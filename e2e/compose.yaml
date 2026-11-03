@@ -57,6 +57,7 @@ services:
       - -tls-cert=/secrets/stub.pem
       - -tls-key=/secrets/stub.key
       - -auth-delay=${FRICT_STUB_AUTH_DELAY:-60s}
+      - -deny-user-ids=DUFRICTDENY
     sysctls:
       net.ipv4.ip_unprivileged_port_start: 0
     volumes:
@@ -65,3 +66,32 @@ services:
       default:
         aliases:
           - duo.frict.test
+
+  # Started by the e2e test once it has provisioned the outpost and can pass
+  # its token in FRICT_LDAP_OUTPOST_TOKEN.
+  ldap:
+    image: ghcr.io/goauthentik/ldap:2026.8.5@sha256:4c75bd27918418d2d6fbbfe4581bbd5a199fe38942d24559c4483edd64a1ea87
+    environment:
+      AUTHENTIK_HOST: http://server:9000
+      AUTHENTIK_INSECURE: "true"
+      AUTHENTIK_TOKEN: ${FRICT_LDAP_OUTPOST_TOKEN:-}
+    networks:
+      default:
+        aliases:
+          - ldap.frict.test
+
+  # SSSD clients, started by the e2e test after the outpost: one with SSSD's
+  # default timeouts, one with the tuned reference config.
+  sssd-default:
+    build: sssd
+    image: frict-m0-sssd
+    volumes:
+      - ./secrets:/secrets:ro
+      - ./sssd/sssd-defaults.conf:/frict/sssd.conf:ro
+
+  sssd-tuned:
+    image: frict-m0-sssd
+    pull_policy: never
+    volumes:
+      - ./secrets:/secrets:ro
+      - ./sssd/sssd.conf:/frict/sssd.conf:ro

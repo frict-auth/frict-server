@@ -1,4 +1,5 @@
-// Command duo-stub serves a Duo-compatible Auth API that approves every push.
+// Command duo-stub serves a Duo-compatible Auth API that approves every push
+// except those for -deny-user-ids.
 package main
 
 import (
@@ -21,6 +22,7 @@ func main() {
 	certFile := flag.String("tls-cert", "", "PEM certificate chain (required)")
 	keyFile := flag.String("tls-key", "", "PEM private key (required)")
 	authDelay := flag.Duration("auth-delay", 0, "how long /auth/v2/auth blocks before approving")
+	denyIDs := flag.String("deny-user-ids", "", "comma-separated Duo user IDs whose pushes are denied after the delay")
 	maxSkew := flag.Duration("max-skew", 5*time.Minute, "allowed difference between request Date and now")
 	flag.Parse()
 
@@ -47,10 +49,20 @@ func main() {
 	}
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           duostub.New(v, *authDelay, log).Handler(),
+		Handler:           duostub.New(v, *authDelay, splitList(*denyIDs), log).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Info("listening", "addr", *listen, "hostname", *hostname, "auth_delay", authDelay.String())
+	log.Info("listening", "addr", *listen, "hostname", *hostname, "auth_delay", authDelay.String(), "deny_user_ids", *denyIDs)
 	log.Error("server stopped", "err", srv.ListenAndServeTLS(*certFile, *keyFile))
 	os.Exit(1)
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, f := range strings.Split(s, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }

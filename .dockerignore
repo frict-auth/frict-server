@@ -1,0 +1,5 @@
+# Build contexts get only what the Dockerfiles copy; e2e/secrets/ and logs stay out.
+*
+!go.mod
+!cmd/
+!internal/

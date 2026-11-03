@@ -22,9 +22,11 @@ const (
 	host = "duo.frict.test"
 )
 
+const deniedUserID = "DUDENIED"
+
 func newStub(delay time.Duration) *Server {
 	v := duosig.Verifier{IKey: ikey, SKey: skey, Host: host, MaxSkew: 5 * time.Minute, Now: time.Now}
-	return New(v, delay, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	return New(v, delay, []string{deniedUserID}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
 type reply struct {
@@ -149,6 +151,22 @@ func TestAuthBlocksForDelayThenApproves(t *testing.T) {
 	}
 	var res struct{ Result, Status string }
 	if err := json.Unmarshal(rep.Resp, &res); err != nil || rep.code != 200 || res.Result != "allow" {
+		t.Fatalf("auth: %d %+v %v", rep.code, rep, err)
+	}
+}
+
+func TestAuthDeniesListedUserAfterDelay(t *testing.T) {
+	const delay = 300 * time.Millisecond
+	h := newStub(delay).Handler()
+	start := time.Now()
+	rep := call(t, context.Background(), h, "/auth/v2/auth",
+		map[string]string{"factor": "auto", "async": "0", "user_id": deniedUserID, "device": "auto"}, skey)
+	elapsed := time.Since(start)
+	if elapsed < delay {
+		t.Fatalf("returned after %s, want >= %s", elapsed, delay)
+	}
+	var res struct{ Result, Status string }
+	if err := json.Unmarshal(rep.Resp, &res); err != nil || rep.code != 200 || res.Result != "deny" || res.Status != "deny" {
 		t.Fatalf("auth: %d %+v %v", rep.code, rep, err)
 	}
 }

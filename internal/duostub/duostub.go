@@ -1,5 +1,6 @@
 // Package duostub serves the subset of Duo's Auth API that Authentik's Duo
-// stages call (enroll, enroll_status, auth) and approves every push.
+// stages call (enroll, enroll_status, auth). It approves every push except
+// those for user IDs it was told to deny.
 package duostub
 
 import (
@@ -19,14 +20,21 @@ const maxBodyBytes = 64 << 10
 type Server struct {
 	verifier  duosig.Verifier
 	authDelay time.Duration
+	deny      map[string]bool // user_id -> push is denied
 	log       *slog.Logger
 
 	mu          sync.Mutex
 	enrollments map[string]string // user_id -> activation_code
 }
 
-func New(v duosig.Verifier, authDelay time.Duration, log *slog.Logger) *Server {
-	return &Server{verifier: v, authDelay: authDelay, log: log, enrollments: map[string]string{}}
+// New returns a stub whose /auth blocks for authDelay, then denies pushes for
+// denyUserIDs and approves all others.
+func New(v duosig.Verifier, authDelay time.Duration, denyUserIDs []string, log *slog.Logger) *Server {
+	deny := map[string]bool{}
+	for _, id := range denyUserIDs {
+		deny[id] = true
+	}
+	return &Server{verifier: v, authDelay: authDelay, deny: deny, log: log, enrollments: map[string]string{}}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -106,6 +114,15 @@ func (s *Server) auth(w http.ResponseWriter, r *http.Request, p map[string]strin
 	case <-time.After(s.authDelay):
 	case <-r.Context().Done():
 		s.log.Warn("auth caller gave up", "user_id", p["user_id"], "after", time.Since(start).String())
+		return
+	}
+	if s.deny[p["user_id"]] {
+		s.log.Info("auth denied", "user_id", p["user_id"], "after", time.Since(start).String())
+		ok(w, map[string]string{
+			"result":     "deny",
+			"status":     "deny",
+			"status_msg": "Login request denied.",
+		})
 		return
 	}
 	s.log.Info("auth approved", "user_id", p["user_id"], "after", time.Since(start).String())

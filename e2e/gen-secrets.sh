@@ -15,21 +15,28 @@ openssl req -x509 -new -key ca.key -sha256 -days 2 -subj "/CN=Frict M0 throwaway
   -addext "keyUsage=critical,keyCertSign,cRLSign" \
   -out ca.pem
 
-openssl ecparam -name prime256v1 -genkey -noout -out stub.key
-openssl req -new -key stub.key -subj "/CN=duo.frict.test" -out stub.csr
-openssl x509 -req -in stub.csr -CA ca.pem -CAkey ca.key -CAcreateserial -sha256 -days 2 \
-  -extfile <(printf '%s\n' \
-    "subjectAltName=DNS:duo.frict.test" \
-    "basicConstraints=critical,CA:FALSE" \
-    "keyUsage=critical,digitalSignature" \
-    "extendedKeyUsage=serverAuth") \
-  -out stub.pem
-rm stub.csr ca.key ca.srl
+# leaf NAME HOSTNAME: NAME.pem / NAME.key signed by the test CA for HOSTNAME.
+leaf() {
+  openssl ecparam -name prime256v1 -genkey -noout -out "$1.key"
+  openssl req -new -key "$1.key" -subj "/CN=$2" -out "$1.csr"
+  openssl x509 -req -in "$1.csr" -CA ca.pem -CAkey ca.key -CAcreateserial -sha256 -days 2 \
+    -extfile <(printf '%s\n' \
+      "subjectAltName=DNS:$2" \
+      "basicConstraints=critical,CA:FALSE" \
+      "keyUsage=critical,digitalSignature" \
+      "extendedKeyUsage=serverAuth") \
+    -out "$1.pem"
+  rm "$1.csr"
+}
+leaf stub duo.frict.test
+leaf ldap ldap.frict.test
+rm ca.key ca.srl
 
 rand() { openssl rand -hex "$1"; }
 rand 20 > duo-client-secret
 rand 24 > akadmin-password
 rand 24 > akadmin-token
+rand 24 > ldap-svc-password
 pg_pass="$(rand 24)"
 cat > authentik.env <<ENV
 POSTGRES_PASSWORD=$pg_pass
