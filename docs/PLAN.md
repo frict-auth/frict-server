@@ -210,8 +210,9 @@ Carried over from chat-relay / chat-android.
     need owner approval to run, and M2 tests fork-token behaviour directly.
   - Fork PR workflows: "Require approval for all external contributors".
   - Secret scanning: repo-level push protection is a paid feature; the free
-    user-level push protection (on by default) covers pushes made with
-    Geoffrey's credentials, which is every agent push.
+    user-level push protection (on by default) covers pushes by accounts
+    that have it on; agent pushes come from `gfree76-claude-agent`, so it
+    must stay on for that account.
 - Release pipeline (Android): semantic-release → signed AAB → Play internal
   track, keyless WIF. Same as chat-android.
 - Deploy (server): image build → Hetzner box via CI, post-deploy digest +
@@ -310,16 +311,19 @@ matching is ever needed.
   frict repo is public and licensed **GPL-3.0**.
 - Repo settings: Actions workflow permissions read-only; "Require approval for
   all external contributors" for fork PR workflows.
-- Ruleset on `main`: require PR (0 approvals), block force-push and deletion.
-  Bypass list empty until every agent harness acts as `gfree76-claude-agent`;
-  then "Organization admin" may bypass (the agent account is a member, not an
-  admin).
+- ~~Ruleset on `main` of `frict-server`~~ (done): require PR (0 approvals),
+  block force-push and deletion, empty bypass list. `frict-android` has no
+  ruleset yet.
 - Agent identity: `gfree76-claude-agent`, org member with Write on all repos
-  (org base permission). Token in `~/keystores/gh-claude-agent.pat`, exported
-  as `GH_TOKEN` by `~/.zshenv` for Claude Code sessions only.
+  (org base permission). Agents run in the agent VM (`gfree76/zart-agent-setup`),
+  where `gh` is logged in as that account over OAuth; no PAT. GitHub CLI is
+  approved under the org's third-party access.
 
 **Before M1**
-- Register the `frict-cross-review` GitHub App at
+- ~~Register the `frict-cross-review` GitHub App~~ (done: Commit statuses
+  write only, installed on the org). Its private key is on the desktop; where
+  the poster runs, and so where the key lives, is still to decide. Original
+  steps, for reference: register at
   https://github.com/organizations/frict-auth/settings/apps/new
   ([docs](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)):
   webhook Active unticked; repository permission **Commit statuses: Read &
