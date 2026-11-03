@@ -59,12 +59,18 @@ func setupLDAP(stage func(string, map[string]any) (string, error), ident, pass, 
 	if err := bindStages(flow.PK, ident, pass, validate, login); err != nil {
 		return err
 	}
-	var flows struct{ Results []struct{ PK string } }
-	if err := admin("GET", "/api/v3/flows/instances/?slug=default-invalidation-flow", nil, &flows); err != nil {
+	logout, err := stage("user_logout", map[string]any{"name": "frict-m0-ldap-logout"})
+	if err != nil {
 		return err
 	}
-	if len(flows.Results) != 1 {
-		return fmt.Errorf("default-invalidation-flow: found %d", len(flows.Results))
+	var unbind struct{ PK string }
+	if err := admin("POST", "/api/v3/flows/instances/", map[string]any{
+		"name": "frict-m0-ldap-unbind", "slug": "frict-m0-ldap-unbind", "title": "Frict M0 LDAP unbind", "designation": "invalidation",
+	}, &unbind); err != nil {
+		return err
+	}
+	if err := bindStages(unbind.PK, logout); err != nil {
+		return err
 	}
 
 	certPEM, err := readSecret("ldap.pem")
@@ -83,7 +89,7 @@ func setupLDAP(stage func(string, map[string]any) (string, error), ident, pass, 
 	}
 	var provider struct{ PK int }
 	if err := admin("POST", "/api/v3/providers/ldap/", map[string]any{
-		"name": "frict-m0-ldap", "authorization_flow": flow.PK, "invalidation_flow": flows.Results[0].PK,
+		"name": "frict-m0-ldap", "authorization_flow": flow.PK, "invalidation_flow": unbind.PK,
 		"base_dn": ldapBaseDN, "certificate": kp.PK, "tls_server_name": "ldap.frict.test",
 		"bind_mode": "direct", "search_mode": "direct", "mfa_support": true,
 	}, &provider); err != nil {
