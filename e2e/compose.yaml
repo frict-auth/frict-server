@@ -1,0 +1,67 @@
+name: frict-m0
+
+x-authentik: &authentik
+  image: ghcr.io/goauthentik/server:2026.8.5@sha256:602227a86455d6772e3d16b7d852713c4f864f40df5df894abd1285bb53979a5
+  env_file: secrets/authentik.env
+  environment:
+    AUTHENTIK_POSTGRESQL__HOST: postgresql
+    AUTHENTIK_POSTGRESQL__NAME: authentik
+    AUTHENTIK_POSTGRESQL__USER: authentik
+    AUTHENTIK_LOG_LEVEL: info
+  volumes:
+    - ./secrets/ca.pem:/ak-root/.venv/lib/python3.14/site-packages/duo_client/ca_certs.pem:ro
+  shm_size: 512mb
+  depends_on:
+    postgresql:
+      condition: service_healthy
+    duo-stub:
+      condition: service_started
+
+services:
+  postgresql:
+    image: docker.io/library/postgres:16.15-alpine
+    env_file: secrets/authentik.env
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d authentik -U authentik"]
+      interval: 2s
+      retries: 30
+
+  server:
+    <<: *authentik
+    command: server
+    ports:
+      - 127.0.0.1:9000:9000
+    healthcheck:
+      test: ["CMD", "ak", "healthcheck"]
+      interval: 5s
+      timeout: 10s
+      retries: 60
+      start_period: 300s
+      start_interval: 3s
+
+  worker:
+    <<: *authentik
+    command: worker
+
+  duo-stub:
+    build:
+      context: ..
+      dockerfile: e2e/duo-stub.Dockerfile
+    command:
+      - -hostname=duo.frict.test
+      - -client-id=DIFRICTE2E0000000000
+      - -client-secret-file=/secrets/duo-client-secret
+      - -tls-cert=/secrets/stub.pem
+      - -tls-key=/secrets/stub.key
+      - -auth-delay=${FRICT_STUB_AUTH_DELAY:-60s}
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: 0
+    volumes:
+      - ./secrets:/secrets:ro
+    networks:
+      default:
+        aliases:
+          - duo.frict.test

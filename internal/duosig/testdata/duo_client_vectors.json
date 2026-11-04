@@ -1,0 +1,70 @@
+{
+  "duo_client_version": "5.6.1",
+  "host": "Duo.Frict.Test",
+  "ikey": "DIXXXXXXXXXXXXXXXXXX",
+  "skey": "test-secret-not-used-anywhere-real-0123456789",
+  "unix_time": 1793793600,
+  "vectors": [
+    {
+      "body": "{\"username\":\"alice\"}",
+      "headers": {
+        "Authorization": "Basic RElYWFhYWFhYWFhYWFhYWFhYWFg6ZmNlN2Y1ZDRjYzRhOTNmODcxNDM3MWZkNzg0OGNjNzhmYzhkOWFiMzQ4MTgzMzBhMWRmZDAxOTViYzFkMjVkZjMzZjQ2MzIwNzM4MWQ2NmIwOTIzNTc3NjhmOTZhZGU0ZTQ4MzJjMzRkMmYzNTk2OGM4Mzc4NDZiZmZlYjQwOWM=",
+        "Content-type": "application/json",
+        "Date": "Wed, 04 Nov 2026 12:00:00 -0000",
+        "User-Agent": "authentik@test"
+      },
+      "method": "POST",
+      "name": "enroll",
+      "uri": "/auth/v2/enroll"
+    },
+    {
+      "body": "{\"activation_code\":\"act-code\",\"user_id\":\"DU123\"}",
+      "headers": {
+        "Authorization": "Basic RElYWFhYWFhYWFhYWFhYWFhYWFg6NDgwMmI3ZmQ1YmVjNjc2NzljNmZiYmRkMjZkM2IyNjVlMjYyNDk1NTY5YTAwMDlhOWEzNzkyOTlhOTdhOTYyZWJlZDg5ZjJhZTEzNWUyMjU2Zjk3ZTFjMjgyMzIxYWMzZTMzZDM1NzFkZDFiOTEwMzRiNmZjZWFjMWE4ZDEwNDg=",
+        "Content-type": "application/json",
+        "Date": "Wed, 04 Nov 2026 12:00:00 -0000",
+        "User-Agent": "authentik@test"
+      },
+      "method": "POST",
+      "name": "enroll_status",
+      "uri": "/auth/v2/enroll_status"
+    },
+    {
+      "body": "{\"async\":\"0\",\"device\":\"auto\",\"display_username\":\"\\u00e9lodie\",\"factor\":\"auto\",\"ipaddr\":\"203.0.113.7\",\"pushinfo\":\"Domain=localhost%3A9000&Application=Gr%C3%A4fana\",\"type\":\"authentik Login request\",\"user_id\":\"DU123\"}",
+      "headers": {
+        "Authorization": "Basic RElYWFhYWFhYWFhYWFhYWFhYWFg6MThhOTliNjFlYTNkYjZiNmUzNThjOWIzODJmYTViODE2M2Y1ZWM5NTcwM2IxZWI3N2EyZDRhMmMzMTljMDg2NjIxZDg5NGQ5MTI4MGFhZDAyMjQ5ODBhYjYwMjc0MzVjY2VlZTY0OGUwODhhMmIzOTZhODU1OTJmMGU2MjRlOGI=",
+        "Content-type": "application/json",
+        "Date": "Wed, 04 Nov 2026 12:00:00 -0000",
+        "User-Agent": "authentik@test"
+      },
+      "method": "POST",
+      "name": "auth_authentik_params",
+      "uri": "/auth/v2/auth"
+    },
+    {
+      "body": "",
+      "headers": {
+        "Authorization": "Basic RElYWFhYWFhYWFhYWFhYWFhYWFg6MzMyODk3YWRlOTFmM2JmZTVjZTk3MDU3YTc3ZjBhYzk4MDUxYzg5ZmJhMTU0MGFhNTcxYzFmYjc1YjFkZjM5Njc2NDI2NmJlN2YwNDdjYjgzYmUyZWNjZjAxZjYyOTJmY2EyYTUzMGEzZWY0MGQ2MjRkMjFkMzZlNjRmNGJkODU=",
+        "Date": "Wed, 04 Nov 2026 12:00:00 -0000",
+        "User-Agent": "authentik@test"
+      },
+      "method": "GET",
+      "name": "get_with_query_params",
+      "uri": "/auth/v2/auth_status?txid=a+b%2Fc~d&Zeta=2&Zeta=1&%C3%BCn%C3%AF=x%2By%3Dz%26"
+    },
+    {
+      "body": "{\"factor\":\"auto\"}",
+      "headers": {
+        "Authorization": "Basic RElYWFhYWFhYWFhYWFhYWFhYWFg6MTQwZGIwMmZmY2I3MjYxYjBmMWY2NWI1MzZlY2Q1ODhmMzBhZGI1NDQ5ZmFiNGMxYWQyY2FiNzU3OGU3ODE0M2Q2ZWZhZThkNmZhMDA5Zjg4M2UzOGEwZjE1MzQ0NzY3ODJmYzM2NGY5YzU1MTA4YjM3NDA5Y2ViMDgyY2ZlYWY=",
+        "Content-type": "application/json",
+        "Date": "Wed, 04 Nov 2026 12:00:00 -0000",
+        "User-Agent": "authentik@test",
+        "X-Duo-Test-Header": "v",
+        "x-duo-another": "w"
+      },
+      "method": "POST",
+      "name": "post_with_x_duo_header",
+      "uri": "/auth/v2/auth"
+    }
+  ]
+}
