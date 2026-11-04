@@ -2,7 +2,9 @@
 
 Feasibility spike results for PLAN.md §Milestones M0. Versions under test:
 Authentik **2026.8.5** (`ghcr.io/goauthentik/server@sha256:602227a8…79a5`),
-which bundles `duo_client` **5.6.1** and Python 3.14.
+which bundles `duo_client` **5.6.1** and Python 3.14; Authentik LDAP outpost
+**2026.8.5** (`ghcr.io/goauthentik/ldap@sha256:4c75bd27…ea87`); SSSD
+**2.9.4-1.1ubuntu6.8** from Ubuntu 24.04 (`ubuntu@sha256:fe815609…f852`).
 
 "Proven" means a test in this repo exercises it and was shown to fail when
 the thing it checks is broken. "Inferred" means read from source, not
@@ -14,8 +16,10 @@ exercised.
 | (b) GTS chain passes `duo_client` pinning | Pending | Separate PR, real certificate |
 | (c) blocking `/auth` survives ~60 s | **Pass** (60 s and 120 s) | Proven (e2e, measured) |
 | (c′) upper limit on `/auth` blocking | ~215 s, then HTTP 408 | 240 s run measured; cause inferred from source |
-| (d) push over an LDAP bind | Pending | Next PR |
-| (e) SSSD/PAM timeout outlasts approval | Pending | Next PR |
+| (d) push over an LDAP bind | **Pass** (plain password, no suffix) | Proven (e2e, measured) |
+| (e) SSSD/PAM survives a 60 s approval | **Fail with defaults; pass with `ldap_opt_timeout = 90`** | Proven (e2e, measured) |
+| (e′) SSSD with default timeouts sends a push every 8 s | **Yes**, until the backend is stopped | Proven (e2e, measured); cause from source |
+| (e″) upper limit on an SSSD login | ~90 s (`client_idle_timeout`), then 120 s hard | 90 s and 120 s measured; 120 s cause inferred from source |
 | Login page can show a number | **No** | Inferred from source |
 
 ## How to reproduce
@@ -31,7 +35,17 @@ the CA over `duo_client/ca_certs.pem` in the Authentik server and worker,
 brings the stack up, runs `go test -tags e2e ./e2e/`, saves every container's
 log to `$EVIDENCE_DIR` (default `e2e/logs/`), and tears the stack down.
 `FRICT_STUB_AUTH_DELAY` sets how long the stub blocks `/auth`; `E2E_RUN`
-filters tests.
+filters tests. The LDAP and SSSD tests need a delay above 10 s; CI runs the
+whole suite at 60 s, so the 60 s measurement is also the CI run.
+
+The LDAP outpost and the two SSSD containers (`sssd-default`,
+`sssd-tuned`) are started by the test's `TestMain` once it has created the
+LDAP provider, outpost and users, because the outpost needs its token. The
+LDAP and PAM checks run inside the SSSD containers via
+`docker compose exec` (`ldapsearch`, `pamtester`).
+
+The SSSD logs are at debug level 6, which dumps the config, including the
+run's throwaway service-account password; it dies with the stack.
 
 Raw evidence from the runs behind this document is under
 `/tmp/frict-m0-evidence/` on the agent VM (not committed). Directory names
@@ -153,6 +167,186 @@ Consequence for M1: Frict's own push expiry (PLAN: 60–120 s) is well inside
 this limit; an expiry at or above ~210 s would turn into an opaque 408 for
 the user. Raising the web `timeout_http_*` settings would raise the limit, but
 Frict doesn't need that.
+
+## (d) push over an LDAP bind — Pass, proven
+
+**Setup.** `TestMain` creates an LDAP provider (`base_dn dc=frict,dc=test`,
+LDAPS with a test-CA certificate, `bind_mode`/`search_mode` direct,
+`mfa_support: true`) whose bind flow is identification → password → Duo
+validation (the stub's stage, `not_configured_action: skip`) → login, an
+application and an LDAP outpost for it, and users whose Duo devices are
+imported on the stub. The stub denies pushes for user ID `DUFRICTDENY`
+(`-deny-user-ids`, after the same delay) and approves all others.
+
+**What was checked.** `TestLDAPBindWaitsForPush` runs a simple bind plus a
+base search (`ldapsearch -x -D cn=ldap-alice,… -w <password>`) over LDAPS
+through the outpost. It requires success, an elapsed time of at least the
+stub delay, and exactly one push for that user in the stub log.
+`TestLDAPBindFailsWhenPushDenied` does the same for a denied user and requires
+`invalidCredentials (49)`, at least the delay, and one push.
+
+**Evidence.**
+
+| Run | Approved bind | Denied bind | Log |
+|---|---|---|---|
+| stub delay 60 s | exit 0 after 1m3.052s, 1 push | exit 49 after 1m1.749s, 1 push | `ldap-e2e-60s/` |
+| stub delay 30 s | exit 0 after 32.618s, 1 push | exit 49 after 31.755s, 1 push | `ldap-e2e-30s/` |
+| final, 60 s | exit 0 after 1m2.553s, 1 push | exit 49 after 1m1.69s, 1 push | `ldap-final-e2e-60s/` |
+
+The outpost logs the bind with its duration (`ldap.log`: `"Bind request"`,
+`took-ms` 62607 for the approved bind in the 60 s run), and the stub logs one
+`auth blocking` / `auth approved` (or `auth denied`) pair for the user's Duo
+ID with `after=1m0.0…s`.
+
+**How the bind password and the push interact.** The user types only their
+password; the outpost sends the push. No TOTP suffix is needed.
+
+- The outpost runs the provider's bind flow (`authorization_flow`,
+  `authentik/providers/ldap/api.py:90`) through Authentik's flow executor for
+  every direct-mode bind (`internal/outpost/ldap/bind/direct/bind.go:17-28`).
+- `SetSecrets` (`internal/outpost/flow/solvers_mfa.go:11-37`): with
+  `mfa_support` on, the bind password is split at its last `;` into password
+  and code. With no `;` the whole string is the password and the code stays
+  empty. With `mfa_support` off the whole string is also offered as the code.
+- The validate-stage solver (`internal/outpost/flow/solvers.go:27-58`)
+  selects the Duo device whenever the challenge offers one. It fills in a
+  TOTP/static code only when the password carried one. Authentik's
+  validate stage then calls Duo `/auth` synchronously
+  (`authentik/stages/authenticator_validate/stage.py:104-108`), the same path
+  as (c).
+- Proven: a plain password with `mfa_support: true` triggers one push and
+  binds once it is approved, and a denied push fails the bind with 49.
+  Inferred, not tested: binds with `mfa_support: false`, or with a `;code`
+  suffix, also push when the user has a Duo device. A password that contains
+  `;` is cut at the last `;` when `mfa_support` is on, so that user can't bind.
+
+**The push outlives the client.** The bind's context is a fresh Sentry span,
+not tied to the LDAP connection (`internal/outpost/ldap/bind/request.go:27-49`),
+and the flow executor's HTTP client has no timeout
+(`internal/outpost/flow/executor.go:90-93`). When the client gives up, the
+outpost keeps waiting and the login still completes in Authentik. Measured: in
+`ldap-e2e-60s/ldap.log` every one of SSSD's abandoned binds for `ldap-bob`
+(see (e)) finished with `took-ms` ≈ 62 300 and logged `User has access`, i.e. succeeded after SSSD
+had dropped the connection at 8 s.
+
+**Negative controls.**
+
+- Deny switch removed (`-deny-user-ids=`) → `TestLDAPBindFailsWhenPushDenied`
+  fails: exit 0 after 1m2.82s (`ldap-mut-deny-disabled/`).
+- Pushes denied for the approving users too → `TestLDAPBindWaitsForPush`
+  fails: exit 49 after 1m2.067s (`ldap-mut-approvers-denied/`).
+
+**Service account.** SSSD searches with its own bind DN (`ldap-svc`, given
+`search_full_directory` on the provider through a role). That bind goes
+through the same flow. It has no Duo device, so the validate stage uses
+`not_configured_action: skip`. That also lets *any* user without a Duo device
+bind with a password alone. With PLAN's `frict-validate` (`configure`), the
+service account's bind would fail: the outpost solves only identification,
+password, validate and user-login challenges and errors on anything else
+(`internal/outpost/flow/executor.go:213-215`; inferred, not tested). M5 has
+to choose how the service account gets past the Duo stage.
+
+## (e) SSSD/PAM vs a human approval — default fails, `ldap_opt_timeout = 90` passes
+
+**Setup.** Two Ubuntu 24.04 containers with `sssd-ldap`, `libpam-sss`,
+`libnss-sss` and `pamtester` (`e2e/sssd/Dockerfile`) talk LDAPS to the
+outpost with the test CA. `sssd-default` runs `e2e/sssd/sssd-defaults.conf`
+(every timeout at its default). `sssd-tuned` runs `e2e/sssd/sssd.conf`, which
+is the same file plus one setting (`TestTunedSSSDIsDefaultsPlusPushTimeouts`
+enforces this). Both use `cache_credentials = false`, so no cached offline
+login can stand in for the server. The service account's password is written
+into `conf.d` at container start and is not part of the committed files.
+Every test runs `pamtester frict-test <user> authenticate` against
+`auth required pam_sss.so`.
+
+**Timeouts on the path (SSSD 2.9.4 source; the `ldap_*` defaults also appear
+in the backend's option dump in each `sssd-*.log`).**
+
+| Setting | Default | On the push path? |
+|---|---|---|
+| `ldap_opt_timeout` | 8 s | **Yes.** It is the timeout of the user's simple bind (`src/providers/ldap/ldap_auth.c:890-899` → `sdap_op_add`, `sdap_async.c:488-500`). |
+| `ldap_network_timeout` | 6 s | Connect only (`sdap_async_connection.c:112`); the outpost accepts at once. |
+| `ldap_search_timeout` | 6 s | The DN lookup before the bind; outpost searches return in well under 1 s. |
+| `pam_id_timeout` | 5 s (`src/responder/pam/pamsrv.c:229`) | How long the PAM responder trusts cached identity data, not a wait on the auth. |
+| `client_idle_timeout` | 60 s (`src/confdb/confdb.h:97`) | **Yes, above ~60 s.** The responder drops a client idle for more than this, checked every `client_idle_timeout/2` (`src/responder/common/responder_common.c:665-711`). Waiting on the backend counts as idle. |
+| sbus call responder → backend | 120 s, fixed | **Yes, the hard ceiling.** `SBUS_MESSAGE_TIMEOUT 120000` (`src/sbus/sbus_message.h:33`, used at `src/sbus/request/sbus_request.c:660`); not configurable. |
+| `pam_sss` client socket | 300 s, fixed | Above the sbus limit (`src/sss_client/sss_cli.h:436`). |
+| `krb5_*`, domain `timeout` (watchdog) | — | Not relevant: `auth_provider = ldap`; the backend is event-driven, and the tuned 60 s pass shows the watchdog doesn't fire. |
+
+**What happens with the defaults.** The bind times out after 8 s. SSSD
+treats `ETIMEDOUT` as a network failure, reconnects and binds again, with no
+retry limit (`src/providers/ldap/ldap_auth.c:925-933`). Each new bind is a new
+flow execution in Authentik and so **a new push**. The outpost completes every
+abandoned bind in Authentik (see (d)). `pamtester` gets
+`Authentication service cannot retrieve authentication info` after 90 s,
+when the PAM responder drops the idle client. The backend keeps binding after
+that: in the first development run (`ldap-dev1/duo-stub.log`, 20 s delay)
+two PAM attempts produced 58 pushes in five minutes, and the pushes stopped
+only when the stack was torn down. The test therefore stops `sssd-default`
+after its check.
+
+**Evidence: default vs tuned at the same delay.**
+
+| Run | `sssd-default` (defaults) | `sssd-tuned` (`ldap_opt_timeout = 90`) | `sssd-tuned`, denied push | Log |
+|---|---|---|---|---|
+| stub delay 60 s | **fail** after 1m30.188s, 12 pushes | **success** after 1m2.947s, 1 push | `Authentication failure` after 1m2.698s, 1 push | `ldap-e2e-60s/` |
+| stub delay 30 s | **fail** after 1m30.255s, 11 pushes | **success** after 33.061s, 1 push | `Authentication failure` after 32.216s, 1 push | `ldap-e2e-30s/` |
+| final, 60 s | **fail** after 1m30.212s, 11 pushes | **success** after 1m2.767s, 1 push | `Authentication failure` after 1m2.154s, 1 push | `ldap-final-e2e-60s/` |
+
+In `sssd-tuned.log` (60 s run) the single bind for `ldap-carol` runs from
+`simple_bind_send` at 18:04:45.339 to `Bind result: Success(0)` at
+18:05:47.747, and the PAM responder returns `[0]: Success`. In `ldap-e2e-60s/`
+the (c) test failed on an unrelated pre-existing bug (the device count; fixed
+in this PR). Its LDAP and SSSD results stand, and the final run repeats them
+all.
+
+**Minimal tuned set: `ldap_opt_timeout = 90` alone.** It is the only setting
+that differs between the two configs, and the default config fails at the same
+delay, so no smaller set exists. Each other default on the table above was left
+in place and the 60 s approval still passed. 90 s is chosen to sit just
+under the client-idle cutoff (below) and above the push expiry. It also bounds
+StartTLS and synchronous libldap calls, so a hung LDAP server now holds a
+login for up to 90 s instead of 8.
+
+**Upper limit (measured, partly inferred).**
+
+- With `client_idle_timeout` at its default, `pamtester` is cut off at
+  90 s in every default-config run (90.188, 90.255, 90.212 s, and 90.27 s with the defaults mounted in `sssd-tuned`). Experiment
+  `ldap-exp-client-idle-300/` (defaults plus `[pam] client_idle_timeout =
+  300`, 60 s delay): the same attempt ran to **2m0.633s** and failed with
+  `System error`. The PAM responder logged `Returning [4]: System error`
+  exactly 120 s after the request. So the 90 s cutoff is `client_idle_timeout`
+  (proven: moving the setting moved the cutoff). The 120 s limit matches
+  `SBUS_MESSAGE_TIMEOUT` (inferred from source).
+- So with the reference config, an approval has to land in under ~88 s.
+  Approvals up to just under 120 s would need `client_idle_timeout` raised as
+  well, which was not measured with a successful approval. Nothing makes a
+  ≥ 120 s approval work.
+
+**Negative controls.** `ldap-mut-sssd-configs-swapped/` mounts each
+container's config into the other: `TestSSSDTunedSurvivesPush` fails
+(defaults in `sssd-tuned`: exit 1 after 1m30.17s, 12 pushes) and
+`TestSSSDDefaultTimeoutsLosePush` fails (tuned config in `sssd-default`:
+success after 1m3.227s, 1 push). `ldap-mut-deny-disabled/` makes
+`TestSSSDTunedFailsWhenPushDenied` fail (success after 1m3.282s), and
+`ldap-mut-approvers-denied/` makes `TestSSSDTunedSurvivesPush` fail (exit 1
+after 1m2.249s). Editing `sssd-defaults.conf` without `sssd.conf` makes
+`TestTunedSSSDIsDefaultsPlusPushTimeouts` fail
+(`ldap-mut-unit-sssd-config-drift/`).
+
+**Consequences for M1 and M5.**
+
+- Frict's push expiry for LDAP logins must be **below `ldap_opt_timeout`**
+  (90 s here) and below the ~88 s client-idle cutoff. Otherwise an unanswered
+  push becomes a fresh push every `ldap_opt_timeout`, each one a real
+  Authentik login if approved. 60 s fits.
+- M5 must deploy the tuned `sssd.conf` *before* putting the Duo stage in the
+  LDAP flow. With SSSD's defaults, every LDAP login floods the phone with
+  pushes and still fails.
+- Not tested: `cache_credentials = true` (offline logins), `su`/`sshd`/`gdm`
+  PAM stacks (only `pam_sss` through `pamtester`), StartTLS (LDAPS only), and
+  `bind_mode: cached` (it would cache a bind and skip the push on later binds;
+  inferred from the mode's purpose, not read in source).
 
 ## Number matching — the login page cannot show a number (inferred)
 

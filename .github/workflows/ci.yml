@@ -42,7 +42,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Authentik + duo-stub e2e (stub /auth delay 60s)
+      - name: Authentik + duo-stub + LDAP outpost + SSSD e2e (stub /auth delay 60s)
         env:
           EVIDENCE_DIR: ${{ runner.temp }}/e2e-logs
           FRICT_STUB_AUTH_DELAY: 60s

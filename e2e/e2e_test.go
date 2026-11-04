@@ -26,6 +26,7 @@ const (
 
 var env struct {
 	baseURL     string
+	composeFile string
 	adminToken  string
 	duoSecret   string
 	stubDelay   time.Duration
@@ -52,8 +53,9 @@ func readSecret(name string) (string, error) {
 
 func setup() error {
 	env.baseURL = os.Getenv("FRICT_E2E_AUTHENTIK_URL")
-	if env.baseURL == "" || os.Getenv("FRICT_E2E_SECRETS_DIR") == "" {
-		return fmt.Errorf("FRICT_E2E_AUTHENTIK_URL and FRICT_E2E_SECRETS_DIR must be set (use e2e/run.sh)")
+	env.composeFile = os.Getenv("FRICT_E2E_COMPOSE_FILE")
+	if env.baseURL == "" || env.composeFile == "" || os.Getenv("FRICT_E2E_SECRETS_DIR") == "" {
+		return fmt.Errorf("FRICT_E2E_AUTHENTIK_URL, FRICT_E2E_COMPOSE_FILE and FRICT_E2E_SECRETS_DIR must be set (use e2e/run.sh)")
 	}
 	var err error
 	if env.stubDelay, err = time.ParseDuration(os.Getenv("FRICT_STUB_AUTH_DELAY")); err != nil {
@@ -116,9 +118,16 @@ func setup() error {
 	}, &flow); err != nil {
 		return err
 	}
-	for i, st := range []string{ident, pass, validate, login} {
+	if err := bindStages(flow.PK, ident, pass, validate, login); err != nil {
+		return err
+	}
+	return setupLDAP(stage, ident, pass, login)
+}
+
+func bindStages(flowPK string, stages ...string) error {
+	for i, st := range stages {
 		if err := admin("POST", "/api/v3/flows/bindings/", map[string]any{
-			"target": flow.PK, "stage": st, "order": (i + 1) * 10,
+			"target": flowPK, "stage": st, "order": (i + 1) * 10,
 		}, nil); err != nil {
 			return err
 		}
@@ -180,14 +189,20 @@ func admin(method, path string, body any, out any) error {
 func createUser(t *testing.T, prefix string) (username string, pk int) {
 	t.Helper()
 	username = prefix + "-" + env.suffix
+	pk, err := newUser(map[string]any{"username": username, "name": username}, env.userPass)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return username, pk
+}
+
+// newUser creates a user from the given API fields and sets its password.
+func newUser(fields map[string]any, password string) (int, error) {
 	var u struct{ PK int }
-	if err := admin("POST", "/api/v3/core/users/", map[string]any{"username": username, "name": username}, &u); err != nil {
-		t.Fatal(err)
+	if err := admin("POST", "/api/v3/core/users/", fields, &u); err != nil {
+		return 0, err
 	}
-	if err := admin("POST", fmt.Sprintf("/api/v3/core/users/%d/set_password/", u.PK), map[string]any{"password": env.userPass}, nil); err != nil {
-		t.Fatal(err)
-	}
-	return username, u.PK
+	return u.PK, admin("POST", fmt.Sprintf("/api/v3/core/users/%d/set_password/", u.PK), map[string]any{"password": password}, nil)
 }
 
 // challenge is the subset of Authentik's flow challenge JSON the tests read.
@@ -319,12 +334,21 @@ func TestDuoPushSurvivesStubDelay(t *testing.T) {
 	}
 	enrollment.expect(enrollment.do("POST", map[string]any{"component": "ak-stage-authenticator-duo"}), "xak-flow-redirect")
 
-	var devices struct{ Results []struct{ PK int } }
-	if err := admin("GET", fmt.Sprintf("/api/v3/authenticators/admin/duo/?user=%d", userPK), nil, &devices); err != nil {
+	// The admin device list has no user filter; count this user's devices.
+	var devices struct {
+		Results []struct{ User struct{ PK int } }
+	}
+	if err := admin("GET", "/api/v3/authenticators/admin/duo/?page_size=1000", nil, &devices); err != nil {
 		t.Fatal(err)
 	}
-	if len(devices.Results) != 1 {
-		t.Fatalf("user has %d Duo devices after enrollment, want 1", len(devices.Results))
+	mine := 0
+	for _, d := range devices.Results {
+		if d.User.PK == userPK {
+			mine++
+		}
+	}
+	if mine != 1 {
+		t.Fatalf("user has %d Duo devices after enrollment, want 1", mine)
 	}
 
 	login := newBrowser(t)
