@@ -50,10 +50,10 @@ Authorization: Frict-P256 <user_id>:<unix_seconds>:<signature>
 ```
 
 - `user_id`: the Duo user ID Frict issued at `/auth/v2/enroll`: `DU`
-  followed by base32 (`A-Z`, `2-7`). One device per user, so outside
-  enroll it names the key to verify with. The server rejects any other
-  characters before it looks at the signature.
-- `unix_seconds`: the signing time, decimal digits only.
+  followed by exactly 26 base32 characters (`A-Z`, `2-7`). One device per
+  user, so outside enroll it names the key to verify with. The server
+  rejects anything else before it looks at the signature.
+- `unix_seconds`: the signing time, 1 to 12 decimal digits.
 - `signature`: base64url (no padding) ASN.1 DER ECDSA-SHA256 over the
   signed bytes below.
 
@@ -131,9 +131,33 @@ and server state on every request. Not worth it for a read and an FID.
 All under `https://<api host>/device/v1/`. Responses are JSON. Errors are
 `{"error": "<code>"}` with a matching HTTP status.
 
+### Activation (Duo side)
+
+Authentik's Duo setup stage calls `/auth/v2/enroll` with only `username`
+(`duo_client/auth.py:43-67`, called from
+`authentik/stages/authenticator_duo/stage.py:57`). Frict answers:
+
+| Field | Value |
+|---|---|
+| `user_id` | A new `DU` + 26 base32 user ID. Every call creates a new user. |
+| `activation_code` | The app link `frict://enroll?code=<code>&host=<api host>&user_id=<user_id>`. Authentik renders it as a link (`web/src/flow/stages/authenticator_duo/AuthenticatorDuoStage.ts`). |
+| `activation_barcode` | The same link. Authentik renders it as an image source; Frict does not render a QR image yet (see PLAN Open). |
+| `username` | As sent. |
+| `valid_secs` | `900`. Authentik sends no `valid_secs`. |
+
+`<code>` is 128 random bits as 26 base32 characters. The server keeps only
+its SHA-256. It enrolls one device, within `valid_secs`.
+
+`/auth/v2/enroll_status` gets `user_id` and that link back
+(`stage.py:85-87`, and every 3 s from the setup page through
+`api.py:95-106`) and answers `waiting` while the code is unclaimed and
+unexpired, `success` once a device has enrolled with it (also after
+expiry), and `invalid` otherwise. The page submits on `success`.
+
 ### `enroll` (signed with `device_key`)
 
-The enrollment QR encodes `frict://enroll?host=<api host>&code=<activation code>`.
+The app reads `host`, `user_id` and `code` from the activation link, sends
+`user_id` in the `Authorization` header and `code` as `activation_code`.
 
 ```json
 {
@@ -152,7 +176,7 @@ The enrollment QR encodes `frict://enroll?host=<api host>&code=<activation code>
 |---|---|
 | `activation_code` | Proves the device scanned this user's QR. Single use; it expires with Duo's `valid_secs`. |
 | `device_key`, `approval_key` | See Keys. |
-| `attestation` | Each key's Android Keystore attestation chain, leaf first, stored as sent. Each key is generated with the activation code as its attestation challenge, so M4 can check the chain is about this enrollment. Not verified until M4. |
+| `attestation` | Each key's Android Keystore attestation chain, leaf first, stored as sent. Each key is generated with the activation code as its attestation challenge, so M4 can check the chain is about this enrollment. Each chain must be a non-empty list of base64url strings; the certificates are not verified until M4. |
 | `fid` | Where to push. |
 
 The user is the one `/auth/v2/enroll` issued this activation code for; the
@@ -162,6 +186,11 @@ Because `user_id` is also signed, a device holding its own valid code can't
 enroll its keys under another user. The signature is checked against the
 `device_key` in the body: proof that the device holds it. Answer: `200 {}`.
 After this, Authentik's `enroll_status` for the user reports `success`.
+
+Every failure is `401 {"error": "unauthorized"}`: a bad header, timestamp or
+signature, a body with unknown or missing fields or a key that is not
+P-256, and an activation code that is unknown, expired, already used or
+issued for another user.
 
 ### `challenge` (signed with `device_key`)
 
