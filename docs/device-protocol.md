@@ -49,9 +49,11 @@ string. It carries:
 Authorization: Frict-P256 <user_id>:<unix_seconds>:<signature>
 ```
 
-- `user_id`: the Duo user ID Frict issued at `/auth/v2/enroll`. One device
-  per user, so it names the key to verify with.
-- `unix_seconds`: the signing time, decimal.
+- `user_id`: the Duo user ID Frict issued at `/auth/v2/enroll`: `DU`
+  followed by base32 (`A-Z`, `2-7`). One device per user, so outside
+  enroll it names the key to verify with. The server rejects any other
+  characters before it looks at the signature.
+- `unix_seconds`: the signing time, decimal digits only.
 - `signature`: base64url (no padding) ASN.1 DER ECDSA-SHA256 over the
   signed bytes below.
 
@@ -59,24 +61,50 @@ Signed bytes, UTF-8, joined by `\n`:
 
 ```
 frict-device-v1
+<user_id>
 <unix_seconds>
 <path>
 <body>
 ```
 
+The layout can't be read two ways: the tag, `user_id` (base32), `unix_seconds`
+(digits) and `path` (one of the fixed routes below) can't contain `\n`, so
+the first four `\n` end the first four fields, and the body is everything
+after the fourth, newlines included.
+
 | Field | Why |
 |---|---|
 | `frict-device-v1` | A signature made for this API can't be valid anywhere else, including a later version of it. |
-| `unix_seconds` | Bounds replay: the server rejects a time more than 5 minutes from its own. |
+| `user_id` | Binds the request to one user. At enroll the key to verify with comes from the body, so without this a valid signature says nothing about which user it is for. |
+| `unix_seconds` | Bounds replay: see Verification. |
 | `path` | Binds the signature to one endpoint, so an answer can't be replayed as an FID update. |
 | `body` | Binds the parameters. Last, so no separator inside it is ambiguous. |
 
-Left out: the method (always `POST`), the host (keys are created per
-enrollment on one server), the `user_id` (a different one selects a
-different key, and the signature fails), and a nonce (see below).
+Left out, and why that is safe:
 
-The server verifies with the key the path calls for (`approval_key` for
-`/device/v1/answer`, `device_key` otherwise) and answers `401` on any failure,
+| Omitted | Why |
+|---|---|
+| Method | The server routes only `POST` on these paths; any other method is rejected before verification. |
+| Host | Outside enroll, the server verifies against a key it stored at that user's enrollment, which no other server holds. An enroll request carries an activation code that only the issuing server knows and that is single use. |
+| Nonce | Replay is bounded by the time window and single-use state; see Replay. |
+
+### Verification
+
+The server, in this order:
+
+1. Parses the header. `user_id` and `unix_seconds` must match the formats
+   above.
+2. Checks freshness on the header's `unix_seconds`: more than 5 minutes from
+   the server's clock, either way, is rejected. There is no other time
+   field.
+3. Rebuilds the signed bytes from the tag, the header's `user_id`, the
+   header's `unix_seconds`, the request path and the raw body as received.
+4. Verifies the signature with the key the path calls for. At enroll that is
+   the body's `device_key`, and the user is fixed by the activation code
+   (see `enroll`).
+
+Outside enroll, the key is the header user's stored `approval_key` for
+`/device/v1/answer` and `device_key` otherwise. Any failure is answered `401`,
 without saying which part failed.
 
 ### Replay
@@ -127,8 +155,11 @@ The enrollment QR encodes `frict://enroll?host=<api host>&code=<activation code>
 | `attestation` | Each key's Android Keystore attestation chain, leaf first, stored as sent. Each key is generated with the activation code as its attestation challenge, so M4 can check the chain is about this enrollment. Not verified until M4. |
 | `fid` | Where to push. |
 
-The `Authorization` header's `user_id` is the one `/auth/v2/enroll` issued
-with this activation code, and the signature is checked against the
+The user is the one `/auth/v2/enroll` issued this activation code for; the
+server looks it up by the code and never takes it from the header. If the
+header's `user_id` differs from that user, the request is rejected `401`.
+Because `user_id` is also signed, a device holding its own valid code can't
+enroll its keys under another user. The signature is checked against the
 `device_key` in the body: proof that the device holds it. Answer: `200 {}`.
 After this, Authentik's `enroll_status` for the user reports `success`.
 
