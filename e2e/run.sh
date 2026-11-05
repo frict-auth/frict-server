@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Brings up the M0 compose stack, runs the e2e tests against it, saves all
+# Brings up the M0 compose stack, checks duo_client's TLS to the stub from the
+# Authentik server and worker, runs the e2e tests against it, saves all
 # container logs, and tears the stack down. The LDAP outpost and SSSD
 # containers are started by the tests once Authentik is provisioned.
 #   EVIDENCE_DIR           where logs go (default: e2e/logs)
@@ -25,6 +26,11 @@ trap collect EXIT
 "$here/gen-secrets.sh"
 compose build
 compose up --detach --wait --wait-timeout 600 postgresql server worker duo-stub
+
+for svc in server worker; do
+  "$here/../scripts/duo-tls-check.sh" "$(compose ps -q "$svc")" https://duo.frict.test \
+    | tee "$evidence/duo-tls-check-$svc.log"
+done
 
 cd "$here/.."
 FRICT_E2E_SECRETS_DIR="$here/secrets" \
