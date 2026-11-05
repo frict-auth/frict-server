@@ -13,7 +13,7 @@ exercised.
 | Item | Result | Basis |
 |---|---|---|
 | (a) sig v5 verification | **Pass** | Proven (unit + e2e) |
-| (b) GTS chain passes `duo_client` pinning | Pending | Separate PR, real certificate |
+| (b) production chain passes `duo_client` pinning | **GTS: fail. Route A (Let's Encrypt + system CA bundle mounted): pass** | Proven (real chains, in the Authentik image) |
 | (c) blocking `/auth` survives ~60 s | **Pass** (60 s and 120 s) | Proven (e2e, measured) |
 | (c′) upper limit on `/auth` blocking | ~215 s, then HTTP 408 | 240 s run measured; cause inferred from source |
 | (d) push over an LDAP bind | **Pass** (plain password, no suffix) | Proven (e2e, measured) |
@@ -21,6 +21,9 @@ exercised.
 | (e′) SSSD with default timeouts sends a push every 8 s | **Yes**, until the backend is stopped | Proven (e2e, measured); cause from source |
 | (e″) upper limit on an SSSD login | ~90 s (`client_idle_timeout`), then 120 s hard | 90 s and 120 s measured; 120 s cause inferred from source |
 | Login page can show a number | **No** | Inferred from source |
+
+**M0 overall: GO.** (a) and (c) pass; (b) passes on route A; (d) passes;
+(e) passes with the tuned SSSD config, which M5 must deploy.
 
 ## How to reproduce
 
@@ -32,7 +35,8 @@ e2e/run.sh                   # compose stack + e2e, FRICT_STUB_AUTH_DELAY=60s
 `e2e/run.sh` generates a throwaway CA, stub certificate, Duo client secret
 and Authentik bootstrap credentials into `e2e/secrets/` (git-ignored), mounts
 the CA over `duo_client/ca_certs.pem` in the Authentik server and worker,
-brings the stack up, runs `go test -tags e2e ./e2e/`, saves every container's
+brings the stack up, runs `scripts/duo-tls-check.sh` in both against the
+stub, runs `go test -tags e2e ./e2e/`, saves every container's
 log to `$EVIDENCE_DIR` (default `e2e/logs/`), and tears the stack down.
 `FRICT_STUB_AUTH_DELAY` sets how long the stub blocks `/auth`; `E2E_RUN`
 filters tests. The LDAP and SSSD tests need a delay above 10 s; CI runs the
@@ -109,6 +113,55 @@ signature mismatch are rejected with 401 before the stub does any work.
   fails because the wrong-secret login succeeds (`mut-e2e-sigcheck-disabled/`).
 
 Each directory holds the mutation as `mutation.diff` and the failing run.
+
+## (b) production chain vs `duo_client` pinning — GTS fails, route A passes
+
+**What was checked.** Whether `duo_client`, as Authentik constructs it (no
+`ca_certs`, so its bundled 15-root `ca_certs.pem`), accepts a real
+publicly trusted chain, and how to make it accept one.
+
+**GTS fails.** The GTS certificate issued for `api.frict.app` was served as
+leaf ← WR1 (RSA) ← GTS Root R1, with R1 cross-signed by GlobalSign Root CA.
+Neither GTS Root R1 nor GlobalSign Root CA is in Duo's bundle, so
+`duo_client` 5.6.1 and 5.7.0 with Duo's bundle both fail with
+`CERTIFICATE_VERIFY_FAILED … unable to get local issuer certificate`. With
+the system bundle, or Duo's bundle plus GTS Root R1, the same call completes
+the handshake. Evidence: `tls-real/` (`00_SUMMARY.txt`;
+`04_duo_ping_api.frict.app.log` 5.7.0, `08_duo561_ping_api.frict.app.log`
+5.6.1, `07_*` positive controls).
+
+GTS can't be made reliable: its default ACME profile issues RSA WR1–4 ← R1
+whatever the leaf key, and its `minimal` profile rotates among WE1–5, where
+WE5 ← GTS Root R3 is not in Duo's bundle either. Intermediate choice is not
+under the client's control.
+
+**Route A passes.** Let's Encrypt, with the Authentik image's own
+`/etc/ssl/certs/ca-certificates.crt` (148 roots) mounted over
+`duo_client`'s `ca_certs.pem`, whose path is read from the installed package:
+`/ak-root/.venv/lib/python3.14/site-packages/duo_client/ca_certs.pem`.
+`scripts/duo_tls_check.py`, run inside the 2026.8.5 image, calls
+`/auth/v2/ping` through `duo_client` 5.6.1:
+
+| Host (chain served) | Mounted | Not mounted |
+|---|---|---|
+| `letsencrypt.org` (YE2 ← ISRG Root YE ← ISRG Root X2 ← ISRG Root X1) | handshake, HTTP 404 | `CERTIFICATE_VERIFY_FAILED`, exit 1 |
+| `valid-isrgrootx1.letsencrypt.org` (YR1 ← ISRG Root YR ← ISRG Root X1) | handshake, HTTP 404 | `CERTIFICATE_VERIFY_FAILED`, exit 1 |
+
+Any HTTP status after the handshake is a pass. Evidence: `tls-route-a/`
+(`00_SUMMARY.txt`, `01_`/`02_` `openssl s_client -showcerts`, `1x_ping_*`).
+
+**Deploy check.** `scripts/duo-tls-check.sh CONTAINER https://HOST` runs the
+same script in a running container and exits non-zero on any TLS or
+connection failure. `e2e/run.sh` runs it in the server and worker against the
+stub before the tests, so CI checks that the mount still lands on
+`duo_client`'s bundle. Negative control: with the mount removed from
+`compose.yaml`, the server check fails `CERTIFICATE_VERIFY_FAILED` and
+`run.sh` exits 1 (`tls-route-a/e2e-check-negative-no-mount/`, positive run in
+`e2e-check-positive/`).
+
+**Fallback B:** AWS ACM certificates via its ACME endpoint. Every ACM chain
+ends at Amazon Root CA 1–4 or Starfield Services G2, all in Duo's bundle, so
+no mount is needed; about $1 per issuance. Not tested end to end.
 
 ## (c) blocking `/auth` survives ~60 s — Pass, proven
 
@@ -281,8 +334,9 @@ abandoned bind in Authentik (see (d)). `pamtester` gets
 `Authentication service cannot retrieve authentication info` after 90 s,
 when the PAM responder drops the idle client. The backend keeps binding after
 that: in the first development run (`ldap-dev1/duo-stub.log`, 20 s delay)
-two PAM attempts produced 58 pushes in five minutes, and the pushes stopped
-only when the stack was torn down. The test therefore stops `sssd-default`
+two PAM attempts produced 58 pushes in five minutes and a third attempt, to
+the denying user, 13 more. The pushes stopped only when
+the stack was torn down. The test therefore stops `sssd-default`
 after its check.
 
 **Evidence: default vs tuned at the same delay.**
@@ -311,7 +365,7 @@ login for up to 90 s instead of 8.
 **Upper limit (measured, partly inferred).**
 
 - With `client_idle_timeout` at its default, `pamtester` is cut off at
-  90 s in every default-config run (90.188, 90.255, 90.212 s, and 90.27 s with the defaults mounted in `sssd-tuned`). Experiment
+  90 s in every default-config run (90.188, 90.255, 90.212 s, and 90.17 s with the defaults mounted in `sssd-tuned`). Experiment
   `ldap-exp-client-idle-300/` (defaults plus `[pam] client_idle_timeout =
   300`, 60 s delay): the same attempt ran to **2m0.633s** and failed with
   `System error`. The PAM responder logged `Returning [4]: System error`
