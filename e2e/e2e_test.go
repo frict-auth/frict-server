@@ -1,14 +1,19 @@
 //go:build e2e
 
-// Package e2e logs in through a real Authentik whose Duo stages point at the
-// duo-stub, using Authentik's flow-executor API. Run it via e2e/run.sh.
+// Package e2e logs in through a real Authentik using its flow-executor API.
+// Enrollment goes to frict-server, with a fake phone claiming the activation;
+// pushes still go to the duo-stub. Run it via e2e/run.sh.
 package e2e
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -17,11 +22,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/frict-auth/frict-server/internal/fakephone"
 )
 
 const (
-	duoHostname = "duo.frict.test"
-	duoClientID = "DIFRICTE2E0000000000"
+	duoHostname   = "duo.frict.test"
+	frictHostname = "frict.frict.test"
+	duoClientID   = "DIFRICTE2E0000000000"
 )
 
 var env struct {
@@ -34,6 +42,8 @@ var env struct {
 	flowSlug    string
 	goodDuoPK   string
 	badDuoPK    string
+	frictDuoPK  string
+	phoneClient *http.Client
 	userPass    string
 	adminClient *http.Client
 }
@@ -68,6 +78,9 @@ func setup() error {
 		return err
 	}
 	env.adminClient = &http.Client{Timeout: 30 * time.Second}
+	if env.phoneClient, err = newPhoneClient(os.Getenv("FRICT_E2E_FRICT_ADDR")); err != nil {
+		return err
+	}
 	env.suffix = fmt.Sprintf("%d", time.Now().Unix())
 	env.flowSlug = "frict-m0-" + env.suffix
 	env.userPass = "pw-" + env.suffix + "-not-secret"
@@ -87,6 +100,11 @@ func setup() error {
 	}); err != nil {
 		return err
 	}
+	if env.frictDuoPK, err = stage("authenticator/duo", map[string]any{
+		"name": name("frict"), "client_id": duoClientID, "client_secret": env.duoSecret, "api_hostname": frictHostname,
+	}); err != nil {
+		return err
+	}
 	if env.badDuoPK, err = stage("authenticator/duo", map[string]any{
 		"name": name("duo-wrong-secret"), "client_id": duoClientID, "client_secret": env.duoSecret + "-wrong", "api_hostname": duoHostname,
 	}); err != nil {
@@ -102,7 +120,7 @@ func setup() error {
 	}
 	validate, err := stage("authenticator/validate", map[string]any{
 		"name": name("validate"), "device_classes": []string{"duo"},
-		"not_configured_action": "configure", "configuration_stages": []string{env.goodDuoPK},
+		"not_configured_action": "configure", "configuration_stages": []string{env.frictDuoPK},
 	})
 	if err != nil {
 		return err
@@ -122,6 +140,33 @@ func setup() error {
 		return err
 	}
 	return setupLDAP(stage, ident, pass, login)
+}
+
+// newPhoneClient returns the fake phone's HTTPS client: it trusts only the
+// test CA and reaches frict.frict.test at addr, the TLS front's published
+// port, since the host cannot resolve compose names.
+func newPhoneClient(addr string) (*http.Client, error) {
+	if addr == "" {
+		return nil, fmt.Errorf("FRICT_E2E_FRICT_ADDR must be set (use e2e/run.sh)")
+	}
+	caPEM, err := os.ReadFile(filepath.Join(os.Getenv("FRICT_E2E_SECRETS_DIR"), "ca.pem"))
+	if err != nil {
+		return nil, err
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("no certificates in ca.pem")
+	}
+	var d net.Dialer
+	return &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: roots},
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return d.DialContext(ctx, network, addr)
+			},
+		},
+	}, nil
 }
 
 func bindStages(flowPK string, stages ...string) error {
@@ -210,6 +255,8 @@ type challenge struct {
 	Component         string `json:"component"`
 	To                string `json:"to"`
 	ActivationBarcode string `json:"activation_barcode"`
+	ActivationCode    string `json:"activation_code"`
+	StageUUID         string `json:"stage_uuid"`
 	DeviceChallenges  []struct {
 		DeviceClass string          `json:"device_class"`
 		DeviceUID   json.RawMessage `json:"device_uid"`
@@ -320,39 +367,122 @@ func duoDeviceUID(t *testing.T, c challenge) json.RawMessage {
 	return nil
 }
 
-// TestDuoPushSurvivesStubDelay proves M0 (c): Authentik waits for a /auth
-// call that blocks for FRICT_STUB_AUTH_DELAY and then logs the user in.
-// The first login enrolls through the Duo setup stage (enroll + enroll_status
-// against the stub); the second performs the push.
-func TestDuoPushSurvivesStubDelay(t *testing.T) {
-	username, userPK := createUser(t, "alice")
+// TestEnrollThroughFrictServer: Authentik's Duo setup stage enrolls against
+// frict-server, a fake phone claims the activation over TLS, enroll_status
+// turns from waiting to success, and Authentik saves the device. A second
+// phone replaying the same activation is refused.
+func TestEnrollThroughFrictServer(t *testing.T) {
+	username, userPK := createUser(t, "erin")
 
-	enrollment := newBrowser(t)
-	c := enrollment.expect(enrollment.passwordStep(username), "ak-stage-authenticator-duo")
-	if !strings.Contains(c.ActivationBarcode, duoHostname) {
-		t.Fatalf("activation barcode did not come from the stub: %s", c.raw)
+	b := newBrowser(t)
+	c := b.expect(b.passwordStep(username), "ak-stage-authenticator-duo")
+	act, err := fakephone.ParseActivation(c.ActivationCode)
+	if err != nil {
+		t.Fatalf("activation_code from frict-server: %v; challenge %s", err, c.raw)
 	}
-	enrollment.expect(enrollment.do("POST", map[string]any{"component": "ak-stage-authenticator-duo"}), "xak-flow-redirect")
+	if act.Host != frictHostname {
+		t.Fatalf("activation host %q, want %q", act.Host, frictHostname)
+	}
+	if got := b.enrollmentStatus(c.StageUUID); got != "waiting" {
+		t.Fatalf("enroll_status before the phone enrolled: %q, want waiting", got)
+	}
 
-	// The admin device list has no user filter; count this user's devices.
+	phone, err := fakephone.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, body := phoneEnroll(t, phone, act); status != http.StatusOK {
+		t.Fatalf("phone enroll: %d %s", status, body)
+	}
+	if got := b.enrollmentStatus(c.StageUUID); got != "success" {
+		t.Fatalf("enroll_status after the phone enrolled: %q, want success", got)
+	}
+	b.expect(b.do("POST", map[string]any{"component": "ak-stage-authenticator-duo"}), "xak-flow-redirect")
+	if n := duoDevices(t, userPK); n != 1 {
+		t.Fatalf("user has %d Duo devices after enrollment, want 1", n)
+	}
+
+	replay, err := fakephone.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status, body := phoneEnroll(t, replay, act); status != http.StatusUnauthorized {
+		t.Fatalf("second phone with the same activation: %d %s, want 401", status, body)
+	}
+}
+
+func phoneEnroll(t *testing.T, phone *fakephone.Phone, act fakephone.Activation) (int, string) {
+	t.Helper()
+	req, err := phone.EnrollRequest(act, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := env.phoneClient.Do(req)
+	if err != nil {
+		t.Fatalf("phone enroll: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp.StatusCode, string(body)
+}
+
+// enrollmentStatus asks Authentik for the enrollment status, as the setup
+// page's script does every 3 s; Authentik relays frict-server's
+// enroll_status answer.
+func (b *browser) enrollmentStatus(stageUUID string) string {
+	b.t.Helper()
+	resp, err := b.client.Post(env.baseURL+"/api/v3/stages/authenticator/duo/"+stageUUID+"/enrollment_status/", "application/json", nil)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	var out struct {
+		DuoResponse string `json:"duo_response"`
+	}
+	if resp.StatusCode != 200 || json.Unmarshal(raw, &out) != nil {
+		b.t.Fatalf("enrollment_status: %d %s", resp.StatusCode, raw)
+	}
+	return out.DuoResponse
+}
+
+// duoDevices counts userPK's Duo devices. The admin device list has no user
+// filter.
+func duoDevices(t *testing.T, userPK int) int {
+	t.Helper()
 	var devices struct {
 		Results []struct{ User struct{ PK int } }
 	}
 	if err := admin("GET", "/api/v3/authenticators/admin/duo/?page_size=1000", nil, &devices); err != nil {
 		t.Fatal(err)
 	}
-	mine := 0
+	n := 0
 	for _, d := range devices.Results {
 		if d.User.PK == userPK {
-			mine++
+			n++
 		}
 	}
-	if mine != 1 {
-		t.Fatalf("user has %d Duo devices after enrollment, want 1", mine)
+	return n
+}
+
+// TestDuoPushSurvivesStubDelay proves M0 (c): Authentik waits for a /auth
+// call that blocks for FRICT_STUB_AUTH_DELAY and then logs the user in. The
+// user's device is imported on the stub's stage, so the push goes to the stub.
+func TestDuoPushSurvivesStubDelay(t *testing.T) {
+	username, _ := createUser(t, "alice")
+	if err := admin("POST", "/api/v3/stages/authenticator/duo/"+env.goodDuoPK+"/import_device_manual/",
+		map[string]any{"duo_user_id": "DUALICE" + env.suffix, "username": username}, nil); err != nil {
+		t.Fatal(err)
 	}
 
 	login := newBrowser(t)
-	c = login.expect(login.passwordStep(username), "ak-stage-authenticator-validate")
+	c := login.expect(login.passwordStep(username), "ak-stage-authenticator-validate")
 	uid := duoDeviceUID(t, c)
 
 	start := time.Now()

@@ -3,11 +3,13 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func openTemp(t *testing.T) (*Store, string) {
@@ -222,5 +224,139 @@ func TestPing(t *testing.T) {
 	s.Close()
 	if err := s.Ping(context.Background()); err == nil {
 		t.Fatal("Ping on a closed store returned nil")
+	}
+}
+
+var t0 = time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+
+const (
+	aliceID   = "DUAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	bobID     = "DUBBBBBBBBBBBBBBBBBBBBBBBBBB"
+	aliceCode = "ALICECODE"
+	bobCode   = "BOBCODE"
+)
+
+// enrolling returns a store where alice and bob each hold an activation code
+// valid from t0 for ten minutes.
+func enrolling(t *testing.T) *Store {
+	t.Helper()
+	s, _ := openTemp(t)
+	ctx := context.Background()
+	for _, u := range []struct{ id, name, code string }{{aliceID, "alice", aliceCode}, {bobID, "bob", bobCode}} {
+		if err := s.CreateEnrollment(ctx, u.id, u.name, u.code, t0, t0.Add(10*time.Minute)); err != nil {
+			t.Fatalf("CreateEnrollment %s: %v", u.name, err)
+		}
+	}
+	return s
+}
+
+func device(key string, at time.Time) Device {
+	return Device{DeviceKey: []byte("dk-" + key), ApprovalKey: []byte("ak-" + key), Attestation: []byte(`{"k":"` + key + `"}`), FID: "fid-" + key, EnrolledAt: at}
+}
+
+func TestCreateEnrollmentStoresOnlyCodeHash(t *testing.T) {
+	s := enrolling(t)
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM users WHERE instr(activation_hash, ?) > 0`, aliceCode).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("activation code stored in clear")
+	}
+}
+
+func TestEnrollThenStatus(t *testing.T) {
+	s := enrolling(t)
+	ctx := context.Background()
+	status := func(userID, code string, at time.Time) EnrollmentStatus {
+		t.Helper()
+		st, err := s.EnrollmentStatusOf(ctx, userID, code, at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+	if got := status(aliceID, aliceCode, t0); got != EnrollmentWaiting {
+		t.Fatalf("before enroll: %q, want waiting", got)
+	}
+	want := device("alice", t0.Add(time.Minute))
+	if err := s.Enroll(ctx, aliceCode, aliceID, want); err != nil {
+		t.Fatalf("Enroll: %v", err)
+	}
+	for _, tc := range []struct {
+		name, user, code string
+		at               time.Time
+		want             EnrollmentStatus
+	}{
+		{"enrolled", aliceID, aliceCode, t0.Add(time.Minute), EnrollmentSuccess},
+		{"enrolled, asked after expiry", aliceID, aliceCode, t0.Add(time.Hour), EnrollmentSuccess},
+		{"other user's code", aliceID, bobCode, t0, EnrollmentInvalid},
+		{"unknown user", "DUCCCCCCCCCCCCCCCCCCCCCCCCCC", aliceCode, t0, EnrollmentInvalid},
+		{"unenrolled bob", bobID, bobCode, t0, EnrollmentWaiting},
+		{"unenrolled bob after expiry", bobID, bobCode, t0.Add(10 * time.Minute), EnrollmentInvalid},
+	} {
+		if got := status(tc.user, tc.code, tc.at); got != tc.want {
+			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	got, err := s.DeviceOf(ctx, aliceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.DeviceKey) != string(want.DeviceKey) || string(got.ApprovalKey) != string(want.ApprovalKey) ||
+		string(got.Attestation) != string(want.Attestation) || got.FID != want.FID || !got.EnrolledAt.Equal(want.EnrolledAt) {
+		t.Fatalf("DeviceOf = %+v, want %+v", got, want)
+	}
+	if _, err := s.DeviceOf(ctx, bobID); !errors.Is(err, ErrNoDevice) {
+		t.Fatalf("DeviceOf bob = %v, want ErrNoDevice", err)
+	}
+}
+
+func TestEnrollRejectsReusedCode(t *testing.T) {
+	s := enrolling(t)
+	ctx := context.Background()
+	if err := s.Enroll(ctx, aliceCode, aliceID, device("first", t0)); err != nil {
+		t.Fatalf("first Enroll: %v", err)
+	}
+	if err := s.Enroll(ctx, aliceCode, aliceID, device("second", t0.Add(time.Second))); !errors.Is(err, ErrActivationUsed) {
+		t.Fatalf("second Enroll = %v, want ErrActivationUsed", err)
+	}
+	got, err := s.DeviceOf(ctx, aliceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got.DeviceKey) != "dk-first" {
+		t.Fatalf("device_key = %q after reuse, want the first device's", got.DeviceKey)
+	}
+}
+
+func TestEnrollRejectsExpiredCode(t *testing.T) {
+	s := enrolling(t)
+	ctx := context.Background()
+	if err := s.Enroll(ctx, aliceCode, aliceID, device("late", t0.Add(10*time.Minute))); !errors.Is(err, ErrActivationInvalid) {
+		t.Fatalf("Enroll at expiry = %v, want ErrActivationInvalid", err)
+	}
+	if err := s.Enroll(ctx, aliceCode, aliceID, device("in time", t0.Add(10*time.Minute-time.Second))); err != nil {
+		t.Fatalf("Enroll a second before expiry: %v", err)
+	}
+}
+
+func TestEnrollTakesUserFromCode(t *testing.T) {
+	s := enrolling(t)
+	ctx := context.Background()
+	if err := s.Enroll(ctx, aliceCode, bobID, device("mallory", t0)); !errors.Is(err, ErrUserMismatch) {
+		t.Fatalf("Enroll alice's code claiming bob = %v, want ErrUserMismatch", err)
+	}
+	for _, id := range []string{aliceID, bobID} {
+		if _, err := s.DeviceOf(ctx, id); !errors.Is(err, ErrNoDevice) {
+			t.Fatalf("DeviceOf %s = %v, want ErrNoDevice", id, err)
+		}
+	}
+}
+
+func TestEnrollRejectsUnknownCode(t *testing.T) {
+	s := enrolling(t)
+	if err := s.Enroll(context.Background(), "NOSUCHCODE", aliceID, device("x", t0)); !errors.Is(err, ErrActivationInvalid) {
+		t.Fatalf("Enroll unknown code = %v, want ErrActivationInvalid", err)
 	}
 }

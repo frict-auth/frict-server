@@ -29,6 +29,7 @@ leaf() {
   rm "$1.csr"
 }
 leaf stub duo.frict.test
+leaf frict frict.frict.test
 leaf ldap ldap.frict.test
 rm ca.key ca.srl
 
