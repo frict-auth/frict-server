@@ -27,6 +27,10 @@ exercised.
 
 ## How to reproduce
 
+The duo-stub these runs used was removed in M1 PR 3, when the e2e suite
+moved to frict-server and a fake phone. To rerun them, check out the M0
+close-out commit `3179c23`, then:
+
 ```sh
 go test -race ./...          # unit (needs cgo/gcc)
 e2e/run.sh                   # compose stack + e2e, FRICT_STUB_AUTH_DELAY=60s

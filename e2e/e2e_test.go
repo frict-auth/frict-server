@@ -1,8 +1,8 @@
 //go:build e2e
 
-// Package e2e logs in through a real Authentik using its flow-executor API.
-// Enrollment goes to frict-server, with a fake phone claiming the activation;
-// pushes still go to the duo-stub. Run it via e2e/run.sh.
+// Package e2e logs in through a real Authentik using its flow-executor API,
+// with frict-server as its Duo API and a fake phone that enrolls, polls for
+// challenges and answers them. Run it via e2e/run.sh.
 package e2e
 
 import (
@@ -27,25 +27,24 @@ import (
 )
 
 const (
-	duoHostname   = "duo.frict.test"
 	frictHostname = "frict.frict.test"
 	duoClientID   = "DIFRICTE2E0000000000"
 )
 
 var env struct {
-	baseURL     string
-	composeFile string
-	adminToken  string
-	duoSecret   string
-	stubDelay   time.Duration
-	suffix      string
-	flowSlug    string
-	goodDuoPK   string
-	badDuoPK    string
-	frictDuoPK  string
-	phoneClient *http.Client
-	userPass    string
-	adminClient *http.Client
+	baseURL      string
+	composeFile  string
+	adminToken   string
+	duoSecret    string
+	answerDelay  time.Duration // how long the phone takes to answer a push in the slow-human tests
+	challengeTTL time.Duration // frict-server's FRICT_CHALLENGE_TTL
+	suffix       string
+	flowSlug     string
+	badDuoPK     string
+	frictDuoPK   string
+	phoneClient  *http.Client
+	userPass     string
+	adminClient  *http.Client
 }
 
 func TestMain(m *testing.M) {
@@ -68,8 +67,14 @@ func setup() error {
 		return fmt.Errorf("FRICT_E2E_AUTHENTIK_URL, FRICT_E2E_COMPOSE_FILE and FRICT_E2E_SECRETS_DIR must be set (use e2e/run.sh)")
 	}
 	var err error
-	if env.stubDelay, err = time.ParseDuration(os.Getenv("FRICT_STUB_AUTH_DELAY")); err != nil {
-		return fmt.Errorf("FRICT_STUB_AUTH_DELAY: %w", err)
+	if env.answerDelay, err = time.ParseDuration(os.Getenv("FRICT_E2E_ANSWER_DELAY")); err != nil {
+		return fmt.Errorf("FRICT_E2E_ANSWER_DELAY: %w", err)
+	}
+	if env.challengeTTL, err = time.ParseDuration(os.Getenv("FRICT_CHALLENGE_TTL")); err != nil {
+		return fmt.Errorf("FRICT_CHALLENGE_TTL: %w", err)
+	}
+	if env.answerDelay+10*time.Second > env.challengeTTL {
+		return fmt.Errorf("FRICT_E2E_ANSWER_DELAY=%s leaves under 10s before FRICT_CHALLENGE_TTL=%s", env.answerDelay, env.challengeTTL)
 	}
 	if env.adminToken, err = readSecret("akadmin-token"); err != nil {
 		return err
@@ -95,18 +100,13 @@ func setup() error {
 		err := admin("POST", "/api/v3/stages/"+kind+"/", body, &out)
 		return out.PK, err
 	}
-	if env.goodDuoPK, err = stage("authenticator/duo", map[string]any{
-		"name": name("duo"), "client_id": duoClientID, "client_secret": env.duoSecret, "api_hostname": duoHostname,
-	}); err != nil {
-		return err
-	}
 	if env.frictDuoPK, err = stage("authenticator/duo", map[string]any{
 		"name": name("frict"), "client_id": duoClientID, "client_secret": env.duoSecret, "api_hostname": frictHostname,
 	}); err != nil {
 		return err
 	}
 	if env.badDuoPK, err = stage("authenticator/duo", map[string]any{
-		"name": name("duo-wrong-secret"), "client_id": duoClientID, "client_secret": env.duoSecret + "-wrong", "api_hostname": duoHostname,
+		"name": name("duo-wrong-secret"), "client_id": duoClientID, "client_secret": env.duoSecret + "-wrong", "api_hostname": frictHostname,
 	}); err != nil {
 		return err
 	}
@@ -391,7 +391,7 @@ func TestEnrollThroughFrictServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status, body := phoneEnroll(t, phone, act); status != http.StatusOK {
+	if status, body := enrollPhone(phone, act); status != http.StatusOK {
 		t.Fatalf("phone enroll: %d %s", status, body)
 	}
 	if got := b.enrollmentStatus(c.StageUUID); got != "success" {
@@ -406,27 +406,9 @@ func TestEnrollThroughFrictServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status, body := phoneEnroll(t, replay, act); status != http.StatusUnauthorized {
+	if status, body := enrollPhone(replay, act); status != http.StatusUnauthorized {
 		t.Fatalf("second phone with the same activation: %d %s, want 401", status, body)
 	}
-}
-
-func phoneEnroll(t *testing.T, phone *fakephone.Phone, act fakephone.Activation) (int, string) {
-	t.Helper()
-	req, err := phone.EnrollRequest(act, time.Now())
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp, err := env.phoneClient.Do(req)
-	if err != nil {
-		t.Fatalf("phone enroll: %v", err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return resp.StatusCode, string(body)
 }
 
 // enrollmentStatus asks Authentik for the enrollment status, as the setup
@@ -469,78 +451,4 @@ func duoDevices(t *testing.T, userPK int) int {
 		}
 	}
 	return n
-}
-
-// TestDuoPushSurvivesStubDelay proves M0 (c): Authentik waits for a /auth
-// call that blocks for FRICT_STUB_AUTH_DELAY and then logs the user in. The
-// user's device is imported on the stub's stage, so the push goes to the stub.
-func TestDuoPushSurvivesStubDelay(t *testing.T) {
-	username, _ := createUser(t, "alice")
-	if err := admin("POST", "/api/v3/stages/authenticator/duo/"+env.goodDuoPK+"/import_device_manual/",
-		map[string]any{"duo_user_id": "DUALICE" + env.suffix, "username": username}, nil); err != nil {
-		t.Fatal(err)
-	}
-
-	login := newBrowser(t)
-	c := login.expect(login.passwordStep(username), "ak-stage-authenticator-validate")
-	uid := duoDeviceUID(t, c)
-
-	start := time.Now()
-	c = login.do("POST", map[string]any{"component": "ak-stage-authenticator-validate", "duo": uid})
-	elapsed := time.Since(start)
-	t.Logf("Duo push round trip through Authentik: %s (stub delay %s)", elapsed.Round(time.Millisecond), env.stubDelay)
-
-	login.expect(c, "xak-flow-redirect")
-	if elapsed < env.stubDelay {
-		t.Fatalf("push returned after %s, before the stub's %s delay: Authentik did not wait for /auth", elapsed, env.stubDelay)
-	}
-	if status, who := login.whoami(); status != 200 || who != username {
-		t.Fatalf("after push login, users/me = %d %q, want 200 %q", status, who, username)
-	}
-}
-
-// TestWrongClientSecretFailsLogin proves M0 (a) end to end: a Duo stage
-// configured with the wrong client secret signs requests the stub rejects,
-// and Authentik refuses the login.
-func TestWrongClientSecretFailsLogin(t *testing.T) {
-	username, _ := createUser(t, "mallory")
-	if err := admin("POST", "/api/v3/stages/authenticator/duo/"+env.badDuoPK+"/import_device_manual/",
-		map[string]any{"duo_user_id": "DUMALLORY", "username": username}, nil); err != nil {
-		t.Fatal(err)
-	}
-
-	login := newBrowser(t)
-	c := login.expect(login.passwordStep(username), "ak-stage-authenticator-validate")
-	uid := duoDeviceUID(t, c)
-
-	start := time.Now()
-	c = login.do("POST", map[string]any{"component": "ak-stage-authenticator-validate", "duo": uid})
-	elapsed := time.Since(start)
-
-	login.expect(c, "ak-stage-authenticator-validate")
-	if errs := c.ResponseErrors["duo"]; len(errs) == 0 || errs[0].String != "Duo denied access" {
-		t.Fatalf("want 'Duo denied access' on the duo field: %s", c.raw)
-	}
-	if elapsed >= env.stubDelay {
-		t.Fatalf("rejection took %s, at least the stub's push delay: the stub ran /auth instead of rejecting", elapsed)
-	}
-	if status, who := login.whoami(); status == 200 {
-		t.Fatalf("login with a wrong Duo secret produced a session for %q", who)
-	}
-
-	var events struct {
-		Results []struct {
-			Context map[string]any `json:"context"`
-		} `json:"results"`
-	}
-	if err := admin("GET", "/api/v3/events/events/?action=configuration_error&username="+url.QueryEscape(username), nil, &events); err != nil {
-		t.Fatal(err)
-	}
-	const want = "Failed to DUO authenticate user: Received 401 Invalid signature in request credentials"
-	for _, e := range events.Results {
-		if e.Context["message"] == want {
-			return
-		}
-	}
-	t.Fatalf("no configuration_error event %q for %s; got %+v", want, username, events.Results)
 }

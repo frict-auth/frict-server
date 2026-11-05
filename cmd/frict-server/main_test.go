@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -41,8 +42,14 @@ func TestLoadConfig(t *testing.T) {
 		want    config
 		wantErr string
 	}{
-		{"defaults listen", full, config{":8080", "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db"}, ""},
-		{"listen set", with("FRICT_LISTEN", "127.0.0.1:9000"), config{"127.0.0.1:9000", "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db"}, ""},
+		{"defaults", full, config{":8080", "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", 60 * time.Second}, ""},
+		{"listen set", with("FRICT_LISTEN", "127.0.0.1:9000"), config{"127.0.0.1:9000", "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", 60 * time.Second}, ""},
+		{"challenge ttl 120s", with("FRICT_CHALLENGE_TTL", "120s"), config{":8080", "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", 120 * time.Second}, ""},
+		{"challenge ttl 90s", with("FRICT_CHALLENGE_TTL", "1m30s"), config{":8080", "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", 90 * time.Second}, ""},
+		{"challenge ttl below 60s", with("FRICT_CHALLENGE_TTL", "59s"), config{}, "FRICT_CHALLENGE_TTL"},
+		{"challenge ttl above 120s", with("FRICT_CHALLENGE_TTL", "121s"), config{}, "FRICT_CHALLENGE_TTL"},
+		{"challenge ttl fractional", with("FRICT_CHALLENGE_TTL", "60.5s"), config{}, "FRICT_CHALLENGE_TTL"},
+		{"challenge ttl no unit", with("FRICT_CHALLENGE_TTL", "90"), config{}, "FRICT_CHALLENGE_TTL"},
 		{"no hostname", without("FRICT_API_HOSTNAME"), config{}, "FRICT_API_HOSTNAME"},
 		{"no client id", without("FRICT_CLIENT_ID"), config{}, "FRICT_CLIENT_ID"},
 		{"no secret file", without("FRICT_CLIENT_SECRET_FILE"), config{}, "FRICT_CLIENT_SECRET_FILE"},
@@ -77,7 +84,7 @@ func testConfig(t *testing.T, secret string) config {
 	if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return config{APIHostname: "api.frict.test", ClientID: "DIXXXX", ClientSecretFile: secretFile, DBPath: filepath.Join(dir, "frict.db")}
+	return config{APIHostname: "api.frict.test", ClientID: "DIXXXX", ClientSecretFile: secretFile, DBPath: filepath.Join(dir, "frict.db"), ChallengeTTL: 60 * time.Second}
 }
 
 type running struct {
@@ -127,10 +134,12 @@ func TestRunServesWithConfiguredSecret(t *testing.T) {
 		t.Fatalf("/healthz = %d, want 200", resp.StatusCode)
 	}
 
+	// The right secret gets past the signature check to /auth's 400 for a
+	// user with no device.
 	for _, tc := range []struct {
 		skey string
 		want int
-	}{{"s3cret", http.StatusNotImplemented}, {"s3cret\n", http.StatusUnauthorized}, {"other", http.StatusUnauthorized}} {
+	}{{"s3cret", http.StatusBadRequest}, {"s3cret\n", http.StatusUnauthorized}, {"other", http.StatusUnauthorized}} {
 		body := `{"user_id":"DU1"}`
 		req, err := http.NewRequest(http.MethodPost, srv.url+"/auth/v2/auth", strings.NewReader(body))
 		if err != nil {
@@ -155,14 +164,20 @@ func TestRunServesWithConfiguredSecret(t *testing.T) {
 func TestRunFinishesInFlightRequestOnShutdown(t *testing.T) {
 	srv := start(t, testConfig(t, "s3cret"))
 
+	// The server sends 100 Continue when the handler first reads the body,
+	// so Got100Continue means the request is in flight.
+	reading := make(chan struct{})
+	ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{Got100Continue: func() { close(reading) }})
 	body, bodyW := io.Pipe()
-	req, err := http.NewRequest(http.MethodPost, srv.url+"/auth/v2/auth", body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.url+"/auth/v2/auth", body)
 	if err != nil {
 		t.Fatal(err)
 	}
+	req.Header.Set("Expect", "100-continue")
+	client := &http.Client{Transport: &http.Transport{ExpectContinueTimeout: time.Minute}}
 	got := make(chan int, 1)
 	go func() {
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Errorf("in-flight request failed: %v", err)
 			got <- 0
@@ -171,10 +186,14 @@ func TestRunFinishesInFlightRequestOnShutdown(t *testing.T) {
 		resp.Body.Close()
 		got <- resp.StatusCode
 	}()
+	select {
+	case <-reading:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not start reading the request body within 5s")
+	}
 	if _, err := bodyW.Write([]byte(`{"user_id":`)); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(100 * time.Millisecond) // let the server start reading the body
 
 	srv.cancel()
 	waitListenerClosed(t, strings.TrimPrefix(srv.url, "http://"))

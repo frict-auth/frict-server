@@ -14,8 +14,6 @@ x-authentik: &authentik
   depends_on:
     postgresql:
       condition: service_healthy
-    duo-stub:
-      condition: service_started
     frict-tls:
       condition: service_started
 
@@ -48,27 +46,6 @@ services:
     <<: *authentik
     command: worker
 
-  duo-stub:
-    build:
-      context: ..
-      dockerfile: e2e/duo-stub.Dockerfile
-    command:
-      - -hostname=duo.frict.test
-      - -client-id=DIFRICTE2E0000000000
-      - -client-secret-file=/secrets/duo-client-secret
-      - -tls-cert=/secrets/stub.pem
-      - -tls-key=/secrets/stub.key
-      - -auth-delay=${FRICT_STUB_AUTH_DELAY:-60s}
-      - -deny-user-ids=DUFRICTDENY
-    sysctls:
-      net.ipv4.ip_unprivileged_port_start: 0
-    volumes:
-      - ./secrets:/secrets:ro
-    networks:
-      default:
-        aliases:
-          - duo.frict.test
-
   frict-server:
     build:
       context: ..
@@ -78,6 +55,7 @@ services:
       FRICT_CLIENT_ID: DIFRICTE2E0000000000
       FRICT_CLIENT_SECRET_FILE: /secrets/duo-client-secret
       FRICT_DB_PATH: /data/frict.db
+      FRICT_CHALLENGE_TTL: ${FRICT_CHALLENGE_TTL:-90s}
     tmpfs:
       - /data:uid=65532,gid=65532,mode=0700
     volumes:

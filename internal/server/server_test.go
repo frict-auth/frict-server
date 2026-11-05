@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,13 +35,19 @@ var t0 = time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 
 // fixture is a Server on a fresh SQLite store whose clock the test moves.
 type fixture struct {
-	t     *testing.T
-	st    *store.Store
+	t   *testing.T
+	st  *store.Store
+	srv *Server
+	h   http.Handler
+
+	mu    sync.Mutex
 	clock time.Time
-	h     http.Handler
 }
 
-func newFixture(t *testing.T) *fixture {
+// newFixture's pushes expire after 60 s.
+func newFixture(t *testing.T) *fixture { return newFixtureTTL(t, 60*time.Second) }
+
+func newFixtureTTL(t *testing.T, challengeTTL time.Duration) *fixture {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "frict.db"))
 	if err != nil {
@@ -48,12 +55,25 @@ func newFixture(t *testing.T) *fixture {
 	}
 	t.Cleanup(func() { st.Close() })
 	f := &fixture{t: t, st: st, clock: t0}
-	f.h = New(f.verifier(), st, slog.New(slog.DiscardHandler)).Handler()
+	f.srv = New(f.verifier(), st, challengeTTL, slog.New(slog.DiscardHandler))
+	f.h = f.srv.Handler()
 	return f
 }
 
+func (f *fixture) now() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.clock
+}
+
+func (f *fixture) setClock(t time.Time) {
+	f.mu.Lock()
+	f.clock = t
+	f.mu.Unlock()
+}
+
 func (f *fixture) verifier() duosig.Verifier {
-	return duosig.Verifier{IKey: clientID, SKey: secret, Host: host, MaxSkew: 5 * time.Minute, Now: func() time.Time { return f.clock }}
+	return duosig.Verifier{IKey: clientID, SKey: secret, Host: host, MaxSkew: 5 * time.Minute, Now: f.now}
 }
 
 func (f *fixture) serve(r *http.Request) *httptest.ResponseRecorder {
@@ -66,7 +86,7 @@ func (f *fixture) serve(r *http.Request) *httptest.ResponseRecorder {
 func (f *fixture) duo(path, body, skey string) *httptest.ResponseRecorder {
 	f.t.Helper()
 	r := httptest.NewRequest(http.MethodPost, "https://"+host+path, strings.NewReader(body))
-	r.Header.Set("Date", f.clock.Format(time.RFC1123Z))
+	r.Header.Set("Date", f.now().Format(time.RFC1123Z))
 	r.Header.Set("Content-Type", "application/json")
 	if err := duosig.Sign(r, []byte(body), clientID, skey, host); err != nil {
 		f.t.Fatalf("Sign: %v", err)
@@ -157,7 +177,9 @@ func TestAuthAPIRequiresDuoSignature(t *testing.T) {
 		want int
 	}{
 		{"enroll signed", func() *httptest.ResponseRecorder { return f.duo("/auth/v2/enroll", `{"username":"alice"}`, secret) }, http.StatusOK},
-		{"auth signed", func() *httptest.ResponseRecorder { return f.duo("/auth/v2/auth", `{"user_id":"DU1"}`, secret) }, http.StatusNotImplemented},
+		{"auth signed, unknown user", func() *httptest.ResponseRecorder {
+			return f.duo("/auth/v2/auth", `{"factor":"auto","user_id":"DU1"}`, secret)
+		}, http.StatusBadRequest},
 		{"enroll unsigned", func() *httptest.ResponseRecorder { return f.serve(unsigned("/auth/v2/enroll")) }, http.StatusUnauthorized},
 		{"enroll_status unsigned", func() *httptest.ResponseRecorder { return f.serve(unsigned("/auth/v2/enroll_status")) }, http.StatusUnauthorized},
 		{"auth unsigned", func() *httptest.ResponseRecorder { return f.serve(unsigned("/auth/v2/auth")) }, http.StatusUnauthorized},
@@ -181,7 +203,7 @@ func TestDuoSignedPassesBodyThrough(t *testing.T) {
 	const body = `{"username":"élodie"}`
 	f := newFixture(t)
 	var got string
-	h := New(f.verifier(), f.st, slog.New(slog.DiscardHandler)).duoSigned(func(w http.ResponseWriter, r *http.Request) {
+	h := New(f.verifier(), f.st, time.Minute, slog.New(slog.DiscardHandler)).duoSigned(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read body: %v", err)
@@ -268,8 +290,8 @@ func TestDeviceEnrollThenStatusSuccess(t *testing.T) {
 		t.Fatalf("before enroll: %q, want waiting", got)
 	}
 	phone := newPhone(t)
-	f.clock = t0.Add(time.Minute)
-	w := f.serve(must[*http.Request](t)(phone.EnrollRequest(a, f.clock)))
+	f.setClock(t0.Add(time.Minute))
+	w := f.serve(must[*http.Request](t)(phone.EnrollRequest(a, f.now())))
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "{}" {
 		t.Fatalf("enroll: %d %s, want 200 {}", w.Code, w.Body)
 	}
@@ -287,7 +309,7 @@ func TestDeviceEnrollThenStatusSuccess(t *testing.T) {
 	}
 	if string(dev.DeviceKey) != string(spki(t, &phone.DeviceKey.PublicKey)) ||
 		string(dev.ApprovalKey) != string(spki(t, &phone.ApprovalKey.PublicKey)) ||
-		string(dev.Attestation) != string(sent.Attestation) || dev.FID != phone.FID || !dev.EnrolledAt.Equal(f.clock) {
+		string(dev.Attestation) != string(sent.Attestation) || dev.FID != phone.FID || !dev.EnrolledAt.Equal(f.now()) {
 		t.Fatalf("stored device %+v does not match the phone's enrollment", dev)
 	}
 }
@@ -309,7 +331,7 @@ func TestDeviceEnrollTakesUserFromActivationCode(t *testing.T) {
 	alice, bob := f.enroll("alice"), f.enroll("bob")
 	phone := newPhone(t)
 	claimBob := fakephone.Activation{Host: host, UserID: bob.UserID, Code: alice.Code}
-	f.rejectEnroll(must[*http.Request](t)(phone.EnrollRequest(claimBob, f.clock)), alice)
+	f.rejectEnroll(must[*http.Request](t)(phone.EnrollRequest(claimBob, f.now())), alice)
 	if _, err := f.st.DeviceOf(context.Background(), bob.UserID); !errors.Is(err, store.ErrNoDevice) {
 		t.Fatalf("bob has a device enrolled with alice's code (err %v)", err)
 	}
@@ -322,10 +344,10 @@ func TestDeviceEnrollRejectsReusedCode(t *testing.T) {
 	f := newFixture(t)
 	a := f.enroll("alice")
 	first, second := newPhone(t), newPhone(t)
-	if w := f.serve(must[*http.Request](t)(first.EnrollRequest(a, f.clock))); w.Code != http.StatusOK {
+	if w := f.serve(must[*http.Request](t)(first.EnrollRequest(a, f.now()))); w.Code != http.StatusOK {
 		t.Fatalf("first enroll: %d %s", w.Code, w.Body)
 	}
-	w := f.serve(must[*http.Request](t)(second.EnrollRequest(a, f.clock)))
+	w := f.serve(must[*http.Request](t)(second.EnrollRequest(a, f.now())))
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("second enroll with the same code: %d %s, want 401", w.Code, w.Body)
 	}
@@ -341,8 +363,8 @@ func TestDeviceEnrollRejectsReusedCode(t *testing.T) {
 func TestDeviceEnrollRejectsExpiredCode(t *testing.T) {
 	f := newFixture(t)
 	a := f.enroll("alice")
-	f.clock = t0.Add(ActivationValidity)
-	f.rejectEnroll(must[*http.Request](t)(newPhone(t).EnrollRequest(a, f.clock)), a)
+	f.setClock(t0.Add(ActivationValidity))
+	f.rejectEnroll(must[*http.Request](t)(newPhone(t).EnrollRequest(a, f.now())), a)
 	if got := f.status(a); got != "invalid" {
 		t.Fatalf("expired, unenrolled: %q, want invalid", got)
 	}
@@ -353,7 +375,7 @@ func TestDeviceEnrollRejectsTimestampOutsideWindow(t *testing.T) {
 		t.Run(offset.String(), func(t *testing.T) {
 			f := newFixture(t)
 			a := f.enroll("alice")
-			f.rejectEnroll(must[*http.Request](t)(newPhone(t).EnrollRequest(a, f.clock.Add(offset))), a)
+			f.rejectEnroll(must[*http.Request](t)(newPhone(t).EnrollRequest(a, f.now().Add(offset))), a)
 		})
 	}
 }
@@ -363,7 +385,7 @@ func TestDeviceEnrollRejectsSignatureByWrongKey(t *testing.T) {
 	a := f.enroll("alice")
 	phone, thief := newPhone(t), newPhone(t)
 	body := must[[]byte](t)(phone.EnrollBody(a.Code))
-	r := must[*http.Request](t)(fakephone.SignedRequest("https://"+host, fakephone.EnrollPath, a.UserID, f.clock.Unix(), body, thief.DeviceKey))
+	r := must[*http.Request](t)(fakephone.SignedRequest("https://"+host, fakephone.EnrollPath, a.UserID, f.now().Unix(), body, thief.DeviceKey))
 	f.rejectEnroll(r, a)
 }
 
@@ -372,9 +394,9 @@ func TestDeviceEnrollRejectsSignatureForAnotherPath(t *testing.T) {
 	a := f.enroll("alice")
 	phone := newPhone(t)
 	body := must[[]byte](t)(phone.EnrollBody(a.Code))
-	sig := must[string](t)(fakephone.Sign(phone.DeviceKey, a.UserID, f.clock.Unix(), "/device/v1/fid", body))
+	sig := must[string](t)(fakephone.Sign(phone.DeviceKey, a.UserID, f.now().Unix(), "/device/v1/fid", body))
 	r := httptest.NewRequest(http.MethodPost, "https://"+host+fakephone.EnrollPath, strings.NewReader(string(body)))
-	r.Header.Set("Authorization", "Frict-P256 "+a.UserID+":"+strconv.FormatInt(f.clock.Unix(), 10)+":"+sig)
+	r.Header.Set("Authorization", "Frict-P256 "+a.UserID+":"+strconv.FormatInt(f.now().Unix(), 10)+":"+sig)
 	f.rejectEnroll(r, a)
 }
 
@@ -383,7 +405,7 @@ func TestDeviceEnrollRejectsMalformedUserID(t *testing.T) {
 	a := f.enroll("alice")
 	phone := newPhone(t)
 	for _, id := range []string{strings.ToLower(a.UserID), a.UserID + "\n", a.UserID[:27] + "0"} {
-		f.rejectEnroll(must[*http.Request](t)(phone.EnrollRequest(fakephone.Activation{Host: host, UserID: id, Code: a.Code}, f.clock)), a)
+		f.rejectEnroll(must[*http.Request](t)(phone.EnrollRequest(fakephone.Activation{Host: host, UserID: id, Code: a.Code}, f.now())), a)
 	}
 }
 
@@ -424,7 +446,7 @@ func TestDeviceEnrollRejectsMalformedBody(t *testing.T) {
 			}
 			mutate(m)
 			body := must[[]byte](t)(json.Marshal(m))
-			f.rejectEnroll(must[*http.Request](t)(fakephone.SignedRequest("https://"+host, fakephone.EnrollPath, a.UserID, f.clock.Unix(), body, phone.DeviceKey)), a)
+			f.rejectEnroll(must[*http.Request](t)(fakephone.SignedRequest("https://"+host, fakephone.EnrollPath, a.UserID, f.now().Unix(), body, phone.DeviceKey)), a)
 		})
 	}
 }
@@ -453,7 +475,7 @@ func TestHealthz(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			New(f.verifier(), tc.store, slog.New(slog.DiscardHandler)).Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			New(f.verifier(), tc.store, time.Minute, slog.New(slog.DiscardHandler)).Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 			if w.Code != tc.want {
 				t.Fatalf("status = %d, want %d", w.Code, tc.want)
 			}

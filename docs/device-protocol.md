@@ -129,7 +129,17 @@ and server state on every request. Not worth it for a read and an FID.
 ## Endpoints
 
 All under `https://<api host>/device/v1/`. Responses are JSON. Errors are
-`{"error": "<code>"}` with a matching HTTP status.
+`{"error": "<code>"}` with a matching HTTP status:
+
+| Status | `error` | When |
+|---|---|---|
+| 400 | `bad_request` | The body doesn't parse, has unknown or missing fields, or a value outside those listed below. |
+| 401 | `unauthorized` | Any verification failure, including a user with no enrolled device. |
+| 404 | `not_found` | See each endpoint. |
+| 409 | `not_pending` | `answer` only. |
+
+The signature is checked before the body is parsed, so an unsigned or
+badly signed request gets `401` whatever its body.
 
 ### Activation (Duo side)
 
@@ -192,6 +202,35 @@ signature, a body with unknown or missing fields or a key that is not
 P-256, and an activation code that is unknown, expired, already used or
 issued for another user.
 
+### Login (Duo side)
+
+Authentik's Duo validation stage calls `/auth/v2/auth` synchronously with
+`factor=auto`, `async=0`, `user_id`, `ipaddr`, `type`, `display_username`,
+`device=auto` and `pushinfo`
+(`authentik/stages/authenticator_validate/challenge.py:276-290`). Frict
+answers `400` (`stat: FAIL`) for `async=1`, a factor other than `auto` or
+`push`, or a `user_id` with no enrolled device; Authentik records that as a
+configuration error (`challenge.py:307-314`).
+
+Otherwise Frict creates a challenge and holds the call open until the
+device answers, the challenge expires (`FRICT_CHALLENGE_TTL`, 60–120 s,
+default 60 s), or Authentik's request ends. A challenge leaves `pending`
+when it is answered, or becomes `expired` when it times out or the call
+ends, so the device never sees a challenge nobody is waiting on.
+
+The response is `stat: OK` with Duo's `result`, `status` and `status_msg`.
+Authentik reads only `result` (`challenge.py:292`) but records the whole
+response in its `login_failed` event on a deny (`challenge.py:294-305`,
+under `auth_method_args.duo_response`), so the `status` values are Duo's
+own (duo.com/docs/authapi, `/auth` status values):
+
+| Outcome | `result` | `status` | `status_msg` |
+|---|---|---|---|
+| approve | `allow` | `allow` | `Success. Logging you in...` |
+| deny, `cancel` | `deny` | `deny` | `Login request denied.` |
+| deny, `not_me` | `deny` | `fraud` | `Login request reported as fraudulent.` |
+| expired | `deny` | `timeout` | `Login timed out.` |
+
 ### `challenge` (signed with `device_key`)
 
 Request `{"challenge_id": "<22 chars>"}`. The ID is 16 random bytes,
@@ -201,18 +240,22 @@ Response:
 
 ```json
 {"challenge_id": "…", "username": "…", "ipaddr": "203.0.113.7",
- "pushinfo": "Domain=…&Application=…", "created": 1762345678, "expires": 1762345768}
+ "pushinfo": "Domain=…&Application=…", "type": "authentik Login request",
+ "created": 1762345678, "expires": 1762345768}
 ```
 
-`pushinfo` is passed through from Authentik's `/auth` call as sent.
+`username` (Authentik's `display_username`), `ipaddr`, `pushinfo` and
+`type` are passed through from Authentik's `/auth` call as sent; any of
+them may be empty. `created` and `expires` are unix seconds.
 `404` if the ID is unknown, belongs to another user, or is no longer
 pending.
 
 ### `pending` (signed with `device_key`)
 
-Request `{}`. Response `{"challenge_ids": ["…"], "poll_interval": 5}`: the
-user's pending challenges, and how many seconds to wait before polling again
-(server-set, as in CIBA).
+Request `{}`: an object with no fields. Response
+`{"challenge_ids": ["…"], "poll_interval": 5}`: the user's pending,
+unexpired challenges, oldest first (an empty list when there are none), and
+how many seconds to wait before polling again (server-set, as in CIBA).
 
 ### `answer` (signed with `approval_key`)
 
@@ -225,8 +268,10 @@ user's pending challenges, and how many seconds to wait before polling again
 | `decision` | `approve` or `deny` |
 | `reason` | Required with `deny`, absent with `approve`: `not_me` ("I didn't start this": pauses pushes and alerts, see PLAN Safeguards) or `cancel`. |
 
-`200 {}` on success; `409` if the challenge is no longer pending; `404` as for
-`challenge`.
+Any other combination, including `deny` with no `reason`, is `400`.
+`200 {}` on success; `409` if the challenge was already answered or has
+expired, however recently; `404` if the ID is unknown or belongs to another
+user. Only the first answer counts.
 
 ### `fid` (signed with `device_key`)
 
