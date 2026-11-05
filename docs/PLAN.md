@@ -6,7 +6,7 @@ Greek chain of fire-beacon towers that relayed signals across the land.
 GitHub org `frict-auth`: `frict-server`, `frict-android`, later `frict-ios`.
 Domain `frict.app`; Android application ID `app.frict.android`.
 
-Plan v1 — 2026-10-30. Status: planning; nothing built yet.
+Plan v1 — 2026-10-30. Status: M0 done (GO); M1 in progress.
 
 ---
 
@@ -125,9 +125,11 @@ bundle of 15 roots. ISRG (Let's Encrypt) is not among them. Authentik passes
 no CA option, so the bundle is always used.
 
 - **Route A (chosen): Let's Encrypt, with the system CA bundle mounted over
-  `duo_client`'s `ca_certs.pem`** in the Authentik server and worker. The
-  mounted file is the Authentik image's own
-  `/etc/ssl/certs/ca-certificates.crt`, copied out of the image. Proven in
+  `duo_client`'s `ca_certs.pem`** in the Authentik server and worker. In
+  production the mounted file is the host's
+  `/etc/ssl/certs/ca-certificates.crt`, kept current by the host's
+  `ca-certificates` package. Dev and e2e copy the Authentik image's own
+  `/etc/ssl/certs/ca-certificates.crt` out of the image instead. Proven in
   M0: inside the 2026.8.5 image (`duo_client` 5.6.1) a `duo_client` call to
   a Let's Encrypt host completes the handshake with the mount and fails
   certificate verification without it (`docs/m0-findings.md` (b)). The
@@ -429,8 +431,8 @@ host.
   loopback only.
 - Let's Encrypt certificate for `api.frict.app`, alongside `auth.` and
   `chat-relay.`.
-- Authentik server and worker: system CA bundle mounted over `duo_client`'s
-  `ca_certs.pem` (appendix).
+- Authentik server and worker: the host's system CA bundle mounted over
+  `duo_client`'s `ca_certs.pem` (appendix).
 - `/home/deploy/frict/{data,secrets}` owned by uid 65532; FCM key at
   `secrets/fcm-sa.json`, mode 0400.
 - Deploy check: `scripts/duo-tls-check.sh` against `https://api.frict.app`
@@ -511,8 +513,9 @@ upload. Keep the name in one constant per codebase.
 
 ## Open / unverified
 
-- Push over LDAP bind (M0 d).
-- Login page cannot show a number (M0).
+M0 settled push over an LDAP bind and that the login page cannot show a
+number (`docs/m0-findings.md` (d) and "Number matching").
+
 - FCM `validate_only` semantics.
 - Whether Authentik will accept a per-stage `disable_ca_pinning` option.
 
@@ -524,20 +527,19 @@ upload. Keep the name in one constant per codebase.
 plugin, as for `auth.` and `chat-relay.`. The CAA records in "Production
 setup" must exist first.
 
-**2. Mount, on every Authentik image upgrade.** Copy the image's system
-bundle out, then mount it over `duo_client`'s bundle in **both** the server
+**2. Mount, checked on every Authentik image upgrade.** Mount the host's
+`/etc/ssl/certs/ca-certificates.crt` (kept current by the host's
+`ca-certificates` package) over `duo_client`'s bundle in **both** the server
 and the worker. Read the target path from the installed package rather than
-assuming it:
+assuming it; it changes with the image's Python version:
 ```bash
 IMAGE=ghcr.io/goauthentik/server:<version>@sha256:<digest>
 docker run --rm --entrypoint python "$IMAGE" \
   -c 'import duo_client.client as c; print(c.DEFAULT_CA_CERTS)'
-docker run --rm --entrypoint cat "$IMAGE" /etc/ssl/certs/ca-certificates.crt \
-  > system-ca.pem
 ```
 ```yaml
     volumes:
-      - ./system-ca.pem:<DEFAULT_CA_CERTS printed above>:ro
+      - /etc/ssl/certs/ca-certificates.crt:<DEFAULT_CA_CERTS printed above>:ro
 ```
 
 **3. Deploy check, after every Authentik or certificate change.** Fails on
