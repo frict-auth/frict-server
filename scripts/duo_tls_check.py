@@ -29,13 +29,18 @@ def main(url: str) -> int:
         return 2
     host = parts.hostname
 
-    with open(DEFAULT_CA_CERTS, "rb") as f:
-        bundle = f.read()
     print(f"duo_client {version('duo_client')}  {ssl.OPENSSL_VERSION}")
+    try:
+        with open(DEFAULT_CA_CERTS, "rb") as f:
+            bundle = f.read()
+    except OSError as e:
+        print(f"FAIL other: cannot read duo_client ca_certs {DEFAULT_CA_CERTS}: {e}")
+        return 2
     print(f"ca_certs {DEFAULT_CA_CERTS}  roots={bundle.count(b'BEGIN CERTIFICATE')}  sha256={hashlib.sha256(bundle).hexdigest()}")
     print(f"host {host}")
 
     client = duo_client.Auth("DIXXXXXXXXXXXXXXXXXX", "x" * 40, host, timeout=15)
+    # Not ping(): it raises on a non-JSON 404, and only the handshake is under test.
     try:
         response, _ = client.api_call("GET", "/auth/v2/ping", {})
     except ssl.SSLError as e:

@@ -408,13 +408,17 @@ host.
 - **Grey cloud is mandatory.** A proxied (orange) record makes Cloudflare
   terminate TLS with its own certificate, which Duo's pinning will reject
   or accept unpredictably. Same model as `auth.itsalwaysreefreemas.org`.
-- CAA is less restrictive than it looks: with Universal SSL on (the
-  default), adding any CAA record makes Cloudflare add records for its own
-  CAs too (Let's Encrypt, Google Trust Services, SSL.com, Sectigo), so
-  `pki.goog` and others stay authorized.
-- Enable DNSSEC on the zone. It is one click only because `frict.app` is on
-  Cloudflare Registrar, which publishes the DS record itself; with another
-  registrar the DS record is added there by hand.
+- CAA is less restrictive than it looks. Per Cloudflare's docs (not tested
+  here), with Universal SSL, adding any CAA record makes Cloudflare add CAA
+  records for the CAs it issues Universal certificates from, and that list
+  changes over time
+  ([CAA records](https://developers.cloudflare.com/ssl/edge-certificates/caa-records/)).
+- Enable DNSSEC on the zone. Per Cloudflare's docs (not tested here), it is
+  one click on Cloudflare Registrar, where `frict.app` is, because Cloudflare
+  publishes the DS record itself (taking one to two days); with another
+  registrar the DS record is added there by hand
+  ([DNSSEC](https://developers.cloudflare.com/dns/dnssec/),
+  [Registrar DNSSEC](https://developers.cloudflare.com/registrar/get-started/enable-dnssec/)).
 - `.app` is on the HSTS preload list: every `*.frict.app` host must serve
   HTTPS. Nothing else is needed for `api.`.
 - Nothing at the apex or `www` yet.
