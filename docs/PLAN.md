@@ -106,12 +106,14 @@ is always offered it over TOTP (#22816).
   directions, a reason on every deny, poll fallback.
 - From NIST 800-63B-4: cap on pushes since the last successful login; a
   failed-attempt counter that a new challenge does not reset. Decisions:
-  - Push cap: a total since the last successful login; once over it, one
-    push per `FRICT_PUSH_COOLDOWN`, so the lock lifts by itself (§3.1.3.2
-    limit; §3.2.2 waiting-period technique).
+  - Push cap: a total since the last successful login; once it is reached,
+    one push per `FRICT_PUSH_COOLDOWN`, so the lock lifts by itself
+    (§3.1.3.2 limit; §3.2.2 waiting-period technique).
   - Failed attempts: denies and timeouts, not reset by a new challenge,
     reset only by a successful login on that device; at `FRICT_MAX_FAILED`
     (at most 100) the device is disabled (§3.1.3.2, §3.2.2).
+    `FRICT_MAX_FAILED` is a live threshold: raising it re-enables devices
+    disabled under the old limit.
   - Recovery from a disabled device: an Authentik admin deletes the user's
     Duo device and the user re-enrolls, which gives a new Frict user with
     fresh counters. Frict has no admin tool (§3.2.2 "disabling that

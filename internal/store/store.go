@@ -239,6 +239,27 @@ func (s *Store) DeviceOf(ctx context.Context, userID string) (Device, error) {
 	return d, nil
 }
 
+// SetFID sets where userID's device is pushed to.
+func (s *Store) SetFID(ctx context.Context, userID, fid string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE devices SET fid = ? WHERE user_id = ?`, fid, userID)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrNoDevice
+	}
+	return nil
+}
+
+// ClearFID forgets userID's FID if it is still fid, leaving the device
+// enrolled. A device that has since sent a new FID keeps it.
+func (s *Store) ClearFID(ctx context.Context, userID, fid string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE devices SET fid = NULL WHERE user_id = ? AND fid = ?`, userID, fid)
+	return err
+}
+
 // ChallengeStatus is a challenge's state in the challenges table.
 type ChallengeStatus string
 
@@ -505,6 +526,32 @@ type Alert struct {
 	Type            string
 	AttemptedAt     time.Time
 	ReportedAt      time.Time
+}
+
+// AlertRecipient is one alert a not_me deny created, and whose device gets
+// it.
+type AlertRecipient struct {
+	AlertID []byte
+	UserID  string
+}
+
+// AlertRecipients returns the alerts created for challengeID.
+func (s *Store) AlertRecipients(ctx context.Context, challengeID []byte) ([]AlertRecipient, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, recipient_user_id FROM alerts WHERE challenge_id = ? ORDER BY recipient_user_id`, challengeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AlertRecipient
+	for rows.Next() {
+		var a AlertRecipient
+		if err := rows.Scan(&a.AlertID, &a.UserID); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // Alerts returns recipientUserID's alerts created at or after since, oldest
