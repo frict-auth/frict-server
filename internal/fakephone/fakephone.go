@@ -19,7 +19,12 @@ import (
 	"time"
 )
 
-const EnrollPath = "/device/v1/enroll"
+const (
+	EnrollPath    = "/device/v1/enroll"
+	PendingPath   = "/device/v1/pending"
+	ChallengePath = "/device/v1/challenge"
+	AnswerPath    = "/device/v1/answer"
+)
 
 type Phone struct {
 	DeviceKey   *ecdsa.PrivateKey
@@ -94,6 +99,59 @@ func (p *Phone) EnrollRequest(a Activation, now time.Time) (*http.Request, error
 		return nil, err
 	}
 	return SignedRequest("https://"+a.Host, EnrollPath, a.UserID, now.Unix(), body, p.DeviceKey)
+}
+
+// PendingRequest asks for a's pending challenges, signed with the
+// device_key.
+func (p *Phone) PendingRequest(a Activation, now time.Time) (*http.Request, error) {
+	return SignedRequest("https://"+a.Host, PendingPath, a.UserID, now.Unix(), []byte("{}"), p.DeviceKey)
+}
+
+// Pending is the answer to a PendingRequest.
+type Pending struct {
+	ChallengeIDs []string `json:"challenge_ids"`
+	PollInterval int      `json:"poll_interval"`
+}
+
+// ChallengeRequest fetches challenge id's details, signed with the
+// device_key.
+func (p *Phone) ChallengeRequest(a Activation, id string, now time.Time) (*http.Request, error) {
+	body, err := json.Marshal(map[string]string{"challenge_id": id})
+	if err != nil {
+		return nil, err
+	}
+	return SignedRequest("https://"+a.Host, ChallengePath, a.UserID, now.Unix(), body, p.DeviceKey)
+}
+
+// Challenge is the answer to a ChallengeRequest: what the app shows the
+// user.
+type Challenge struct {
+	ChallengeID string `json:"challenge_id"`
+	Username    string `json:"username"`
+	IPAddr      string `json:"ipaddr"`
+	PushInfo    string `json:"pushinfo"`
+	Type        string `json:"type"`
+	Created     int64  `json:"created"`
+	Expires     int64  `json:"expires"`
+}
+
+// AnswerBody is an answer's JSON body. An empty reason is left out.
+func AnswerBody(id, decision, reason string) ([]byte, error) {
+	m := map[string]string{"challenge_id": id, "decision": decision}
+	if reason != "" {
+		m["reason"] = reason
+	}
+	return json.Marshal(m)
+}
+
+// AnswerRequest answers challenge id with decision ("approve" or "deny")
+// and reason, signed with the approval_key.
+func (p *Phone) AnswerRequest(a Activation, id, decision, reason string, now time.Time) (*http.Request, error) {
+	body, err := AnswerBody(id, decision, reason)
+	if err != nil {
+		return nil, err
+	}
+	return SignedRequest("https://"+a.Host, AnswerPath, a.UserID, now.Unix(), body, p.ApprovalKey)
 }
 
 // SignedRequest builds a POST to base+path whose Authorization header claims

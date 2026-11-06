@@ -75,8 +75,8 @@ func TestOpenMigratesEmptyDatabaseToFrozenSchema(t *testing.T) {
 }
 
 // TestOpenMigratesPriorSchemaCopy loads each frozen schema older than the
-// current one and requires Open to bring it to the current schema. With one
-// schema version, the only prior one is the empty database.
+// current one, and the empty database, and requires Open to bring it to the
+// current schema.
 func TestOpenMigratesPriorSchemaCopy(t *testing.T) {
 	current, err := os.ReadFile(goldenPath(len(migrations)))
 	if err != nil {
@@ -358,5 +358,187 @@ func TestEnrollRejectsUnknownCode(t *testing.T) {
 	s := enrolling(t)
 	if err := s.Enroll(context.Background(), "NOSUCHCODE", aliceID, device("x", t0)); !errors.Is(err, ErrActivationInvalid) {
 		t.Fatalf("Enroll unknown code = %v, want ErrActivationInvalid", err)
+	}
+}
+
+// enrolled returns a store where alice and bob each have a device.
+func enrolled(t *testing.T) *Store {
+	t.Helper()
+	s := enrolling(t)
+	for _, u := range []struct{ id, code string }{{aliceID, aliceCode}, {bobID, bobCode}} {
+		if err := s.Enroll(context.Background(), u.code, u.id, device(u.id, t0)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return s
+}
+
+func challengeID(b byte) []byte { return []byte{b, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, b} }
+
+// pushTo stores a pending challenge for userID created at at, expiring a
+// minute later.
+func pushTo(t *testing.T, s *Store, id []byte, userID string, at time.Time) Challenge {
+	t.Helper()
+	c := Challenge{ID: id, UserID: userID, DisplayUsername: "alice", IPAddr: "203.0.113.7",
+		PushInfo: "Domain=auth.example&Application=Grafana", Type: "authentik Login request",
+		CreatedAt: at, ExpiresAt: at.Add(time.Minute)}
+	if err := s.CreateChallenge(context.Background(), c); err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	return c
+}
+
+func pendingIDs(t *testing.T, s *Store, userID string, now time.Time) []string {
+	t.Helper()
+	cs, err := s.PendingChallenges(context.Background(), userID, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, c := range cs {
+		ids = append(ids, fmt.Sprintf("%x", c.ID))
+	}
+	return ids
+}
+
+func TestPendingChallengesAreTheUsersUnexpiredOnes(t *testing.T) {
+	s := enrolled(t)
+	ctx := context.Background()
+	pushTo(t, s, challengeID(1), aliceID, t0)
+	pushTo(t, s, challengeID(2), aliceID, t0.Add(30*time.Second))
+	pushTo(t, s, challengeID(3), bobID, t0)
+	answered := pushTo(t, s, challengeID(4), aliceID, t0)
+	if err := s.AnswerChallenge(ctx, answered.ID, aliceID, Outcome{Status: ChallengeApproved}, t0); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := pendingIDs(t, s, aliceID, t0.Add(59*time.Second)), []string{fmt.Sprintf("%x", challengeID(1)), fmt.Sprintf("%x", challengeID(2))}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("alice pending at t0+59s = %v, want %v", got, want)
+	}
+	if got := pendingIDs(t, s, aliceID, t0.Add(time.Minute)); len(got) != 1 || got[0] != fmt.Sprintf("%x", challengeID(2)) {
+		t.Fatalf("alice pending at t0+60s = %v, want only the second", got)
+	}
+}
+
+func TestPendingChallengeDetails(t *testing.T) {
+	s := enrolled(t)
+	ctx := context.Background()
+	want := pushTo(t, s, challengeID(1), aliceID, t0)
+	got, err := s.PendingChallenge(ctx, want.ID, aliceID, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprintf("%+v", got) != fmt.Sprintf("%+v", Challenge{ID: want.ID, UserID: aliceID, DisplayUsername: want.DisplayUsername,
+		IPAddr: want.IPAddr, PushInfo: want.PushInfo, Type: want.Type, CreatedAt: time.Unix(t0.Unix(), 0), ExpiresAt: time.Unix(want.ExpiresAt.Unix(), 0)}) {
+		t.Fatalf("PendingChallenge = %+v, want %+v", got, want)
+	}
+	for name, tc := range map[string]struct {
+		user string
+		at   time.Time
+	}{
+		"another user's": {bobID, t0},
+		"expired":        {aliceID, t0.Add(time.Minute)},
+	} {
+		if _, err := s.PendingChallenge(ctx, want.ID, tc.user, tc.at); !errors.Is(err, ErrChallengeNotFound) {
+			t.Errorf("%s: %v, want ErrChallengeNotFound", name, err)
+		}
+	}
+}
+
+func TestAnswerChallengeOnce(t *testing.T) {
+	for _, answer := range []Outcome{
+		{Status: ChallengeApproved},
+		{Status: ChallengeDenied, Reason: "not_me"},
+		{Status: ChallengeDenied, Reason: "cancel"},
+	} {
+		t.Run(string(answer.Status)+answer.Reason, func(t *testing.T) {
+			s := enrolled(t)
+			ctx := context.Background()
+			c := pushTo(t, s, challengeID(1), aliceID, t0)
+			if err := s.AnswerChallenge(ctx, c.ID, aliceID, answer, t0.Add(time.Second)); err != nil {
+				t.Fatalf("first answer: %v", err)
+			}
+			if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeApproved}, t0.Add(2*time.Second)); !errors.Is(err, ErrChallengeNotPending) {
+				t.Fatalf("second answer: %v, want ErrChallengeNotPending", err)
+			}
+			got, err := s.CloseChallenge(ctx, c.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != answer {
+				t.Fatalf("outcome %+v, want the first answer %+v", got, answer)
+			}
+		})
+	}
+}
+
+func TestAnswerChallengeRejected(t *testing.T) {
+	s := enrolled(t)
+	ctx := context.Background()
+	c := pushTo(t, s, challengeID(1), aliceID, t0)
+	approve := Outcome{Status: ChallengeApproved}
+	if err := s.AnswerChallenge(ctx, c.ID, bobID, approve, t0); !errors.Is(err, ErrChallengeNotFound) {
+		t.Fatalf("bob answering alice's challenge: %v, want ErrChallengeNotFound", err)
+	}
+	if err := s.AnswerChallenge(ctx, challengeID(9), aliceID, approve, t0); !errors.Is(err, ErrChallengeNotFound) {
+		t.Fatalf("unknown challenge: %v, want ErrChallengeNotFound", err)
+	}
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, approve, c.ExpiresAt); !errors.Is(err, ErrChallengeNotPending) {
+		t.Fatalf("answer at expiry: %v, want ErrChallengeNotPending", err)
+	}
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeDenied}, t0); err == nil {
+		t.Fatal("deny without a reason accepted")
+	}
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeDenied, Reason: "bored"}, t0); err == nil {
+		t.Fatal("deny with an unknown reason accepted")
+	}
+	if got := pendingIDs(t, s, aliceID, t0); len(got) != 1 {
+		t.Fatalf("rejected answers changed the challenge: pending %v", got)
+	}
+}
+
+func TestCloseChallengeExpiresPending(t *testing.T) {
+	s := enrolled(t)
+	ctx := context.Background()
+	c := pushTo(t, s, challengeID(1), aliceID, t0)
+	got, err := s.CloseChallenge(ctx, c.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != (Outcome{Status: ChallengeExpired}) {
+		t.Fatalf("CloseChallenge on a pending challenge = %+v, want expired", got)
+	}
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeApproved}, t0); !errors.Is(err, ErrChallengeNotPending) {
+		t.Fatalf("answer after close: %v, want ErrChallengeNotPending", err)
+	}
+}
+
+// TestEnrollConcurrentSameCode: of several devices racing to enroll with one
+// activation code, exactly one succeeds and the rest get ErrActivationUsed.
+func TestEnrollConcurrentSameCode(t *testing.T) {
+	s := enrolling(t)
+	const racers = 8
+	errs := make(chan error, racers)
+	start := make(chan struct{})
+	for i := range racers {
+		go func() {
+			<-start
+			errs <- s.Enroll(context.Background(), aliceCode, aliceID, device(fmt.Sprint(i), t0))
+		}()
+	}
+	close(start)
+	var ok, used int
+	for range racers {
+		switch err := <-errs; {
+		case err == nil:
+			ok++
+		case errors.Is(err, ErrActivationUsed):
+			used++
+		default:
+			t.Errorf("Enroll: %v", err)
+		}
+	}
+	if ok != 1 || used != racers-1 {
+		t.Fatalf("%d enrolls succeeded and %d got ErrActivationUsed, want 1 and %d", ok, used, racers-1)
 	}
 }

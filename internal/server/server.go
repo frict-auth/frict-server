@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/frict-auth/frict-server/internal/devicesig"
@@ -30,6 +31,10 @@ const (
 	// ActivationValidity is how long an activation code from /auth/v2/enroll
 	// can enroll a device. Authentik sends no valid_secs.
 	ActivationValidity = 15 * time.Minute
+
+	// PollInterval is how many seconds a device waits between polls of
+	// /device/v1/pending.
+	PollInterval = 5
 )
 
 type Store interface {
@@ -37,18 +42,31 @@ type Store interface {
 	CreateEnrollment(ctx context.Context, userID, username, code string, now, expires time.Time) error
 	EnrollmentStatusOf(ctx context.Context, userID, code string, now time.Time) (store.EnrollmentStatus, error)
 	Enroll(ctx context.Context, code, claimedUserID string, d store.Device) error
+	DeviceOf(ctx context.Context, userID string) (store.Device, error)
+	CreateChallenge(ctx context.Context, c store.Challenge) error
+	PendingChallenges(ctx context.Context, userID string, now time.Time) ([]store.Challenge, error)
+	PendingChallenge(ctx context.Context, id []byte, userID string, now time.Time) (store.Challenge, error)
+	AnswerChallenge(ctx context.Context, id []byte, userID string, answer store.Outcome, now time.Time) error
+	CloseChallenge(ctx context.Context, id []byte) (store.Outcome, error)
 }
 
 // Server serves one Authentik Duo stage. The verifier's Host is the API
 // hostname devices are sent to, and its Now is the server's clock.
 type Server struct {
-	verifier duosig.Verifier
-	store    Store
-	log      *slog.Logger
+	verifier     duosig.Verifier
+	store        Store
+	challengeTTL time.Duration
+	log          *slog.Logger
+
+	mu       sync.Mutex
+	answered map[string]chan struct{} // challenge ID -> closed when the device answers
 }
 
-func New(v duosig.Verifier, st Store, log *slog.Logger) *Server {
-	return &Server{verifier: v, store: st, log: log}
+// New returns a Server whose pushes expire challengeTTL after /auth/v2/auth
+// creates them. challengeTTL is whole seconds, since the store keeps
+// timestamps in seconds.
+func New(v duosig.Verifier, st Store, challengeTTL time.Duration, log *slog.Logger) *Server {
+	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, log: log, answered: map[string]chan struct{}{}}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -56,8 +74,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.healthz)
 	mux.Handle("POST /auth/v2/enroll", s.duoSigned(s.duoEnroll))
 	mux.Handle("POST /auth/v2/enroll_status", s.duoSigned(s.duoEnrollStatus))
-	mux.Handle("POST /auth/v2/auth", s.duoSigned(notImplemented))
+	mux.Handle("POST /auth/v2/auth", s.duoSigned(s.duoAuth))
 	mux.HandleFunc("POST /device/v1/enroll", s.deviceEnroll)
+	mux.HandleFunc("POST /device/v1/pending", s.devicePending)
+	mux.HandleFunc("POST /device/v1/challenge", s.deviceChallenge)
+	mux.HandleFunc("POST /device/v1/answer", s.deviceAnswer)
 	return mux
 }
 
@@ -90,10 +111,6 @@ func (s *Server) duoSigned(next http.HandlerFunc) http.Handler {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		next(w, r)
 	})
-}
-
-func notImplemented(w http.ResponseWriter, r *http.Request) {
-	duoFail(w, http.StatusNotImplemented, 50100, r.URL.Path+" is not implemented yet")
 }
 
 // duoParams decodes the JSON object of string parameters duo_client sends.
@@ -221,9 +238,7 @@ var errBadEnroll = errors.New("malformed enroll body")
 // its device_key, which must have signed the request.
 func parseEnroll(body []byte) (enrollRequest, store.Device, *ecdsa.PublicKey, error) {
 	var req enrollRequest
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := decodeStrict(body, &req); err != nil {
 		return req, store.Device{}, nil, fmt.Errorf("%w: %v", errBadEnroll, err)
 	}
 	if req.ActivationCode == "" || req.FID == "" {
@@ -250,15 +265,28 @@ func parseP256(s string) ([]byte, *ecdsa.PublicKey, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	key, err := p256FromDER(der)
+	return der, key, err
+}
+
+func p256FromDER(der []byte) (*ecdsa.PublicKey, error) {
 	pub, err := x509.ParsePKIXPublicKey(der)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	key, ok := pub.(*ecdsa.PublicKey)
 	if !ok || key.Curve != elliptic.P256() {
-		return nil, nil, errors.New("not a P-256 key")
+		return nil, errors.New("not a P-256 key")
 	}
-	return der, key, nil
+	return key, nil
+}
+
+// decodeStrict decodes a JSON value from body into v, rejecting unknown
+// fields.
+func decodeStrict(body []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
 }
 
 // checkAttestation requires a chain of base64url certificates for each key.

@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -15,32 +16,36 @@ import (
 
 // Names shared with compose.yaml and e2e/sssd/*.conf.
 const (
-	ldapURI       = "ldaps://ldap.frict.test:6636"
-	ldapBaseDN    = "dc=frict,dc=test"
-	ldapSvcUser   = "ldap-svc"
-	denyDuoUserID = "DUFRICTDENY" // in the stub's -deny-user-ids
-	sssdDefault   = "sssd-default"
-	sssdTuned     = "sssd-tuned"
+	ldapURI     = "ldaps://ldap.frict.test:6636"
+	ldapBaseDN  = "dc=frict,dc=test"
+	ldapSvcUser = "ldap-svc"
+	sssdDefault = "sssd-default"
+	sssdTuned   = "sssd-tuned"
 	// sssdDefaultOptTimeout is SSSD's ldap_opt_timeout default, which bounds
 	// the user's simple bind (sssd-ldap(5); ldap_auth.c auth_do_bind).
 	sssdDefaultOptTimeout = 8 * time.Second
 )
 
-// One LDAP user per test, so each test can count its own pushes in the stub
-// log. Every user's password is env.userPass.
-var ldapUsers = map[string]string{ // username -> Duo user ID on the stub
-	"ldap-alice":   "DUFRICTALICE", // plain LDAP bind, approved
-	"ldap-bob":     "DUFRICTBOB",   // PAM via default SSSD
-	"ldap-carol":   "DUFRICTCAROL", // PAM via tuned SSSD
-	"ldap-mallory": denyDuoUserID,  // denied: LDAP bind and PAM via tuned SSSD
+// One LDAP user per test, so each test can count its own pushes in
+// frict-server's log. Every user's password is env.userPass.
+var ldapUsers = []string{
+	"ldap-alice",   // plain LDAP bind, approved
+	"ldap-bob",     // PAM via default SSSD
+	"ldap-carol",   // PAM via tuned SSSD
+	"ldap-mallory", // denied: LDAP bind and PAM via tuned SSSD
 }
+
+// ldapDevices holds each LDAP user's phone, enrolled on frict-server by
+// setupLDAP.
+var ldapDevices = map[string]device{}
 
 func userDN(username string) string { return "cn=" + username + ",ou=users," + ldapBaseDN }
 
 // setupLDAP adds an LDAP provider whose bind flow is
 // identification -> password -> Duo validation -> login, an outpost for it,
-// the service account SSSD searches with, and two users with Duo devices on
-// the stub; then starts the outpost and both SSSD clients and waits for them.
+// the service account SSSD searches with, and users whose phones are
+// enrolled on frict-server; then starts the outpost and both SSSD clients and
+// waits for them.
 func setupLDAP(stage func(string, map[string]any) (string, error), ident, pass, login string) error {
 	validate, err := stage("authenticator/validate", map[string]any{
 		"name": "frict-m0-ldap-validate", "device_classes": []string{"duo"},
@@ -129,14 +134,19 @@ func setupLDAP(stage func(string, map[string]any) (string, error), ident, pass, 
 	if _, err := newUser(map[string]any{"username": ldapSvcUser, "name": ldapSvcUser, "roles": []string{role.PK}}, svcPass); err != nil {
 		return err
 	}
-	for username, duoID := range ldapUsers {
+	for _, username := range ldapUsers {
 		if _, err := newUser(map[string]any{"username": username, "name": username}, env.userPass); err != nil {
 			return err
 		}
-		if err := admin("POST", "/api/v3/stages/authenticator/duo/"+env.goodDuoPK+"/import_device_manual/",
-			map[string]any{"duo_user_id": duoID, "username": username}, nil); err != nil {
+		d, err := enrollViaDuoAPI(username)
+		if err != nil {
 			return err
 		}
+		if err := admin("POST", "/api/v3/stages/authenticator/duo/"+env.frictDuoPK+"/import_device_manual/",
+			map[string]any{"duo_user_id": d.act.UserID, "username": username}, nil); err != nil {
+			return err
+		}
+		ldapDevices[username] = d
 	}
 
 	up := composeCmd("up", "--detach", "--no-deps", "--wait", "--wait-timeout", "120", "ldap")
@@ -221,68 +231,117 @@ func pamAuth(svc, username string) result {
 	return inContainer(svc, env.userPass+"\n", "pamtester", "-v", "frict-test", username, "authenticate")
 }
 
-// pushesSince counts the pushes the stub received for username's Duo device
-// since t.
+// pushesSince counts the challenges frict-server created for username's
+// phone since t.
 func pushesSince(t *testing.T, username string, since time.Time) int {
 	t.Helper()
-	out, err := composeCmd("logs", "--no-color", "--since", since.UTC().Format(time.RFC3339Nano), "duo-stub").CombinedOutput()
+	out, err := composeCmd("logs", "--no-color", "--since", since.UTC().Format(time.RFC3339Nano), "frict-server").CombinedOutput()
 	if err != nil {
-		t.Fatalf("duo-stub logs: %v\n%s", err, out)
+		t.Fatalf("frict-server logs: %v\n%s", err, out)
 	}
-	return strings.Count(string(out), `msg="auth blocking" user_id=`+ldapUsers[username]+" ")
+	return strings.Count(string(out), `msg="challenge created" user_id=`+ldapDevices[username].act.UserID+" ")
+}
+
+// answerPushes has username's phone answer each of its pushes
+// FRICT_E2E_ANSWER_DELAY after first seeing it, until the test ends.
+func answerPushes(t *testing.T, username, decision, reason string) {
+	t.Helper()
+	d := ldapDevices[username]
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		seen := map[string]time.Time{}
+		answered := map[string]bool{}
+		tick := time.NewTicker(time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+			ids, err := d.pending()
+			if err != nil {
+				t.Errorf("%s's phone: %v", username, err)
+				return
+			}
+			for _, id := range ids {
+				if _, ok := seen[id]; !ok {
+					seen[id] = time.Now()
+				}
+			}
+			for id, at := range seen {
+				if answered[id] || time.Since(at) < env.answerDelay {
+					continue
+				}
+				answered[id] = true
+				if status, body := d.answer(id, decision, reason); status != 200 {
+					t.Errorf("%s's phone: answer %s: %d %s", username, decision, status, body)
+				}
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 }
 
 func requireDelayAbove(t *testing.T, d time.Duration) {
 	t.Helper()
-	if env.stubDelay <= d+2*time.Second {
-		t.Fatalf("FRICT_STUB_AUTH_DELAY=%s must exceed %s by more than 2s for this test to mean anything", env.stubDelay, d)
+	if env.answerDelay <= d+2*time.Second {
+		t.Fatalf("FRICT_E2E_ANSWER_DELAY=%s must exceed %s by more than 2s for this test to mean anything", env.answerDelay, d)
 	}
 }
 
 // TestLDAPBindWaitsForPush proves M0 (d): a plain simple bind (no TOTP
-// suffix) through the outpost runs the bind flow, which sends one Duo push to
-// the stub, waits for the stub's delay, and succeeds.
+// suffix) through the outpost runs the bind flow, which sends one push to
+// frict-server, waits for the phone's approval, and succeeds.
 func TestLDAPBindWaitsForPush(t *testing.T) {
 	const user = "ldap-alice"
+	answerPushes(t, user, "approve", "")
 	start := time.Now()
 	r := ldapSearch(sssdTuned, user, env.userPass, userDN(user))
-	t.Logf("bind+search as %s: exit %d after %s (stub delay %s)\n%s", user, r.exit, r.elapsed.Round(time.Millisecond), env.stubDelay, r.out)
+	t.Logf("bind+search as %s: exit %d after %s (answer delay %s)\n%s", user, r.exit, r.elapsed.Round(time.Millisecond), env.answerDelay, r.out)
 	if r.exit != 0 || !strings.Contains(r.out, "cn: "+user) {
 		t.Fatalf("bind as %s failed: exit %d\n%s", user, r.exit, r.out)
 	}
-	if r.elapsed < env.stubDelay {
-		t.Fatalf("bind returned after %s, before the stub's %s delay: no push was waited for", r.elapsed, env.stubDelay)
+	if r.elapsed < env.answerDelay {
+		t.Fatalf("bind returned after %s, before the phone's %s answer delay: no push was waited for", r.elapsed, env.answerDelay)
 	}
 	if n := pushesSince(t, user, start); n != 1 {
-		t.Fatalf("stub saw %d pushes for %s, want 1", n, user)
+		t.Fatalf("frict-server created %d challenges for %s, want 1", n, user)
 	}
 }
 
-// TestLDAPBindFailsWhenPushDenied: the stub denies mallory's push after the
+// TestLDAPBindFailsWhenPushDenied: mallory's phone denies the push after the
 // delay, and the bind must fail with invalidCredentials (49).
 func TestLDAPBindFailsWhenPushDenied(t *testing.T) {
 	const user = "ldap-mallory"
+	answerPushes(t, user, "deny", "cancel")
 	start := time.Now()
 	r := ldapSearch(sssdTuned, user, env.userPass, userDN(user))
-	t.Logf("bind+search as %s: exit %d after %s (stub delay %s)\n%s", user, r.exit, r.elapsed.Round(time.Millisecond), env.stubDelay, r.out)
+	t.Logf("bind+search as %s: exit %d after %s (answer delay %s)\n%s", user, r.exit, r.elapsed.Round(time.Millisecond), env.answerDelay, r.out)
 	if r.exit != 49 {
 		t.Fatalf("bind with denied push: exit %d, want 49 (invalidCredentials)\n%s", r.exit, r.out)
 	}
-	if r.elapsed < env.stubDelay {
-		t.Fatalf("bind failed after %s, before the stub's %s delay: it failed before the push was answered", r.elapsed, env.stubDelay)
+	if r.elapsed < env.answerDelay {
+		t.Fatalf("bind failed after %s, before the phone's %s answer delay: it failed before the push was answered", r.elapsed, env.answerDelay)
 	}
 	if n := pushesSince(t, user, start); n != 1 {
-		t.Fatalf("stub saw %d pushes for %s, want 1", n, user)
+		t.Fatalf("frict-server created %d challenges for %s, want 1", n, user)
 	}
 }
 
 // TestSSSDDefaultTimeoutsLosePush documents M0 (e)'s baseline: with SSSD's
 // default timeouts the user's bind times out after ldap_opt_timeout (8 s),
 // SSSD reconnects and binds again, and each new bind sends another push.
-// PAM auth fails even though every push is approved.
+// PAM auth fails even though the phone approves every push.
 func TestSSSDDefaultTimeoutsLosePush(t *testing.T) {
 	const user = "ldap-bob"
 	requireDelayAbove(t, sssdDefaultOptTimeout)
+	answerPushes(t, user, "approve", "")
 	// The backend keeps re-binding after pamtester gives up; stopping the
 	// container ends that so it doesn't load the rest of the run.
 	t.Cleanup(func() {
@@ -293,12 +352,12 @@ func TestSSSDDefaultTimeoutsLosePush(t *testing.T) {
 	start := time.Now()
 	r := pamAuth(sssdDefault, user)
 	n := pushesSince(t, user, start)
-	t.Logf("pam auth (%s) as %s: exit %d after %s, %d pushes (stub delay %s)\n%s", sssdDefault, user, r.exit, r.elapsed.Round(time.Millisecond), n, env.stubDelay, r.out)
+	t.Logf("pam auth (%s) as %s: exit %d after %s, %d pushes (answer delay %s)\n%s", sssdDefault, user, r.exit, r.elapsed.Round(time.Millisecond), n, env.answerDelay, r.out)
 	if r.exit == 0 {
-		t.Fatalf("PAM auth with default SSSD timeouts succeeded; expected it to lose the %s push", env.stubDelay)
+		t.Fatalf("PAM auth with default SSSD timeouts succeeded; expected it to lose a push answered after %s", env.answerDelay)
 	}
 	if want := int(r.elapsed / sssdDefaultOptTimeout); n < 2 || n > want+1 {
-		t.Fatalf("stub saw %d pushes for %s in %s; want about one per %s (%d)", n, user, r.elapsed, sssdDefaultOptTimeout, want)
+		t.Fatalf("frict-server created %d challenges for %s in %s; want about one per %s (%d)", n, user, r.elapsed, sssdDefaultOptTimeout, want)
 	}
 }
 
@@ -307,18 +366,19 @@ func TestSSSDDefaultTimeoutsLosePush(t *testing.T) {
 func TestSSSDTunedSurvivesPush(t *testing.T) {
 	const user = "ldap-carol"
 	requireDelayAbove(t, sssdDefaultOptTimeout)
+	answerPushes(t, user, "approve", "")
 	start := time.Now()
 	r := pamAuth(sssdTuned, user)
 	n := pushesSince(t, user, start)
-	t.Logf("pam auth (%s) as %s: exit %d after %s, %d pushes (stub delay %s)\n%s", sssdTuned, user, r.exit, r.elapsed.Round(time.Millisecond), n, env.stubDelay, r.out)
+	t.Logf("pam auth (%s) as %s: exit %d after %s, %d pushes (answer delay %s)\n%s", sssdTuned, user, r.exit, r.elapsed.Round(time.Millisecond), n, env.answerDelay, r.out)
 	if r.exit != 0 || !strings.Contains(r.out, "successfully authenticated") {
 		t.Fatalf("PAM auth with tuned SSSD failed: exit %d\n%s", r.exit, r.out)
 	}
-	if r.elapsed < env.stubDelay {
-		t.Fatalf("PAM auth returned after %s, before the stub's %s delay", r.elapsed, env.stubDelay)
+	if r.elapsed < env.answerDelay {
+		t.Fatalf("PAM auth returned after %s, before the phone's %s answer delay", r.elapsed, env.answerDelay)
 	}
 	if n != 1 {
-		t.Fatalf("stub saw %d pushes for %s, want 1", n, user)
+		t.Fatalf("frict-server created %d challenges for %s, want 1", n, user)
 	}
 }
 
@@ -327,17 +387,18 @@ func TestSSSDTunedSurvivesPush(t *testing.T) {
 func TestSSSDTunedFailsWhenPushDenied(t *testing.T) {
 	const user = "ldap-mallory"
 	requireDelayAbove(t, sssdDefaultOptTimeout)
+	answerPushes(t, user, "deny", "cancel")
 	start := time.Now()
 	r := pamAuth(sssdTuned, user)
 	n := pushesSince(t, user, start)
-	t.Logf("pam auth (%s) as %s: exit %d after %s, %d pushes (stub delay %s)\n%s", sssdTuned, user, r.exit, r.elapsed.Round(time.Millisecond), n, env.stubDelay, r.out)
+	t.Logf("pam auth (%s) as %s: exit %d after %s, %d pushes (answer delay %s)\n%s", sssdTuned, user, r.exit, r.elapsed.Round(time.Millisecond), n, env.answerDelay, r.out)
 	if r.exit == 0 || !strings.Contains(r.out, "Authentication failure") {
 		t.Fatalf("PAM auth with a denied push: exit %d, want PAM_AUTH_ERR (Authentication failure)\n%s", r.exit, r.out)
 	}
-	if r.elapsed < env.stubDelay {
-		t.Fatalf("PAM auth failed after %s, before the stub's %s delay: not the denial", r.elapsed, env.stubDelay)
+	if r.elapsed < env.answerDelay {
+		t.Fatalf("PAM auth failed after %s, before the phone's %s answer delay: not the denial", r.elapsed, env.answerDelay)
 	}
 	if n != 1 {
-		t.Fatalf("stub saw %d pushes for %s, want 1", n, user)
+		t.Fatalf("frict-server created %d challenges for %s, want 1", n, user)
 	}
 }

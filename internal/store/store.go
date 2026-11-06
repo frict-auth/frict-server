@@ -48,6 +48,8 @@ var migrations = []string{
 		CHECK ((status = 'denied') = (reason IS NOT NULL)),
 		CHECK ((status IN ('approved', 'denied')) = (answered_at IS NOT NULL))
 	) STRICT;`,
+	`ALTER TABLE challenges ADD COLUMN display_username TEXT NOT NULL DEFAULT '';
+	ALTER TABLE challenges ADD COLUMN type TEXT NOT NULL DEFAULT '';`,
 }
 
 type Store struct {
@@ -57,7 +59,10 @@ type Store struct {
 // Open opens the database at path, creating the file and migrating the
 // schema to the current version if needed.
 func Open(path string) (*Store, error) {
-	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)"
+	// _txlock=immediate takes the write lock at BEGIN, so concurrent
+	// read-then-write transactions wait on busy_timeout instead of failing
+	// SQLITE_BUSY when one upgrades after another has written.
+	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -223,4 +228,145 @@ func (s *Store) DeviceOf(ctx context.Context, userID string) (Device, error) {
 	d.FID = fid.String
 	d.EnrolledAt = time.Unix(enrolled, 0)
 	return d, nil
+}
+
+// ChallengeStatus is a challenge's state in the challenges table.
+type ChallengeStatus string
+
+const (
+	ChallengePending  ChallengeStatus = "pending"
+	ChallengeApproved ChallengeStatus = "approved"
+	ChallengeDenied   ChallengeStatus = "denied"
+	ChallengeExpired  ChallengeStatus = "expired"
+)
+
+var (
+	ErrChallengeNotFound   = errors.New("challenge unknown or belongs to another user")
+	ErrChallengeNotPending = errors.New("challenge already answered or expired")
+)
+
+// Challenge is one push: what Authentik's /auth call asked the user to
+// approve. The display fields are stored as Authentik sent them.
+type Challenge struct {
+	ID              []byte
+	UserID          string
+	DisplayUsername string
+	IPAddr          string
+	PushInfo        string
+	Type            string
+	CreatedAt       time.Time
+	ExpiresAt       time.Time
+}
+
+// Outcome is how a challenge ended. Reason is set only for a denial.
+type Outcome struct {
+	Status ChallengeStatus
+	Reason string
+}
+
+func (s *Store) CreateChallenge(ctx context.Context, c Challenge) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO challenges (id, user_id, display_username, ipaddr, pushinfo, type, created_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.UserID, c.DisplayUsername, c.IPAddr, c.PushInfo, c.Type, c.CreatedAt.Unix(), c.ExpiresAt.Unix())
+	return err
+}
+
+const challengeColumns = `id, user_id, display_username, ipaddr, pushinfo, type, created_at, expires_at`
+
+func scanChallenge(row interface{ Scan(...any) error }) (Challenge, error) {
+	var c Challenge
+	var created, expires int64
+	err := row.Scan(&c.ID, &c.UserID, &c.DisplayUsername, &c.IPAddr, &c.PushInfo, &c.Type, &created, &expires)
+	c.CreatedAt, c.ExpiresAt = time.Unix(created, 0), time.Unix(expires, 0)
+	return c, err
+}
+
+// PendingChallenges returns userID's challenges that are pending and
+// unexpired at now, oldest first.
+func (s *Store) PendingChallenges(ctx context.Context, userID string, now time.Time) ([]Challenge, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT `+challengeColumns+` FROM challenges
+		 WHERE user_id = ? AND status = 'pending' AND expires_at > ?
+		 ORDER BY created_at, id`,
+		userID, now.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Challenge
+	for rows.Next() {
+		c, err := scanChallenge(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// PendingChallenge returns challenge id if it belongs to userID and is
+// pending and unexpired at now; otherwise ErrChallengeNotFound.
+func (s *Store) PendingChallenge(ctx context.Context, id []byte, userID string, now time.Time) (Challenge, error) {
+	c, err := scanChallenge(s.db.QueryRowContext(ctx,
+		`SELECT `+challengeColumns+` FROM challenges
+		 WHERE id = ? AND user_id = ? AND status = 'pending' AND expires_at > ?`,
+		id, userID, now.Unix()))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Challenge{}, ErrChallengeNotFound
+	}
+	return c, err
+}
+
+// AnswerChallenge moves userID's challenge id from pending to answer's
+// status, once: only while it is pending and unexpired at now. It returns
+// ErrChallengeNotFound if no such challenge belongs to userID and
+// ErrChallengeNotPending if it was already answered or has expired.
+func (s *Store) AnswerChallenge(ctx context.Context, id []byte, userID string, answer Outcome, now time.Time) error {
+	var reason sql.NullString
+	if answer.Reason != "" {
+		reason = sql.NullString{String: answer.Reason, Valid: true}
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE challenges SET status = ?, reason = ?, answered_at = ?
+		 WHERE id = ? AND user_id = ? AND status = 'pending' AND expires_at > ?`,
+		string(answer.Status), reason, now.Unix(), id, userID, now.Unix())
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 1 {
+		return nil
+	}
+	var exists bool
+	err = s.db.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM challenges WHERE id = ? AND user_id = ?)`, id, userID).Scan(&exists)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return ErrChallengeNotFound
+	}
+	return ErrChallengeNotPending
+}
+
+// CloseChallenge expires challenge id if it is still pending and returns how
+// it ended.
+func (s *Store) CloseChallenge(ctx context.Context, id []byte) (Outcome, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return Outcome{}, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE challenges SET status = 'expired' WHERE id = ? AND status = 'pending'`, id); err != nil {
+		return Outcome{}, err
+	}
+	var o Outcome
+	var reason sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT status, reason FROM challenges WHERE id = ?`, id).Scan(&o.Status, &reason); err != nil {
+		return Outcome{}, err
+	}
+	o.Reason = reason.String
+	return o, tx.Commit()
 }

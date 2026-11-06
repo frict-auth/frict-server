@@ -8,6 +8,7 @@
 //	FRICT_CLIENT_ID           Duo stage client ID (required)
 //	FRICT_CLIENT_SECRET_FILE  file holding the Duo stage client secret (required)
 //	FRICT_DB_PATH             SQLite database file, created if missing (required)
+//	FRICT_CHALLENGE_TTL       how long a push waits for the device's answer: whole seconds from 60s to 120s (default 60s)
 //
 // SIGINT or SIGTERM stops accepting connections and waits up to 15 s for
 // in-flight requests.
@@ -31,7 +32,15 @@ import (
 	"github.com/frict-auth/frict-server/internal/store"
 )
 
-const shutdownGrace = 15 * time.Second
+const (
+	shutdownGrace = 15 * time.Second
+
+	defaultChallengeTTL = 60 * time.Second
+	minChallengeTTL     = 60 * time.Second
+	// maxChallengeTTL stays well inside the ~213 s after which Authentik
+	// answers the login with HTTP 408 (docs/m0-findings.md (c′)).
+	maxChallengeTTL = 120 * time.Second
+)
 
 type config struct {
 	Listen           string
@@ -39,6 +48,7 @@ type config struct {
 	ClientID         string
 	ClientSecretFile string
 	DBPath           string
+	ChallengeTTL     time.Duration
 }
 
 func loadConfig(getenv func(string) string) (config, error) {
@@ -51,6 +61,14 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}
 	if c.Listen == "" {
 		c.Listen = ":8080"
+	}
+	c.ChallengeTTL = defaultChallengeTTL
+	if v := getenv("FRICT_CHALLENGE_TTL"); v != "" {
+		ttl, err := time.ParseDuration(v)
+		if err != nil || ttl < minChallengeTTL || ttl > maxChallengeTTL || ttl%time.Second != 0 {
+			return config{}, fmt.Errorf("FRICT_CHALLENGE_TTL=%q: want whole seconds from %s to %s", v, minChallengeTTL, maxChallengeTTL)
+		}
+		c.ChallengeTTL = ttl
 	}
 	var missing []string
 	for _, req := range []struct{ name, value string }{
@@ -117,13 +135,13 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 		Now:     time.Now,
 	}
 	srv := &http.Server{
-		Handler:           server.New(v, st, log).Handler(),
+		Handler:           server.New(v, st, cfg.ChallengeTTL, log).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	served := make(chan error, 1)
 	go func() { served <- srv.Serve(ln) }()
-	log.Info("listening", "addr", ln.Addr().String(), "api_hostname", cfg.APIHostname)
+	log.Info("listening", "addr", ln.Addr().String(), "api_hostname", cfg.APIHostname, "challenge_ttl", cfg.ChallengeTTL.String())
 
 	select {
 	case err := <-served:
