@@ -346,15 +346,27 @@ func TestRunWithoutFCMSaysPollOnly(t *testing.T) {
 	}
 }
 
-func TestRunRejectsUnreadableFCMKey(t *testing.T) {
-	cfg := testConfig(t, "s3cret")
-	cfg.FCM = fcmConfig{ProjectID: "frict-test", CredentialsFile: filepath.Join(t.TempDir(), "absent.json")}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
+func TestRunRejectsBadFCMKey(t *testing.T) {
+	dir := t.TempDir()
+	userCreds := filepath.Join(dir, "user.json")
+	if err := os.WriteFile(userCreds, []byte(`{"type":"authorized_user","client_id":"x","client_secret":"y","refresh_token":"z"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err = run(context.Background(), cfg, ln, slog.New(slog.DiscardHandler))
-	if err == nil || !strings.Contains(err.Error(), "FRICT_FCM_CREDENTIALS_FILE") {
-		t.Fatalf("run = %v, want an error naming FRICT_FCM_CREDENTIALS_FILE", err)
+	for _, tc := range []struct{ name, file, wantErr string }{
+		{"missing file", filepath.Join(dir, "absent.json"), "read FRICT_FCM_CREDENTIALS_FILE"},
+		{"not a service account", userCreds, "service_account"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := testConfig(t, "s3cret")
+			cfg.FCM = fcmConfig{ProjectID: "frict-test", CredentialsFile: tc.file}
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = run(context.Background(), cfg, ln, slog.New(slog.DiscardHandler))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("run = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }

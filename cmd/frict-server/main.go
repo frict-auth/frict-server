@@ -284,15 +284,9 @@ func newSender(cfg fcmConfig) (push.Sender, error) {
 		return nil, fmt.Errorf("read FRICT_FCM_CREDENTIALS_FILE: %w", err)
 	}
 	client := &http.Client{Timeout: fcmTimeout}
-	tokens, err := fcmTokenSource(key, client)
+	tokens, err := push.ServiceAccountTokens(key, client)
 	if err != nil {
 		return nil, fmt.Errorf("FCM service-account key %s: %w", cfg.CredentialsFile, err)
 	}
 	return push.NewFCM(push.FCMBaseURL, cfg.ProjectID, tokens, client), nil
-}
-
-// fcmTokenSource returns a token source for push.FCMScope from a
-// service-account key, minting tokens over client.
-func fcmTokenSource(key []byte, client *http.Client) (push.TokenSource, error) {
-	return nil, errors.New("this build has no OAuth token source; unset FRICT_FCM_* to run poll-only")
 }
