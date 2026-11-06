@@ -72,6 +72,7 @@ func (s *Server) duoAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("challenge created", "user_id", userID, "challenge_id", encodeID(id), "expires_in", s.challengeTTL.String())
+	s.wake(userID, map[string]string{"challenge_id": encodeID(id)})
 
 	timer := time.NewTimer(s.challengeTTL)
 	defer timer.Stop()
@@ -339,5 +340,8 @@ func (s *Server) deviceAnswer(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("challenge answered", "user_id", userID, "challenge_id", encodeID(id), "status", string(answer.Status), "reason", answer.Reason)
 	s.wakeAuth(id)
+	if answer.Reason == "not_me" {
+		s.pushAlerts(r.Context(), id)
+	}
 	writeJSON(w, http.StatusOK, struct{}{})
 }

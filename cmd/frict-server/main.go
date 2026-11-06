@@ -16,9 +16,14 @@
 //	FRICT_PAUSE               how long "I didn't start this" stops pushes to that user (default 30m)
 //	FRICT_ALERT_RECIPIENTS    comma-separated Authentik usernames alerted on "I didn't start this" (default akadmin)
 //	FRICT_ALERT_TTL           how long an alert stays in the device's poll (default 24h)
+//	FRICT_FCM_PROJECT_ID      Firebase project to push through
+//	FRICT_FCM_CREDENTIALS_FILE  that project's FCM sender service-account key (JSON)
 //
 // Durations are Go durations in whole seconds. docs/PLAN.md Safeguards
 // gives the reason for each default.
+//
+// Push is on only when both FRICT_FCM_* are set; with neither, the server
+// sends no pushes and devices find challenges and alerts by polling.
 //
 // SIGINT or SIGTERM stops accepting connections and waits up to 15 s for
 // in-flight requests.
@@ -41,6 +46,7 @@ import (
 	"time"
 
 	"github.com/frict-auth/frict-server/internal/duosig"
+	"github.com/frict-auth/frict-server/internal/push"
 	"github.com/frict-auth/frict-server/internal/server"
 	"github.com/frict-auth/frict-server/internal/store"
 )
@@ -57,6 +63,9 @@ const (
 	// maxFailedLimit is NIST SP 800-63B-4 §3.2.2's upper bound on
 	// consecutive failed attempts before an authenticator is disabled.
 	maxFailedLimit = 100
+
+	// fcmTimeout bounds each HTTP request to FCM or its token endpoint.
+	fcmTimeout = 10 * time.Second
 )
 
 var defaultSafeguards = server.Safeguards{
@@ -76,6 +85,13 @@ type config struct {
 	DBPath           string
 	ChallengeTTL     time.Duration
 	Safeguards       server.Safeguards
+	FCM              fcmConfig
+}
+
+// fcmConfig is empty when push is off.
+type fcmConfig struct {
+	ProjectID       string
+	CredentialsFile string
 }
 
 func loadConfig(getenv func(string) string) (config, error) {
@@ -147,6 +163,10 @@ func loadConfig(getenv func(string) string) (config, error) {
 			return config{}, fmt.Errorf("FRICT_ALERT_RECIPIENTS=%q: want at least one username", v)
 		}
 	}
+	c.FCM = fcmConfig{ProjectID: getenv("FRICT_FCM_PROJECT_ID"), CredentialsFile: getenv("FRICT_FCM_CREDENTIALS_FILE")}
+	if (c.FCM.ProjectID == "") != (c.FCM.CredentialsFile == "") {
+		return config{}, errors.New("FRICT_FCM_PROJECT_ID and FRICT_FCM_CREDENTIALS_FILE: set both to push through FCM, or neither to have devices poll")
+	}
 	var missing []string
 	for _, req := range []struct{ name, value string }{
 		{"FRICT_API_HOSTNAME", c.APIHostname},
@@ -198,6 +218,11 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 		ln.Close()
 		return fmt.Errorf("client secret file %s is empty", cfg.ClientSecretFile)
 	}
+	sender, err := newSender(cfg.FCM)
+	if err != nil {
+		ln.Close()
+		return err
+	}
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		ln.Close()
@@ -212,8 +237,10 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 		MaxSkew: 5 * time.Minute,
 		Now:     time.Now,
 	}
+	h := server.New(v, st, cfg.ChallengeTTL, cfg.Safeguards, sender, log)
+	defer h.Close()
 	srv := &http.Server{
-		Handler:           server.New(v, st, cfg.ChallengeTTL, cfg.Safeguards, log).Handler(),
+		Handler:           h.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -224,6 +251,11 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 		"max_failed", cfg.Safeguards.MaxFailed, "pause", cfg.Safeguards.Pause.String(),
 		"alert_recipients", strings.Join(cfg.Safeguards.AlertRecipients, ","), "alert_ttl", cfg.Safeguards.AlertTTL.String(),
 		"authentik_url", cfg.Safeguards.AuthentikURL)
+	if sender == nil {
+		log.Warn("push disabled: FRICT_FCM_PROJECT_ID and FRICT_FCM_CREDENTIALS_FILE are unset; devices find challenges and alerts only by polling")
+	} else {
+		log.Info("push enabled", "fcm_project", cfg.FCM.ProjectID)
+	}
 
 	select {
 	case err := <-served:
@@ -240,4 +272,27 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 		return err
 	}
 	return nil
+}
+
+// newSender returns the FCM sender cfg describes, or nil when push is off.
+func newSender(cfg fcmConfig) (push.Sender, error) {
+	if cfg.ProjectID == "" {
+		return nil, nil
+	}
+	key, err := os.ReadFile(cfg.CredentialsFile)
+	if err != nil {
+		return nil, fmt.Errorf("read FRICT_FCM_CREDENTIALS_FILE: %w", err)
+	}
+	client := &http.Client{Timeout: fcmTimeout}
+	tokens, err := fcmTokenSource(key, client)
+	if err != nil {
+		return nil, fmt.Errorf("FCM service-account key %s: %w", cfg.CredentialsFile, err)
+	}
+	return push.NewFCM(push.FCMBaseURL, cfg.ProjectID, tokens, client), nil
+}
+
+// fcmTokenSource returns a token source for push.FCMScope from a
+// service-account key, minting tokens over client.
+func fcmTokenSource(key []byte, client *http.Client) (push.TokenSource, error) {
+	return nil, errors.New("this build has no OAuth token source; unset FRICT_FCM_* to run poll-only")
 }

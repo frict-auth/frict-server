@@ -22,6 +22,7 @@ import (
 
 	"github.com/frict-auth/frict-server/internal/devicesig"
 	"github.com/frict-auth/frict-server/internal/duosig"
+	"github.com/frict-auth/frict-server/internal/push"
 	"github.com/frict-auth/frict-server/internal/store"
 )
 
@@ -43,12 +44,15 @@ type Store interface {
 	EnrollmentStatusOf(ctx context.Context, userID, code string, now time.Time) (store.EnrollmentStatus, error)
 	Enroll(ctx context.Context, code, claimedUserID string, d store.Device) error
 	DeviceOf(ctx context.Context, userID string) (store.Device, error)
+	SetFID(ctx context.Context, userID, fid string) error
+	ClearFID(ctx context.Context, userID, fid string) error
 	StartPush(ctx context.Context, c store.Challenge, lim store.Limits) (store.Lock, error)
 	PendingChallenges(ctx context.Context, userID string, now time.Time) ([]store.Challenge, error)
 	PendingChallenge(ctx context.Context, id []byte, userID string, now time.Time) (store.Challenge, error)
 	AnswerChallenge(ctx context.Context, id []byte, userID string, answer store.Outcome, now time.Time, fraud store.Fraud) error
 	CloseChallenge(ctx context.Context, id []byte) (store.Outcome, error)
 	Alerts(ctx context.Context, recipientUserID string, since time.Time) ([]store.Alert, error)
+	AlertRecipients(ctx context.Context, challengeID []byte) ([]store.AlertRecipient, error)
 }
 
 // Safeguards limit pushes and say what a not_me deny does
@@ -80,7 +84,10 @@ type Server struct {
 	store        Store
 	challengeTTL time.Duration
 	safeguards   Safeguards
+	sender       push.Sender
 	log          *slog.Logger
+
+	pushes sync.WaitGroup
 
 	mu       sync.Mutex
 	answered map[string]chan struct{} // challenge ID -> closed when the device answers
@@ -88,9 +95,9 @@ type Server struct {
 
 // New returns a Server whose pushes expire challengeTTL after /auth/v2/auth
 // creates them. challengeTTL is whole seconds, since the store keeps
-// timestamps in seconds.
-func New(v duosig.Verifier, st Store, challengeTTL time.Duration, sg Safeguards, log *slog.Logger) *Server {
-	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, safeguards: sg, log: log, answered: map[string]chan struct{}{}}
+// timestamps in seconds. A nil sender sends no pushes: devices poll.
+func New(v duosig.Verifier, st Store, challengeTTL time.Duration, sg Safeguards, sender push.Sender, log *slog.Logger) *Server {
+	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, safeguards: sg, sender: sender, log: log, answered: map[string]chan struct{}{}}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -103,6 +110,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /device/v1/pending", s.devicePending)
 	mux.HandleFunc("POST /device/v1/challenge", s.deviceChallenge)
 	mux.HandleFunc("POST /device/v1/answer", s.deviceAnswer)
+	mux.HandleFunc("POST /device/v1/fid", s.deviceFID)
 	return mux
 }
 

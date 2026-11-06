@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +20,12 @@ import (
 	"github.com/frict-auth/frict-server/internal/server"
 )
 
+// isolateHome points HOME at an empty directory, so nothing a test starts
+// can find credentials in the user's home.
+func isolateHome(t *testing.T) { t.Setenv("HOME", t.TempDir()) }
+
 func TestLoadConfig(t *testing.T) {
+	isolateHome(t)
 	full := map[string]string{
 		"FRICT_API_HOSTNAME":       "api.frict.app",
 		"FRICT_CLIENT_ID":          "DIXXXX",
@@ -45,8 +52,9 @@ func TestLoadConfig(t *testing.T) {
 	}
 	defaults := sg(func(*server.Safeguards) {})
 	want := func(listen string, ttl time.Duration, s server.Safeguards) config {
-		return config{listen, "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", ttl, s}
+		return config{listen, "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", ttl, s, fcmConfig{}}
 	}
+	withFCM := func(c config) config { c.FCM = fcmConfig{"frict-test", "/secrets/fcm-sa.json"}; return c }
 
 	tests := []struct {
 		name    string
@@ -74,6 +82,13 @@ func TestLoadConfig(t *testing.T) {
 			s.PushCap, s.PushCooldown, s.MaxFailed, s.Pause = 5, 5*time.Minute, 100, time.Hour
 			s.AlertRecipients, s.AlertTTL = []string{"akadmin", "sec"}, 48*time.Hour
 		})), ""},
+		{"fcm set", func() map[string]string {
+			m := with("FRICT_FCM_PROJECT_ID", "frict-test")
+			m["FRICT_FCM_CREDENTIALS_FILE"] = "/secrets/fcm-sa.json"
+			return m
+		}(), withFCM(want(":8080", 60*time.Second, defaults)), ""},
+		{"fcm project without key", with("FRICT_FCM_PROJECT_ID", "frict-test"), config{}, "FRICT_FCM_CREDENTIALS_FILE"},
+		{"fcm key without project", with("FRICT_FCM_CREDENTIALS_FILE", "/secrets/fcm-sa.json"), config{}, "FRICT_FCM_PROJECT_ID"},
 		{"max failed above NIST's 100", with("FRICT_MAX_FAILED", "101"), config{}, "FRICT_MAX_FAILED"},
 		{"max failed zero", with("FRICT_MAX_FAILED", "0"), config{}, "FRICT_MAX_FAILED"},
 		{"push cap zero", with("FRICT_PUSH_CAP", "0"), config{}, "FRICT_PUSH_CAP"},
@@ -113,6 +128,7 @@ func TestLoadConfig(t *testing.T) {
 // leave it) and returns a config using it and a fresh database.
 func testConfig(t *testing.T, secret string) config {
 	t.Helper()
+	isolateHome(t)
 	dir := t.TempDir()
 	secretFile := filepath.Join(dir, "client-secret")
 	if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0o600); err != nil {
@@ -282,5 +298,63 @@ func TestRunRejectsBadSecretFile(t *testing.T) {
 				t.Fatalf("run = %v, want error containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// syncBuffer is a log destination the running server writes to while a
+// test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestRunWithoutFCMSaysPollOnly(t *testing.T) {
+	cfg := testConfig(t, "s3cret")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg, ln, slog.New(slog.NewTextHandler(logs, nil))) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "push disabled") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no poll-only notice at startup; logs:\n%s", logs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("poll-only notice is not a warning; logs:\n%s", logs)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run = %v", err)
+	}
+}
+
+func TestRunRejectsUnreadableFCMKey(t *testing.T) {
+	cfg := testConfig(t, "s3cret")
+	cfg.FCM = fcmConfig{ProjectID: "frict-test", CredentialsFile: filepath.Join(t.TempDir(), "absent.json")}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = run(context.Background(), cfg, ln, slog.New(slog.DiscardHandler))
+	if err == nil || !strings.Contains(err.Error(), "FRICT_FCM_CREDENTIALS_FILE") {
+		t.Fatalf("run = %v, want an error naming FRICT_FCM_CREDENTIALS_FILE", err)
 	}
 }

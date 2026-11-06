@@ -242,7 +242,9 @@ user has been disabled due to authentication failures" with result `deny`
    the call early. Only an approval resets the count. A disabled device
    stays disabled until it is re-enrolled: an Authentik admin deletes the
    user's Duo device, and the next login runs the Duo setup stage, which
-   creates a new Frict user.
+   creates a new Frict user. The threshold is checked live, so raising
+   `FRICT_MAX_FAILED` re-enables devices whose count is under the new
+   value.
 2. **Paused.** Within `FRICT_PAUSE` of a `not_me` deny.
 3. **Capped.** `FRICT_PUSH_CAP` pushes since the last approval, and the
    last push was under `FRICT_PUSH_COOLDOWN` ago. An approval resets the
@@ -251,7 +253,7 @@ user has been disabled due to authentication failures" with result `deny`
 ### `challenge` (signed with `device_key`)
 
 Request `{"challenge_id": "<22 chars>"}`. The ID is 16 random bytes,
-base64url without padding. The FCM data message carries only this ID.
+base64url without padding. The push carries only this ID (see Push).
 
 Response:
 
@@ -277,8 +279,9 @@ CIBA), and the user's alerts.
 
 An alert says someone answered a push with `not_me`. Every enrolled user
 whose username is in `FRICT_ALERT_RECIPIENTS` gets one per such deny, and it
-is listed in every poll for `FRICT_ALERT_TTL` after the deny; the app shows
-each `alert_id` once. Oldest first, empty when there are none:
+is listed in every poll for `FRICT_ALERT_TTL` after the deny, and pushed
+once when it is created (see Push); the app shows each `alert_id` once.
+Oldest first, empty when there are none:
 
 ```json
 {"alert_id": "…", "username": "geoffrey", "ipaddr": "203.0.113.7",
@@ -311,5 +314,37 @@ user. Only the first answer counts.
 
 ### `fid` (signed with `device_key`)
 
-Request `{"fid": "…"}`. `200 {}`. A dead FID reported by FCM clears only the
-stored FID, never the enrollment (PLAN Domain lessons).
+Request `{"fid": "…"}`, a non-empty string. `200 {}`; pushes go to this FID
+from then on. A dead FID reported by FCM clears only the stored FID, never
+the enrollment (PLAN Domain lessons): the device keeps polling and answering,
+and gets pushes again once it sends a FID.
+
+## Push
+
+A push wakes the app; it never says what to approve. Each is an FCM HTTP v1
+data message to the device's FID, with Android priority `high`, which FCM
+tries to deliver at once, waking a device in Doze. FCM may deprioritize
+high-priority messages that don't lead to a user-visible notification, so
+the app shows one for each (firebase.google.com/docs/cloud-messaging/android-message-priority).
+Two `data` payloads:
+
+| When | `data` |
+|---|---|
+| `/auth/v2/auth` creates a challenge for the user | `{"challenge_id": "<22 chars>"}` |
+| A `not_me` deny creates an alert for a recipient | `{"alert_id": "<22 chars>"}` |
+
+Both IDs are 16 random bytes, base64url without padding, the same IDs
+`pending` lists. The app fetches everything else with signed requests:
+`challenge` for a challenge ID, `pending` for an alert ID. So Google sees
+neither who is signing in to what nor the alert's contents.
+
+Push is best effort. `/auth` doesn't wait on it, and a failed push changes
+nothing about the challenge; the app finds it by polling `pending` at
+`poll_interval`. A refused `/auth` sends no push, and a device with no
+stored FID gets none. FCM's `UNREGISTERED` (HTTP 404), or
+`INVALID_ARGUMENT` (HTTP 400, which for these fixed payloads can only be
+about the FID), clears the stored FID; other errors leave it.
+
+The server pushes only when `FRICT_FCM_PROJECT_ID` and
+`FRICT_FCM_CREDENTIALS_FILE` are set. Without them it runs poll-only and
+logs that at startup.

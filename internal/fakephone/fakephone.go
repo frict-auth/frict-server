@@ -24,6 +24,7 @@ const (
 	PendingPath   = "/device/v1/pending"
 	ChallengePath = "/device/v1/challenge"
 	AnswerPath    = "/device/v1/answer"
+	FIDPath       = "/device/v1/fid"
 )
 
 type Phone struct {
@@ -166,6 +167,16 @@ func (p *Phone) AnswerRequest(a Activation, id, decision, reason string, now tim
 		return nil, err
 	}
 	return SignedRequest("https://"+a.Host, AnswerPath, a.UserID, now.Unix(), body, p.ApprovalKey)
+}
+
+// FIDRequest tells the server to push to fid from now on, signed with the
+// device_key.
+func (p *Phone) FIDRequest(a Activation, fid string, now time.Time) (*http.Request, error) {
+	body, err := json.Marshal(map[string]string{"fid": fid})
+	if err != nil {
+		return nil, err
+	}
+	return SignedRequest("https://"+a.Host, FIDPath, a.UserID, now.Unix(), body, p.DeviceKey)
 }
 
 // SignedRequest builds a POST to base+path whose Authorization header claims

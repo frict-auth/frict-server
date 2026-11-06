@@ -563,3 +563,52 @@ func TestStartPushRequiresDevice(t *testing.T) {
 		t.Fatalf("pending after a refused push: %v", got)
 	}
 }
+
+func fidOf(t *testing.T, s *Store, userID string) string {
+	t.Helper()
+	d, err := s.DeviceOf(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d.FID
+}
+
+func TestSetFIDOnlyForEnrolledDevice(t *testing.T) {
+	s := enrolled(t)
+	ctx := context.Background()
+	if err := s.SetFID(ctx, aliceID, "alice-2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fidOf(t, s, aliceID); got != "alice-2" {
+		t.Fatalf("alice's FID = %q, want alice-2", got)
+	}
+	if got := fidOf(t, s, bobID); got != device(bobID, t0).FID {
+		t.Fatalf("bob's FID = %q, changed by alice's update", got)
+	}
+	if err := s.SetFID(ctx, "DUNOBODY", "x"); !errors.Is(err, ErrNoDevice) {
+		t.Fatalf("SetFID for a user without a device: %v, want ErrNoDevice", err)
+	}
+}
+
+// TestClearFIDKeepsNewerFID: clearing a dead FID leaves a FID the device
+// sent after the failed push, and leaves the device enrolled either way.
+func TestClearFIDKeepsNewerFID(t *testing.T) {
+	s := enrolled(t)
+	ctx := context.Background()
+	dead := fidOf(t, s, aliceID)
+	if err := s.SetFID(ctx, aliceID, "alice-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClearFID(ctx, aliceID, dead); err != nil {
+		t.Fatal(err)
+	}
+	if got := fidOf(t, s, aliceID); got != "alice-2" {
+		t.Fatalf("FID after clearing the old one = %q, want alice-2 kept", got)
+	}
+	if err := s.ClearFID(ctx, aliceID, "alice-2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fidOf(t, s, aliceID); got != "" {
+		t.Fatalf("FID after clearing it = %q, want empty", got)
+	}
+}
