@@ -121,8 +121,9 @@ func duoParams(r *http.Request) (map[string]string, error) {
 }
 
 // duoEnroll answers duo_client's Auth.enroll with a new user and a single-use
-// activation code for it. activation_code is the app link; Authentik renders
-// it as a link and activation_barcode as an image source.
+// activation code for it. activation_code is the app link, which Authentik
+// renders as a link; activation_barcode is a QR code of the link as a PNG data
+// URL, which Authentik renders as an image source.
 func (s *Server) duoEnroll(w http.ResponseWriter, r *http.Request) {
 	p, err := duoParams(r)
 	if err != nil || p["username"] == "" {
@@ -139,8 +140,14 @@ func (s *Server) duoEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("enrollment created", "user_id", userID, "username", p["username"])
 	link := ActivationLink(s.verifier.Host, userID, code)
+	barcode, err := qrDataURL(link)
+	if err != nil {
+		s.log.Error("enroll: qr", "err", err)
+		duoFail(w, http.StatusInternalServerError, 50000, "Internal error")
+		return
+	}
 	duoOK(w, map[string]any{
-		"activation_barcode": link,
+		"activation_barcode": barcode,
 		"activation_code":    link,
 		"user_id":            userID,
 		"username":           p["username"],
