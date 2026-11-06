@@ -105,7 +105,17 @@ is always offered it over TOTP (#22816).
 - From privacyIDEA: keys exchanged at enrollment, signatures in both
   directions, a reason on every deny, poll fallback.
 - From NIST 800-63B-4: cap on pushes since the last successful login; a
-  failed-attempt counter that a new challenge does not reset.
+  failed-attempt counter that a new challenge does not reset. Decisions:
+  - Push cap: a total since the last successful login; once over it, one
+    push per `FRICT_PUSH_COOLDOWN`, so the lock lifts by itself (§3.1.3.2
+    limit; §3.2.2 waiting-period technique).
+  - Failed attempts: denies and timeouts, not reset by a new challenge,
+    reset only by a successful login on that device; at `FRICT_MAX_FAILED`
+    (at most 100) the device is disabled (§3.1.3.2, §3.2.2).
+  - Recovery from a disabled device: an Authentik admin deletes the user's
+    Duo device and the user re-enrolls, which gives a new Frict user with
+    fresh counters. Frict has no admin tool (§3.2.2 "disabling that
+    authenticator").
 - **"I didn't start this" means the user's password is compromised** (the push
   only happens after the password step). On that deny Frict:
   1. Automatically pauses pushes for that user for N minutes (stops push
@@ -118,8 +128,40 @@ is always offered it over TOTP (#22816).
      The buttons are deep links into Authentik's admin UI, so Frict holds no
      Authentik admin token.
 
-  Authentik's own event log shows the failed login but cannot distinguish
-  "I didn't start this" from "cancel".
+  Authentik's own event log tells them apart: its `login_failed` event
+  records `duo_response.status` `fraud` for "I didn't start this" and `deny`
+  for "cancel" (`e2e/login_test.go`).
+
+  Limits, all set in frict-server's environment (`cmd/frict-server/main.go`):
+
+  | Setting | Default | Why |
+  |---|---|---|
+  | `FRICT_PUSH_CAP` | 10 | A person rarely needs more than a few tries per login; 10 leaves room for a missed push or two. |
+  | `FRICT_PUSH_COOLDOWN` | 15 min | Holds a push bomber to 4 pushes an hour, inside §3.2.2's "30 seconds up to an hour". |
+  | `FRICT_MAX_FAILED` | 20 | Twice the cap and well under §3.2.2's 100, so ignoring pushes alone can't disable a device within a day. |
+  | `FRICT_PAUSE` | 30 min | Long enough for an admin to read the alert and reset the password, short enough that a mistaken tap doesn't lock the user out for the day. |
+  | `FRICT_ALERT_RECIPIENTS` | `akadmin` | Authentik's bootstrap admin username. |
+  | `FRICT_ALERT_TTL` | 24 h | A phone that was off overnight still gets the alert on its next poll. |
+  | `FRICT_AUTHENTIK_URL` | none (required) | Base of the alert links. |
+
+  When a safeguard refuses a push, `/auth` answers `deny` with Duo's
+  `locked_out` status ("The user has been disabled due to authentication
+  failures", duo.com/docs/authapi) and says which safeguard in `status_msg`;
+  Authentik records both in `login_failed`. A refused `/auth` sends no push
+  and counts as neither a push nor a failed attempt.
+
+  Authentik 2026.8.5's `/auth` call supplies the alert's fields
+  (`authenticator_validate/challenge.py:267-290`): `display_username` (the
+  Authentik username), `ipaddr` (the client IP), `pushinfo` with `Domain`
+  (the login host) and `Application` (only when the flow was started for an
+  application), and `type` ("<brand> Login request"). It sends no time;
+  Frict records when the push was created and when it was reported.
+
+  Authentik's admin UI has no per-action URL, and a user's page needs the
+  user's primary key, which Frict can't look up without an API token. Both
+  buttons open the admin user list filtered to that username, whose row
+  holds "Set password", "Create recovery link" and the "Revoke Sessions"
+  action.
 
 ### TLS: getting past Duo's certificate pinning
 

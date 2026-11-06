@@ -50,6 +50,15 @@ var migrations = []string{
 	) STRICT;`,
 	`ALTER TABLE challenges ADD COLUMN display_username TEXT NOT NULL DEFAULT '';
 	ALTER TABLE challenges ADD COLUMN type TEXT NOT NULL DEFAULT '';`,
+	`ALTER TABLE users ADD COLUMN last_push_at INTEGER;
+	CREATE TABLE alerts (
+		id                BLOB PRIMARY KEY CHECK (length(id) = 16),
+		recipient_user_id TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+		challenge_id      BLOB NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+		created_at        INTEGER NOT NULL,
+		UNIQUE (recipient_user_id, challenge_id)
+	) STRICT;
+	CREATE INDEX alerts_by_recipient ON alerts (recipient_user_id, created_at);`,
 }
 
 type Store struct {
@@ -264,12 +273,70 @@ type Outcome struct {
 	Reason string
 }
 
-func (s *Store) CreateChallenge(ctx context.Context, c Challenge) error {
-	_, err := s.db.ExecContext(ctx,
+// Limits gate pushes for a user since that user's last successful login.
+type Limits struct {
+	// PushCap is how many pushes a user gets before Cooldown applies.
+	PushCap int
+	// Cooldown is the least time between pushes once PushCap is reached.
+	Cooldown time.Duration
+	// MaxFailed failed attempts disable the user's device.
+	MaxFailed int
+}
+
+// Lock is why StartPush refused a push; empty when it created one.
+type Lock string
+
+const (
+	Unlocked     Lock = ""
+	LockDisabled Lock = "disabled"
+	LockPaused   Lock = "paused"
+	LockCapped   Lock = "capped"
+)
+
+// StartPush stores c as a pending challenge and counts it as a push for
+// c.UserID, unless lim or a pause refuses it at c.CreatedAt. A refused push
+// stores nothing and changes no counter. It returns ErrNoDevice if the user
+// has no enrolled device.
+func (s *Store) StartPush(ctx context.Context, c Challenge, lim Limits) (Lock, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+
+	var pushes, failed int
+	var pausedUntil, lastPush sql.NullInt64
+	err = tx.QueryRowContext(ctx,
+		`SELECT u.pushes_since_success, u.failed_attempts, u.paused_until, u.last_push_at
+		 FROM users u JOIN devices d ON d.user_id = u.user_id WHERE u.user_id = ?`,
+		c.UserID).Scan(&pushes, &failed, &pausedUntil, &lastPush)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNoDevice
+	}
+	if err != nil {
+		return "", err
+	}
+	now := c.CreatedAt.Unix()
+	switch {
+	case failed >= lim.MaxFailed:
+		return LockDisabled, nil
+	case pausedUntil.Valid && now < pausedUntil.Int64:
+		return LockPaused, nil
+	case pushes >= lim.PushCap && lastPush.Valid && now < lastPush.Int64+int64(lim.Cooldown/time.Second):
+		return LockCapped, nil
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE users SET pushes_since_success = pushes_since_success + 1, last_push_at = ? WHERE user_id = ?`,
+		now, c.UserID); err != nil {
+		return "", err
+	}
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO challenges (id, user_id, display_username, ipaddr, pushinfo, type, created_at, expires_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		c.ID, c.UserID, c.DisplayUsername, c.IPAddr, c.PushInfo, c.Type, c.CreatedAt.Unix(), c.ExpiresAt.Unix())
-	return err
+		c.ID, c.UserID, c.DisplayUsername, c.IPAddr, c.PushInfo, c.Type, now, c.ExpiresAt.Unix()); err != nil {
+		return "", err
+	}
+	return Unlocked, tx.Commit()
 }
 
 const challengeColumns = `id, user_id, display_username, ipaddr, pushinfo, type, created_at, expires_at`
@@ -318,16 +385,32 @@ func (s *Store) PendingChallenge(ctx context.Context, id []byte, userID string, 
 	return c, err
 }
 
+// Fraud is what a not_me deny does: it pauses the user's pushes until
+// PausedUntil and alerts every enrolled user whose username is in
+// AlertRecipients.
+type Fraud struct {
+	PausedUntil     time.Time
+	AlertRecipients []string
+}
+
 // AnswerChallenge moves userID's challenge id from pending to answer's
-// status, once: only while it is pending and unexpired at now. It returns
-// ErrChallengeNotFound if no such challenge belongs to userID and
+// status, once: only while it is pending and unexpired at now. In the same
+// transaction an approval resets the user's push and failed-attempt counts,
+// any deny adds a failed attempt, and a not_me deny also applies fraud. It
+// returns ErrChallengeNotFound if no such challenge belongs to userID and
 // ErrChallengeNotPending if it was already answered or has expired.
-func (s *Store) AnswerChallenge(ctx context.Context, id []byte, userID string, answer Outcome, now time.Time) error {
+func (s *Store) AnswerChallenge(ctx context.Context, id []byte, userID string, answer Outcome, now time.Time, fraud Fraud) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
 	var reason sql.NullString
 	if answer.Reason != "" {
 		reason = sql.NullString{String: answer.Reason, Valid: true}
 	}
-	res, err := s.db.ExecContext(ctx,
+	res, err := tx.ExecContext(ctx,
 		`UPDATE challenges SET status = ?, reason = ?, answered_at = ?
 		 WHERE id = ? AND user_id = ? AND status = 'pending' AND expires_at > ?`,
 		string(answer.Status), reason, now.Unix(), id, userID, now.Unix())
@@ -336,31 +419,72 @@ func (s *Store) AnswerChallenge(ctx context.Context, id []byte, userID string, a
 	}
 	if n, err := res.RowsAffected(); err != nil {
 		return err
-	} else if n == 1 {
-		return nil
+	} else if n == 0 {
+		var exists bool
+		err = tx.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM challenges WHERE id = ? AND user_id = ?)`, id, userID).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			return ErrChallengeNotFound
+		}
+		return ErrChallengeNotPending
 	}
-	var exists bool
-	err = s.db.QueryRowContext(ctx,
-		`SELECT EXISTS (SELECT 1 FROM challenges WHERE id = ? AND user_id = ?)`, id, userID).Scan(&exists)
+
+	if answer.Status == ChallengeApproved {
+		_, err = tx.ExecContext(ctx, `UPDATE users SET pushes_since_success = 0, failed_attempts = 0 WHERE user_id = ?`, userID)
+	} else {
+		_, err = tx.ExecContext(ctx, `UPDATE users SET failed_attempts = failed_attempts + 1 WHERE user_id = ?`, userID)
+	}
 	if err != nil {
 		return err
 	}
-	if !exists {
-		return ErrChallengeNotFound
+	if answer.Reason == "not_me" {
+		if err := applyFraud(ctx, tx, id, userID, now, fraud); err != nil {
+			return err
+		}
 	}
-	return ErrChallengeNotPending
+	return tx.Commit()
 }
 
-// CloseChallenge expires challenge id if it is still pending and returns how
-// it ended.
+func applyFraud(ctx context.Context, tx *sql.Tx, id []byte, userID string, now time.Time, fraud Fraud) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE users SET paused_until = ? WHERE user_id = ?`, fraud.PausedUntil.Unix(), userID); err != nil {
+		return err
+	}
+	for _, username := range fraud.AlertRecipients {
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO alerts (id, recipient_user_id, challenge_id, created_at)
+			 SELECT randomblob(16), u.user_id, ?, ?
+			 FROM users u JOIN devices d ON d.user_id = u.user_id WHERE u.username = ?
+			 ON CONFLICT DO NOTHING`,
+			id, now.Unix(), username); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CloseChallenge expires challenge id if it is still pending, counting that
+// as a failed attempt for its user, and returns how it ended.
 func (s *Store) CloseChallenge(ctx context.Context, id []byte) (Outcome, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Outcome{}, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE challenges SET status = 'expired' WHERE id = ? AND status = 'pending'`, id); err != nil {
+	res, err := tx.ExecContext(ctx, `UPDATE challenges SET status = 'expired' WHERE id = ? AND status = 'pending'`, id)
+	if err != nil {
 		return Outcome{}, err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return Outcome{}, err
+	} else if n == 1 {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE users SET failed_attempts = failed_attempts + 1
+			 WHERE user_id = (SELECT user_id FROM challenges WHERE id = ?)`, id); err != nil {
+			return Outcome{}, err
+		}
 	}
 	var o Outcome
 	var reason sql.NullString
@@ -369,4 +493,42 @@ func (s *Store) CloseChallenge(ctx context.Context, id []byte) (Outcome, error) 
 	}
 	o.Reason = reason.String
 	return o, tx.Commit()
+}
+
+// Alert tells a recipient that someone reported a push as not theirs. The
+// sign-in's fields are the challenge's, as Authentik sent them.
+type Alert struct {
+	ID              []byte
+	DisplayUsername string
+	IPAddr          string
+	PushInfo        string
+	Type            string
+	AttemptedAt     time.Time
+	ReportedAt      time.Time
+}
+
+// Alerts returns recipientUserID's alerts created at or after since, oldest
+// first.
+func (s *Store) Alerts(ctx context.Context, recipientUserID string, since time.Time) ([]Alert, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT a.id, c.display_username, c.ipaddr, c.pushinfo, c.type, c.created_at, a.created_at
+		 FROM alerts a JOIN challenges c ON c.id = a.challenge_id
+		 WHERE a.recipient_user_id = ? AND a.created_at >= ?
+		 ORDER BY a.created_at, a.id`,
+		recipientUserID, since.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Alert
+	for rows.Next() {
+		var a Alert
+		var attempted, reported int64
+		if err := rows.Scan(&a.ID, &a.DisplayUsername, &a.IPAddr, &a.PushInfo, &a.Type, &attempted, &reported); err != nil {
+			return nil, err
+		}
+		a.AttemptedAt, a.ReportedAt = time.Unix(attempted, 0), time.Unix(reported, 0)
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }

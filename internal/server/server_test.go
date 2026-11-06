@@ -35,27 +35,44 @@ var t0 = time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
 
 // fixture is a Server on a fresh SQLite store whose clock the test moves.
 type fixture struct {
-	t   *testing.T
-	st  *store.Store
-	srv *Server
-	h   http.Handler
+	t      *testing.T
+	dbPath string
+	st     *store.Store
+	srv    *Server
+	h      http.Handler
 
 	mu    sync.Mutex
 	clock time.Time
 }
 
+// testSafeguards are loose enough that tests not about them never hit one.
+var testSafeguards = Safeguards{
+	PushCap:         100,
+	PushCooldown:    time.Minute,
+	MaxFailed:       100,
+	Pause:           10 * time.Minute,
+	AlertRecipients: []string{"admin"},
+	AlertTTL:        24 * time.Hour,
+	AuthentikURL:    "https://auth.example",
+}
+
 // newFixture's pushes expire after 60 s.
-func newFixture(t *testing.T) *fixture { return newFixtureTTL(t, 60*time.Second) }
+func newFixture(t *testing.T) *fixture { return newFixtureWith(t, 60*time.Second, testSafeguards) }
 
 func newFixtureTTL(t *testing.T, challengeTTL time.Duration) *fixture {
+	return newFixtureWith(t, challengeTTL, testSafeguards)
+}
+
+func newFixtureWith(t *testing.T, challengeTTL time.Duration, sg Safeguards) *fixture {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "frict.db"))
+	f := &fixture{t: t, dbPath: filepath.Join(t.TempDir(), "frict.db"), clock: t0}
+	st, err := store.Open(f.dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	f := &fixture{t: t, st: st, clock: t0}
-	f.srv = New(f.verifier(), st, challengeTTL, slog.New(slog.DiscardHandler))
+	f.st = st
+	f.srv = New(f.verifier(), st, challengeTTL, sg, slog.New(slog.DiscardHandler))
 	f.h = f.srv.Handler()
 	return f
 }
@@ -203,7 +220,7 @@ func TestDuoSignedPassesBodyThrough(t *testing.T) {
 	const body = `{"username":"élodie"}`
 	f := newFixture(t)
 	var got string
-	h := New(f.verifier(), f.st, time.Minute, slog.New(slog.DiscardHandler)).duoSigned(func(w http.ResponseWriter, r *http.Request) {
+	h := New(f.verifier(), f.st, time.Minute, testSafeguards, slog.New(slog.DiscardHandler)).duoSigned(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read body: %v", err)
@@ -475,7 +492,7 @@ func TestHealthz(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			New(f.verifier(), tc.store, time.Minute, slog.New(slog.DiscardHandler)).Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			New(f.verifier(), tc.store, time.Minute, testSafeguards, slog.New(slog.DiscardHandler)).Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 			if w.Code != tc.want {
 				t.Fatalf("status = %d, want %d", w.Code, tc.want)
 			}

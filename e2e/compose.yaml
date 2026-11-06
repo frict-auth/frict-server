@@ -56,6 +56,7 @@ services:
       FRICT_CLIENT_SECRET_FILE: /secrets/duo-client-secret
       FRICT_DB_PATH: /data/frict.db
       FRICT_CHALLENGE_TTL: ${FRICT_CHALLENGE_TTL:-90s}
+      FRICT_AUTHENTIK_URL: http://127.0.0.1:9000
     tmpfs:
       - /data:uid=65532,gid=65532,mode=0700
     volumes:

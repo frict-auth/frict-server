@@ -54,20 +54,26 @@ func enrollPhone(phone *fakephone.Phone, act fakephone.Activation) (int, string)
 	return send(req)
 }
 
-func (d device) pending() ([]string, error) {
+// poll asks frict-server for the account's pending challenges and alerts.
+func (d device) poll() (fakephone.Pending, error) {
 	req, err := d.phone.PendingRequest(d.act, time.Now())
 	if err != nil {
-		return nil, err
+		return fakephone.Pending{}, err
 	}
 	status, body := send(req)
 	if status != http.StatusOK {
-		return nil, fmt.Errorf("pending: %d %s", status, body)
+		return fakephone.Pending{}, fmt.Errorf("pending: %d %s", status, body)
 	}
 	var p fakephone.Pending
 	if err := json.Unmarshal([]byte(body), &p); err != nil {
-		return nil, fmt.Errorf("pending body %s: %w", body, err)
+		return fakephone.Pending{}, fmt.Errorf("pending body %s: %w", body, err)
 	}
-	return p.ChallengeIDs, nil
+	return p, nil
+}
+
+func (d device) pending() ([]string, error) {
+	p, err := d.poll()
+	return p.ChallengeIDs, err
 }
 
 // waitChallenge polls until the account has a pending challenge and returns

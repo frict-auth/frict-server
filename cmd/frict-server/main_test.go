@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/frict-auth/frict-server/internal/duosig"
+	"github.com/frict-auth/frict-server/internal/server"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -23,6 +24,7 @@ func TestLoadConfig(t *testing.T) {
 		"FRICT_CLIENT_ID":          "DIXXXX",
 		"FRICT_CLIENT_SECRET_FILE": "/secrets/duo-client-secret",
 		"FRICT_DB_PATH":            "/data/frict.db",
+		"FRICT_AUTHENTIK_URL":      "https://auth.example",
 	}
 	without := func(keys ...string) map[string]string {
 		m := map[string]string{}
@@ -35,6 +37,16 @@ func TestLoadConfig(t *testing.T) {
 		return m
 	}
 	with := func(k, v string) map[string]string { m := without(); m[k] = v; return m }
+	sg := func(edit func(*server.Safeguards)) server.Safeguards {
+		s := defaultSafeguards
+		s.AuthentikURL = "https://auth.example"
+		edit(&s)
+		return s
+	}
+	defaults := sg(func(*server.Safeguards) {})
+	want := func(listen string, ttl time.Duration, s server.Safeguards) config {
+		return config{listen, "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", ttl, s}
+	}
 
 	tests := []struct {
 		name    string
@@ -42,19 +54,41 @@ func TestLoadConfig(t *testing.T) {
 		want    config
 		wantErr string
 	}{
-		{"defaults", full, config{":8080", "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", 60 * time.Second}, ""},
-		{"listen set", with("FRICT_LISTEN", "127.0.0.1:9000"), config{"127.0.0.1:9000", "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", 60 * time.Second}, ""},
-		{"challenge ttl 120s", with("FRICT_CHALLENGE_TTL", "120s"), config{":8080", "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", 120 * time.Second}, ""},
-		{"challenge ttl 90s", with("FRICT_CHALLENGE_TTL", "1m30s"), config{":8080", "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", 90 * time.Second}, ""},
+		{"defaults", full, want(":8080", 60*time.Second, defaults), ""},
+		{"listen set", with("FRICT_LISTEN", "127.0.0.1:9000"), want("127.0.0.1:9000", 60*time.Second, defaults), ""},
+		{"challenge ttl 120s", with("FRICT_CHALLENGE_TTL", "120s"), want(":8080", 120*time.Second, defaults), ""},
+		{"challenge ttl 90s", with("FRICT_CHALLENGE_TTL", "1m30s"), want(":8080", 90*time.Second, defaults), ""},
 		{"challenge ttl below 60s", with("FRICT_CHALLENGE_TTL", "59s"), config{}, "FRICT_CHALLENGE_TTL"},
 		{"challenge ttl above 120s", with("FRICT_CHALLENGE_TTL", "121s"), config{}, "FRICT_CHALLENGE_TTL"},
 		{"challenge ttl fractional", with("FRICT_CHALLENGE_TTL", "60.5s"), config{}, "FRICT_CHALLENGE_TTL"},
 		{"challenge ttl no unit", with("FRICT_CHALLENGE_TTL", "90"), config{}, "FRICT_CHALLENGE_TTL"},
+		{"safeguards set", func() map[string]string {
+			m := with("FRICT_PUSH_CAP", "5")
+			m["FRICT_PUSH_COOLDOWN"] = "5m"
+			m["FRICT_MAX_FAILED"] = "100"
+			m["FRICT_PAUSE"] = "1h"
+			m["FRICT_ALERT_RECIPIENTS"] = " akadmin, sec ,,"
+			m["FRICT_ALERT_TTL"] = "48h"
+			return m
+		}(), want(":8080", 60*time.Second, sg(func(s *server.Safeguards) {
+			s.PushCap, s.PushCooldown, s.MaxFailed, s.Pause = 5, 5*time.Minute, 100, time.Hour
+			s.AlertRecipients, s.AlertTTL = []string{"akadmin", "sec"}, 48*time.Hour
+		})), ""},
+		{"max failed above NIST's 100", with("FRICT_MAX_FAILED", "101"), config{}, "FRICT_MAX_FAILED"},
+		{"max failed zero", with("FRICT_MAX_FAILED", "0"), config{}, "FRICT_MAX_FAILED"},
+		{"push cap zero", with("FRICT_PUSH_CAP", "0"), config{}, "FRICT_PUSH_CAP"},
+		{"push cap not a number", with("FRICT_PUSH_CAP", "ten"), config{}, "FRICT_PUSH_CAP"},
+		{"cooldown fractional", with("FRICT_PUSH_COOLDOWN", "1.5s"), config{}, "FRICT_PUSH_COOLDOWN"},
+		{"pause zero", with("FRICT_PAUSE", "0s"), config{}, "FRICT_PAUSE"},
+		{"alert ttl no unit", with("FRICT_ALERT_TTL", "3600"), config{}, "FRICT_ALERT_TTL"},
+		{"no alert recipients", with("FRICT_ALERT_RECIPIENTS", " , "), config{}, "FRICT_ALERT_RECIPIENTS"},
+		{"authentik url without scheme", with("FRICT_AUTHENTIK_URL", "auth.example"), config{}, "FRICT_AUTHENTIK_URL"},
+		{"no authentik url", without("FRICT_AUTHENTIK_URL"), config{}, "FRICT_AUTHENTIK_URL"},
 		{"no hostname", without("FRICT_API_HOSTNAME"), config{}, "FRICT_API_HOSTNAME"},
 		{"no client id", without("FRICT_CLIENT_ID"), config{}, "FRICT_CLIENT_ID"},
 		{"no secret file", without("FRICT_CLIENT_SECRET_FILE"), config{}, "FRICT_CLIENT_SECRET_FILE"},
 		{"no db path", without("FRICT_DB_PATH"), config{}, "FRICT_DB_PATH"},
-		{"all missing named", map[string]string{}, config{}, "FRICT_API_HOSTNAME, FRICT_CLIENT_ID, FRICT_CLIENT_SECRET_FILE, FRICT_DB_PATH"},
+		{"all missing named", map[string]string{}, config{}, "FRICT_API_HOSTNAME, FRICT_CLIENT_ID, FRICT_CLIENT_SECRET_FILE, FRICT_DB_PATH, FRICT_AUTHENTIK_URL"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -84,7 +118,7 @@ func testConfig(t *testing.T, secret string) config {
 	if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return config{APIHostname: "api.frict.test", ClientID: "DIXXXX", ClientSecretFile: secretFile, DBPath: filepath.Join(dir, "frict.db"), ChallengeTTL: 60 * time.Second}
+	return config{APIHostname: "api.frict.test", ClientID: "DIXXXX", ClientSecretFile: secretFile, DBPath: filepath.Join(dir, "frict.db"), ChallengeTTL: 60 * time.Second, Safeguards: defaultSafeguards}
 }
 
 type running struct {

@@ -111,6 +111,20 @@ func (p *Phone) PendingRequest(a Activation, now time.Time) (*http.Request, erro
 type Pending struct {
 	ChallengeIDs []string `json:"challenge_ids"`
 	PollInterval int      `json:"poll_interval"`
+	Alerts       []Alert  `json:"alerts"`
+}
+
+// Alert says someone reported a push as "I didn't start this".
+type Alert struct {
+	AlertID           string `json:"alert_id"`
+	Username          string `json:"username"`
+	IPAddr            string `json:"ipaddr"`
+	PushInfo          string `json:"pushinfo"`
+	Type              string `json:"type"`
+	Attempted         int64  `json:"attempted"`
+	Reported          int64  `json:"reported"`
+	ResetPasswordURL  string `json:"reset_password_url"`
+	RevokeSessionsURL string `json:"revoke_sessions_url"`
 }
 
 // ChallengeRequest fetches challenge id's details, signed with the
