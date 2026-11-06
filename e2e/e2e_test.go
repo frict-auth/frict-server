@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -368,9 +369,10 @@ func duoDeviceUID(t *testing.T, c challenge) json.RawMessage {
 }
 
 // TestEnrollThroughFrictServer: Authentik's Duo setup stage enrolls against
-// frict-server, a fake phone claims the activation over TLS, enroll_status
-// turns from waiting to success, and Authentik saves the device. A second
-// phone replaying the same activation is refused.
+// frict-server, the setup page's QR code scans as the activation link, a fake
+// phone claims the activation over TLS, enroll_status turns from waiting to
+// success, and Authentik saves the device. A second phone replaying the same
+// activation is refused.
 func TestEnrollThroughFrictServer(t *testing.T) {
 	username, userPK := createUser(t, "erin")
 
@@ -382,6 +384,9 @@ func TestEnrollThroughFrictServer(t *testing.T) {
 	}
 	if act.Host != frictHostname {
 		t.Fatalf("activation host %q, want %q", act.Host, frictHostname)
+	}
+	if got := scanQR(t, c.ActivationBarcode); got != c.ActivationCode {
+		t.Fatalf("activation_barcode scans as %q, want the activation link %q", got, c.ActivationCode)
 	}
 	if got := b.enrollmentStatus(c.StageUUID); got != "waiting" {
 		t.Fatalf("enroll_status before the phone enrolled: %q, want waiting", got)
@@ -409,6 +414,28 @@ func TestEnrollThroughFrictServer(t *testing.T) {
 	if status, body := enrollPhone(replay, act); status != http.StatusUnauthorized {
 		t.Fatalf("second phone with the same activation: %d %s, want 401", status, body)
 	}
+}
+
+// scanQR checks that barcode, as the setup page puts it in <img src>, is a
+// PNG data URL, and returns what zbarimg reads from the image.
+func scanQR(t *testing.T, barcode string) string {
+	t.Helper()
+	b64, ok := strings.CutPrefix(barcode, "data:image/png;base64,")
+	if !ok {
+		t.Fatalf("activation_barcode %.80q is not a PNG data URL", barcode)
+	}
+	img, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		t.Fatalf("activation_barcode base64: %v", err)
+	}
+	cmd := composeCmd("run", "--rm", "-T", "zbar")
+	cmd.Stdin = bytes.NewReader(img)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("zbarimg: %v; stdout %q; stderr %s", err, stdout.String(), stderr.String())
+	}
+	return strings.TrimSuffix(stdout.String(), "\n")
 }
 
 // enrollmentStatus asks Authentik for the enrollment status, as the setup
