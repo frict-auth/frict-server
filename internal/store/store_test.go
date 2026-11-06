@@ -154,6 +154,8 @@ func TestOpenRejectsNewerSchema(t *testing.T) {
 func TestSchemaConstraints(t *testing.T) {
 	const id = `x'00112233445566778899aabbccddeeff'`
 	const challenge = `INSERT INTO challenges (id, user_id, ipaddr, pushinfo, status, created_at, expires_at, answered_at, reason) VALUES `
+	const alertFor = `INSERT INTO challenges (id, user_id, ipaddr, pushinfo, created_at, expires_at) VALUES (` + id + `, 'DU1', '', '', 100, 160);
+		INSERT INTO alerts (id, recipient_user_id, challenge_id, created_at) VALUES `
 	tests := []struct {
 		name   string
 		stmt   string
@@ -178,6 +180,10 @@ func TestSchemaConstraints(t *testing.T) {
 		{"device for unknown user", `INSERT INTO devices (user_id, device_key, approval_key, attestation, fid, enrolled_at) VALUES ('DU404', x'01', x'02', x'03', 'fid', 1)`, false},
 		{"negative failed_attempts", `UPDATE users SET failed_attempts = -1 WHERE user_id = 'DU1'`, false},
 		{"negative pushes_since_success", `UPDATE users SET pushes_since_success = -1 WHERE user_id = 'DU1'`, false},
+		{"alert for a challenge", alertFor + `(x'0f0e0d0c0b0a09080706050403020100', 'DU1', ` + id + `, 100)`, true},
+		{"15-byte alert id", alertFor + `(x'0f0e0d0c0b0a090807060504030201', 'DU1', ` + id + `, 100)`, false},
+		{"alert for unknown recipient", alertFor + `(x'0f0e0d0c0b0a09080706050403020100', 'DU404', ` + id + `, 100)`, false},
+		{"alert for unknown challenge", alertFor + `(x'0f0e0d0c0b0a09080706050403020100', 'DU1', x'ffffffffffffffffffffffffffffffff', 100)`, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -196,19 +202,20 @@ func TestSchemaConstraints(t *testing.T) {
 	}
 }
 
-func TestDeletingUserRemovesDeviceAndChallenges(t *testing.T) {
+func TestDeletingUserRemovesDeviceChallengesAndAlerts(t *testing.T) {
 	s, _ := openTemp(t)
 	for _, stmt := range []string{
 		`INSERT INTO users (user_id, username, created_at) VALUES ('DU1', 'alice', 1)`,
 		`INSERT INTO devices (user_id, device_key, approval_key, attestation, enrolled_at) VALUES ('DU1', x'01', x'02', x'03', 1)`,
 		`INSERT INTO challenges (id, user_id, ipaddr, pushinfo, created_at, expires_at) VALUES (x'00112233445566778899aabbccddeeff', 'DU1', '', '', 100, 160)`,
+		`INSERT INTO alerts (id, recipient_user_id, challenge_id, created_at) VALUES (x'0f0e0d0c0b0a09080706050403020100', 'DU1', x'00112233445566778899aabbccddeeff', 100)`,
 		`DELETE FROM users WHERE user_id = 'DU1'`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil {
 			t.Fatalf("%s: %v", stmt, err)
 		}
 	}
-	for _, table := range []string{"devices", "challenges"} {
+	for _, table := range []string{"devices", "challenges", "alerts"} {
 		var n int
 		if err := s.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil || n != 0 {
 			t.Fatalf("%s rows after deleting the user = %d err:%v, want 0", table, n, err)
@@ -373,6 +380,9 @@ func enrolled(t *testing.T) *Store {
 	return s
 }
 
+// noLimits never refuses a push.
+var noLimits = Limits{PushCap: 1000, Cooldown: time.Second, MaxFailed: 1000}
+
 func challengeID(b byte) []byte { return []byte{b, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, b} }
 
 // pushTo stores a pending challenge for userID created at at, expiring a
@@ -382,8 +392,8 @@ func pushTo(t *testing.T, s *Store, id []byte, userID string, at time.Time) Chal
 	c := Challenge{ID: id, UserID: userID, DisplayUsername: "alice", IPAddr: "203.0.113.7",
 		PushInfo: "Domain=auth.example&Application=Grafana", Type: "authentik Login request",
 		CreatedAt: at, ExpiresAt: at.Add(time.Minute)}
-	if err := s.CreateChallenge(context.Background(), c); err != nil {
-		t.Fatalf("CreateChallenge: %v", err)
+	if lock, err := s.StartPush(context.Background(), c, noLimits); err != nil || lock != Unlocked {
+		t.Fatalf("StartPush: %q %v", lock, err)
 	}
 	return c
 }
@@ -408,7 +418,7 @@ func TestPendingChallengesAreTheUsersUnexpiredOnes(t *testing.T) {
 	pushTo(t, s, challengeID(2), aliceID, t0.Add(30*time.Second))
 	pushTo(t, s, challengeID(3), bobID, t0)
 	answered := pushTo(t, s, challengeID(4), aliceID, t0)
-	if err := s.AnswerChallenge(ctx, answered.ID, aliceID, Outcome{Status: ChallengeApproved}, t0); err != nil {
+	if err := s.AnswerChallenge(ctx, answered.ID, aliceID, Outcome{Status: ChallengeApproved}, t0, Fraud{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -455,10 +465,10 @@ func TestAnswerChallengeOnce(t *testing.T) {
 			s := enrolled(t)
 			ctx := context.Background()
 			c := pushTo(t, s, challengeID(1), aliceID, t0)
-			if err := s.AnswerChallenge(ctx, c.ID, aliceID, answer, t0.Add(time.Second)); err != nil {
+			if err := s.AnswerChallenge(ctx, c.ID, aliceID, answer, t0.Add(time.Second), Fraud{}); err != nil {
 				t.Fatalf("first answer: %v", err)
 			}
-			if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeApproved}, t0.Add(2*time.Second)); !errors.Is(err, ErrChallengeNotPending) {
+			if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeApproved}, t0.Add(2*time.Second), Fraud{}); !errors.Is(err, ErrChallengeNotPending) {
 				t.Fatalf("second answer: %v, want ErrChallengeNotPending", err)
 			}
 			got, err := s.CloseChallenge(ctx, c.ID)
@@ -477,19 +487,19 @@ func TestAnswerChallengeRejected(t *testing.T) {
 	ctx := context.Background()
 	c := pushTo(t, s, challengeID(1), aliceID, t0)
 	approve := Outcome{Status: ChallengeApproved}
-	if err := s.AnswerChallenge(ctx, c.ID, bobID, approve, t0); !errors.Is(err, ErrChallengeNotFound) {
+	if err := s.AnswerChallenge(ctx, c.ID, bobID, approve, t0, Fraud{}); !errors.Is(err, ErrChallengeNotFound) {
 		t.Fatalf("bob answering alice's challenge: %v, want ErrChallengeNotFound", err)
 	}
-	if err := s.AnswerChallenge(ctx, challengeID(9), aliceID, approve, t0); !errors.Is(err, ErrChallengeNotFound) {
+	if err := s.AnswerChallenge(ctx, challengeID(9), aliceID, approve, t0, Fraud{}); !errors.Is(err, ErrChallengeNotFound) {
 		t.Fatalf("unknown challenge: %v, want ErrChallengeNotFound", err)
 	}
-	if err := s.AnswerChallenge(ctx, c.ID, aliceID, approve, c.ExpiresAt); !errors.Is(err, ErrChallengeNotPending) {
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, approve, c.ExpiresAt, Fraud{}); !errors.Is(err, ErrChallengeNotPending) {
 		t.Fatalf("answer at expiry: %v, want ErrChallengeNotPending", err)
 	}
-	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeDenied}, t0); err == nil {
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeDenied}, t0, Fraud{}); err == nil {
 		t.Fatal("deny without a reason accepted")
 	}
-	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeDenied, Reason: "bored"}, t0); err == nil {
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeDenied, Reason: "bored"}, t0, Fraud{}); err == nil {
 		t.Fatal("deny with an unknown reason accepted")
 	}
 	if got := pendingIDs(t, s, aliceID, t0); len(got) != 1 {
@@ -508,7 +518,7 @@ func TestCloseChallengeExpiresPending(t *testing.T) {
 	if got != (Outcome{Status: ChallengeExpired}) {
 		t.Fatalf("CloseChallenge on a pending challenge = %+v, want expired", got)
 	}
-	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeApproved}, t0); !errors.Is(err, ErrChallengeNotPending) {
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeApproved}, t0, Fraud{}); !errors.Is(err, ErrChallengeNotPending) {
 		t.Fatalf("answer after close: %v, want ErrChallengeNotPending", err)
 	}
 }
@@ -540,5 +550,16 @@ func TestEnrollConcurrentSameCode(t *testing.T) {
 	}
 	if ok != 1 || used != racers-1 {
 		t.Fatalf("%d enrolls succeeded and %d got ErrActivationUsed, want 1 and %d", ok, used, racers-1)
+	}
+}
+
+func TestStartPushRequiresDevice(t *testing.T) {
+	s := enrolling(t)
+	c := Challenge{ID: challengeID(1), UserID: aliceID, CreatedAt: t0, ExpiresAt: t0.Add(time.Minute)}
+	if _, err := s.StartPush(context.Background(), c, noLimits); !errors.Is(err, ErrNoDevice) {
+		t.Fatalf("StartPush for a user without a device: %v, want ErrNoDevice", err)
+	}
+	if got := pendingIDs(t, s, aliceID, t0); len(got) != 0 {
+		t.Fatalf("pending after a refused push: %v", got)
 	}
 }

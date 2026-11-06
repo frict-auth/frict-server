@@ -43,11 +43,34 @@ type Store interface {
 	EnrollmentStatusOf(ctx context.Context, userID, code string, now time.Time) (store.EnrollmentStatus, error)
 	Enroll(ctx context.Context, code, claimedUserID string, d store.Device) error
 	DeviceOf(ctx context.Context, userID string) (store.Device, error)
-	CreateChallenge(ctx context.Context, c store.Challenge) error
+	StartPush(ctx context.Context, c store.Challenge, lim store.Limits) (store.Lock, error)
 	PendingChallenges(ctx context.Context, userID string, now time.Time) ([]store.Challenge, error)
 	PendingChallenge(ctx context.Context, id []byte, userID string, now time.Time) (store.Challenge, error)
-	AnswerChallenge(ctx context.Context, id []byte, userID string, answer store.Outcome, now time.Time) error
+	AnswerChallenge(ctx context.Context, id []byte, userID string, answer store.Outcome, now time.Time, fraud store.Fraud) error
 	CloseChallenge(ctx context.Context, id []byte) (store.Outcome, error)
+	Alerts(ctx context.Context, recipientUserID string, since time.Time) ([]store.Alert, error)
+}
+
+// Safeguards limit pushes and say what a not_me deny does
+// (docs/PLAN.md Safeguards). Durations are whole seconds.
+type Safeguards struct {
+	// PushCap pushes since a user's last successful login, after which
+	// the user gets one push per PushCooldown.
+	PushCap      int
+	PushCooldown time.Duration
+	// MaxFailed denies and timeouts since the last successful login
+	// disable the device until it is re-enrolled.
+	MaxFailed int
+	// Pause is how long a not_me deny stops pushes to that user.
+	Pause time.Duration
+	// AlertRecipients are the Authentik usernames whose enrolled devices
+	// get an alert on every not_me deny.
+	AlertRecipients []string
+	// AlertTTL is how long an alert is listed in /device/v1/pending.
+	AlertTTL time.Duration
+	// AuthentikURL is Authentik's base URL, e.g. https://auth.example, for
+	// the alert's links into its admin UI.
+	AuthentikURL string
 }
 
 // Server serves one Authentik Duo stage. The verifier's Host is the API
@@ -56,6 +79,7 @@ type Server struct {
 	verifier     duosig.Verifier
 	store        Store
 	challengeTTL time.Duration
+	safeguards   Safeguards
 	log          *slog.Logger
 
 	mu       sync.Mutex
@@ -65,8 +89,8 @@ type Server struct {
 // New returns a Server whose pushes expire challengeTTL after /auth/v2/auth
 // creates them. challengeTTL is whole seconds, since the store keeps
 // timestamps in seconds.
-func New(v duosig.Verifier, st Store, challengeTTL time.Duration, log *slog.Logger) *Server {
-	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, log: log, answered: map[string]chan struct{}{}}
+func New(v duosig.Verifier, st Store, challengeTTL time.Duration, sg Safeguards, log *slog.Logger) *Server {
+	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, safeguards: sg, log: log, answered: map[string]chan struct{}{}}
 }
 
 func (s *Server) Handler() http.Handler {

@@ -72,8 +72,8 @@ func expectLoggedIn(t *testing.T, b *browser, c challenge, username string) {
 
 // expectDenied requires Authentik to have refused the push, and its
 // login_failed event to carry frict-server's /auth response with
-// duoStatus.
-func expectDenied(t *testing.T, b *browser, c challenge, username, duoStatus string) {
+// duoStatus. It returns that response.
+func expectDenied(t *testing.T, b *browser, c challenge, username, duoStatus string) map[string]any {
 	t.Helper()
 	b.expect(c, "ak-stage-authenticator-validate")
 	if errs := c.ResponseErrors["duo"]; len(errs) == 0 || errs[0].String != "Duo denied access" {
@@ -99,12 +99,13 @@ func expectDenied(t *testing.T, b *browser, c challenge, username, duoStatus str
 			args, _ := e.Context["auth_method_args"].(map[string]any)
 			resp, _ := args["duo_response"].(map[string]any)
 			if resp["result"] == "deny" && resp["status"] == duoStatus {
-				return
+				return resp
 			}
 		}
 		time.Sleep(time.Second)
 	}
 	t.Fatalf("no login_failed event for %s with duo_response status %q; got %v", username, duoStatus, seen)
+	return nil
 }
 
 func answerOrError(t *testing.T, d device, id, decision, reason string, want int) {

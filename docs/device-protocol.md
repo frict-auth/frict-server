@@ -230,6 +230,23 @@ own (duo.com/docs/authapi, `/auth` status values):
 | deny, `cancel` | `deny` | `deny` | `Login request denied.` |
 | deny, `not_me` | `deny` | `fraud` | `Login request reported as fraudulent.` |
 | expired | `deny` | `timeout` | `Login timed out.` |
+| refused by a safeguard | `deny` | `locked_out` | Which safeguard: the device is disabled, pushes are paused, or the push cap is reached. |
+
+A safeguard (PLAN Safeguards) can refuse `/auth` before any challenge
+exists: it answers at once with `locked_out`, which Duo documents as "The
+user has been disabled due to authentication failures" with result `deny`
+(duo.com/docs/authapi, `/auth` response formats). In the order checked:
+
+1. **Disabled.** `FRICT_MAX_FAILED` denies and timeouts since the user's
+   last approval, counted across challenges, including Authentik ending
+   the call early. Only an approval resets the count. A disabled device
+   stays disabled until it is re-enrolled: an Authentik admin deletes the
+   user's Duo device, and the next login runs the Duo setup stage, which
+   creates a new Frict user.
+2. **Paused.** Within `FRICT_PAUSE` of a `not_me` deny.
+3. **Capped.** `FRICT_PUSH_CAP` pushes since the last approval, and the
+   last push was under `FRICT_PUSH_COOLDOWN` ago. An approval resets the
+   count.
 
 ### `challenge` (signed with `device_key`)
 
@@ -253,9 +270,28 @@ pending.
 ### `pending` (signed with `device_key`)
 
 Request `{}`: an object with no fields. Response
-`{"challenge_ids": ["…"], "poll_interval": 5}`: the user's pending,
-unexpired challenges, oldest first (an empty list when there are none), and
-how many seconds to wait before polling again (server-set, as in CIBA).
+`{"challenge_ids": ["…"], "poll_interval": 5, "alerts": […]}`: the user's
+pending, unexpired challenges, oldest first (an empty list when there are
+none), how many seconds to wait before polling again (server-set, as in
+CIBA), and the user's alerts.
+
+An alert says someone answered a push with `not_me`. Every enrolled user
+whose username is in `FRICT_ALERT_RECIPIENTS` gets one per such deny, and it
+is listed in every poll for `FRICT_ALERT_TTL` after the deny; the app shows
+each `alert_id` once. Oldest first, empty when there are none:
+
+```json
+{"alert_id": "…", "username": "geoffrey", "ipaddr": "203.0.113.7",
+ "pushinfo": "Domain=…&Application=…", "type": "authentik Login request",
+ "attempted": 1762345678, "reported": 1762345690,
+ "reset_password_url": "https://auth.example/if/admin/#/identity/users;…",
+ "revoke_sessions_url": "https://auth.example/if/admin/#/identity/users;…"}
+```
+
+`username`, `ipaddr`, `pushinfo` and `type` are the denied challenge's, as
+Authentik sent them. `attempted` is when that push was created and
+`reported` when it was denied, in unix seconds. Both URLs open Authentik's
+admin user list filtered to `username` (PLAN Safeguards).
 
 ### `answer` (signed with `approval_key`)
 

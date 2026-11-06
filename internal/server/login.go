@@ -5,9 +5,12 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/frict-auth/frict-server/internal/devicesig"
@@ -33,16 +36,6 @@ func (s *Server) duoAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := p["user_id"]
-	if _, err := s.store.DeviceOf(r.Context(), userID); errors.Is(err, store.ErrNoDevice) {
-		s.log.Warn("auth for a user without a device", "user_id", userID)
-		duoFail(w, http.StatusBadRequest, 40002, "Invalid request parameters: user_id")
-		return
-	} else if err != nil {
-		s.log.Error("auth: store", "err", err)
-		duoFail(w, http.StatusInternalServerError, 50000, "Internal error")
-		return
-	}
-
 	id := make([]byte, 16)
 	rand.Read(id)
 	now := s.verifier.Now()
@@ -61,9 +54,21 @@ func (s *Server) duoAuth(w http.ResponseWriter, r *http.Request) {
 	// Not cancelled with the request: a challenge, once stored, must reach
 	// CloseChallenge below, or it stays pending for the device until it
 	// expires.
-	if err := s.store.CreateChallenge(context.WithoutCancel(r.Context()), c); err != nil {
+	lock, err := s.store.StartPush(context.WithoutCancel(r.Context()), c, store.Limits{
+		PushCap: s.safeguards.PushCap, Cooldown: s.safeguards.PushCooldown, MaxFailed: s.safeguards.MaxFailed,
+	})
+	switch {
+	case errors.Is(err, store.ErrNoDevice):
+		s.log.Warn("auth for a user without a device", "user_id", userID)
+		duoFail(w, http.StatusBadRequest, 40002, "Invalid request parameters: user_id")
+		return
+	case err != nil:
 		s.log.Error("auth: store", "err", err)
 		duoFail(w, http.StatusInternalServerError, 50000, "Internal error")
+		return
+	case lock != store.Unlocked:
+		s.log.Warn("push refused", "user_id", userID, "lock", string(lock))
+		duoOK(w, lockedOut(lock))
 		return
 	}
 	s.log.Info("challenge created", "user_id", userID, "challenge_id", encodeID(id), "expires_in", s.challengeTTL.String())
@@ -105,6 +110,20 @@ func duoResult(o store.Outcome) map[string]string {
 	default:
 		return map[string]string{"result": "deny", "status": "timeout", "status_msg": "Login timed out."}
 	}
+}
+
+// lockedOut is the /auth response when a safeguard refuses to push. Duo's
+// Auth API documents status locked_out, "The user has been disabled due to
+// authentication failures", with result deny (duo.com/docs/authapi, /auth
+// response formats). status_msg says which safeguard, and Authentik records
+// it in its login_failed event with the rest of the response.
+func lockedOut(l store.Lock) map[string]string {
+	msg := map[store.Lock]string{
+		store.LockDisabled: "Device disabled after too many failed attempts; re-enroll it.",
+		store.LockPaused:   "Pushes paused after a sign-in was reported as fraudulent.",
+		store.LockCapped:   "Too many pushes since the last successful login; try again later.",
+	}[l]
+	return map[string]string{"result": "deny", "status": "locked_out", "status_msg": msg}
 }
 
 // awaitAnswer returns a channel deviceAnswer closes when challenge id is
@@ -176,7 +195,8 @@ func (s *Server) devicePending(w http.ResponseWriter, r *http.Request) {
 		deviceFail(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	cs, err := s.store.PendingChallenges(r.Context(), userID, s.verifier.Now())
+	now := s.verifier.Now()
+	cs, err := s.store.PendingChallenges(r.Context(), userID, now)
 	if err != nil {
 		s.log.Error("pending: store", "err", err)
 		deviceFail(w, http.StatusInternalServerError, "internal")
@@ -186,7 +206,41 @@ func (s *Server) devicePending(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cs {
 		ids = append(ids, encodeID(c.ID))
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"challenge_ids": ids, "poll_interval": PollInterval})
+	as, err := s.store.Alerts(r.Context(), userID, now.Add(-s.safeguards.AlertTTL+time.Second))
+	if err != nil {
+		s.log.Error("pending: store", "err", err)
+		deviceFail(w, http.StatusInternalServerError, "internal")
+		return
+	}
+	alerts := []map[string]any{}
+	for _, a := range as {
+		admin := AuthentikUserURL(s.safeguards.AuthentikURL, a.DisplayUsername)
+		alerts = append(alerts, map[string]any{
+			"alert_id":            encodeID(a.ID),
+			"username":            a.DisplayUsername,
+			"ipaddr":              a.IPAddr,
+			"pushinfo":            a.PushInfo,
+			"type":                a.Type,
+			"attempted":           a.AttemptedAt.Unix(),
+			"reported":            a.ReportedAt.Unix(),
+			"reset_password_url":  admin,
+			"revoke_sessions_url": admin,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"challenge_ids": ids, "poll_interval": PollInterval, "alerts": alerts})
+}
+
+// AuthentikUserURL opens Authentik's admin user list filtered to username.
+// That row carries both alert actions: Recovery's "Set password" and
+// "Create recovery link", and the "Revoke Sessions" bulk action
+// (web/src/admin/users/UserListPage.ts in 2026.8.5). A user's own page needs
+// the user's primary key, which Frict cannot look up without an Authentik
+// API token. The list reads its search from the route parameter
+// "ak-user-list-search", JSON after ";" in the hash, URI-encoded
+// (web/src/elements/table/Table.ts, web/src/elements/router/RouteMatch.ts).
+func AuthentikUserURL(base, username string) string {
+	params, _ := json.Marshal(map[string]string{"ak-user-list-search": username})
+	return strings.TrimRight(base, "/") + "/if/admin/#/identity/users;" + url.PathEscape(string(params))
 }
 
 type challengeRequest struct {
@@ -267,7 +321,9 @@ func (s *Server) deviceAnswer(w http.ResponseWriter, r *http.Request) {
 		deviceFail(w, http.StatusBadRequest, "bad_request")
 		return
 	}
-	err := s.store.AnswerChallenge(r.Context(), id, userID, answer, s.verifier.Now())
+	now := s.verifier.Now()
+	fraud := store.Fraud{PausedUntil: now.Add(s.safeguards.Pause), AlertRecipients: s.safeguards.AlertRecipients}
+	err := s.store.AnswerChallenge(r.Context(), id, userID, answer, now, fraud)
 	switch {
 	case errors.Is(err, store.ErrChallengeNotFound):
 		deviceFail(w, http.StatusNotFound, "not_found")
