@@ -105,3 +105,9 @@ services:
     volumes:
       - ./secrets:/secrets:ro
       - ./sssd/sssd.conf:/frict/sssd.conf:ro
+
+  # Run by the enrollment test: reads a PNG on stdin and prints the QR code's
+  # contents.
+  zbar:
+    build: zbar
+    image: frict-m0-zbar

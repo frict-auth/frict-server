@@ -262,8 +262,12 @@ func TestDuoEnrollResponse(t *testing.T) {
 	if a.Host != host || a.UserID != r.UserID || len(a.Code) != 26 {
 		t.Fatalf("activation link %q: %+v", r.ActivationCode, a)
 	}
-	if r.ActivationBarcode != r.ActivationCode {
-		t.Fatalf("activation_barcode %q, want the activation link", r.ActivationBarcode)
+	want, err := qrDataURL(r.ActivationCode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.ActivationBarcode != want {
+		t.Fatalf("activation_barcode %.60q..., want the QR code of the activation link", r.ActivationBarcode)
 	}
 	if other := f.enroll("élodie"); other.UserID == a.UserID || other.Code == a.Code {
 		t.Fatalf("second enroll reused user_id or code: %+v %+v", a, other)

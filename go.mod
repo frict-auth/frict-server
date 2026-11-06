@@ -2,7 +2,10 @@ module github.com/frict-auth/frict-server
 
 go 1.27.3
 
-require modernc.org/sqlite v1.58.0
+require (
+	github.com/boombuler/barcode v1.1.0
+	modernc.org/sqlite v1.58.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

@@ -151,7 +151,7 @@ Authentik's Duo setup stage calls `/auth/v2/enroll` with only `username`
 |---|---|
 | `user_id` | A new `DU` + 26 base32 user ID. Every call creates a new user. |
 | `activation_code` | The app link `frict://enroll?code=<code>&host=<api host>&user_id=<user_id>`. Authentik renders it as a link (`web/src/flow/stages/authenticator_duo/AuthenticatorDuoStage.ts`). |
-| `activation_barcode` | The same link. Authentik renders it as an image source; Frict does not render a QR image yet (see PLAN Open). |
+| `activation_barcode` | A QR code of the same link as a `data:image/png;base64,` URL (error correction M, 4-module quiet zone). Authentik renders it as an image source. |
 | `username` | As sent. |
 | `valid_secs` | `900`. Authentik sends no `valid_secs`. |
 

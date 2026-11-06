@@ -562,10 +562,6 @@ M0 settled push over an LDAP bind and that the login page cannot show a
 number (`docs/m0-findings.md` (d) and "Number matching").
 
 - FCM `validate_only` semantics.
-- Enrollment QR image. The standard library has no QR encoder, so
-  `activation_barcode` carries the app link and Authentik's setup page shows
-  an image that cannot load, above a working link. Needed by M2: a hand-written encoder
-  or a dependency, Geoffrey's call.
 - Whether Authentik will accept a per-stage `disable_ca_pinning` option.
 
 ---
