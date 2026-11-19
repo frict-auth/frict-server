@@ -25,6 +25,9 @@ type TokenSource interface {
 
 // FCM sends data messages through the FCM HTTP v1 API.
 type FCM struct {
+	// ValidateOnly has FCM check each message without delivering it.
+	ValidateOnly bool
+
 	client   *http.Client
 	endpoint string
 	tokens   TokenSource
@@ -41,7 +44,8 @@ func NewFCM(baseURL, projectID string, tokens TokenSource, client *http.Client) 
 }
 
 type fcmRequest struct {
-	Message fcmMessage `json:"message"`
+	ValidateOnly bool       `json:"validate_only,omitempty"`
+	Message      fcmMessage `json:"message"`
 }
 
 type fcmMessage struct {
@@ -71,7 +75,7 @@ func (f *FCM) Send(ctx context.Context, m Message) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("fcm token: %w", err)
 	}
-	body, err := json.Marshal(fcmRequest{Message: fcmMessage{
+	body, err := json.Marshal(fcmRequest{ValidateOnly: f.ValidateOnly, Message: fcmMessage{
 		FID:     m.FID,
 		Data:    m.Data,
 		Android: fcmAndroid{Priority: "high"},

@@ -314,7 +314,7 @@ Carried over from chat-relay / chat-android.
 3. **LDAP e2e.** `ldapsearch` bind through the outpost in the same stack.
 4. **Live FCM.**
    - Every PR, server side: a contract test sends through real FCM with
-     `validate_only: true` (validates without delivering — *unverified*),
+     `validate_only: true` (validates without delivering),
      authenticated by keyless WIF.
    - Every PR, device side: real FCM push to an emulator on a KVM-enabled
      GitHub runner, using chat-android's scripts. If the cold-boot
@@ -560,7 +560,11 @@ upload. Keep the name in one constant per codebase.
 M0 settled push over an LDAP bind and that the login page cannot show a
 number (`docs/m0-findings.md` (d) and "Number matching").
 
-- FCM `validate_only` semantics.
+- FCM `validate_only` semantics: settled. It checks the target: an FID no
+  device holds gets 404 NOT_FOUND, `errorCode` UNREGISTERED, so `fcm-live`
+  passes only past auth and IAM; a project the token can't send for gets 403
+  PERMISSION_DENIED (actions run 44539165608 attempt 2; negative control
+  run 44542161659).
 - Whether Authentik will accept a per-stage `disable_ca_pinning` option.
 
 ---

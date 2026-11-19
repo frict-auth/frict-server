@@ -68,6 +68,21 @@ func TestFCMSendsDataMessage(t *testing.T) {
 	}
 }
 
+func TestFCMValidateOnly(t *testing.T) {
+	var got map[string]any
+	f := testFCM(t, &tokens{list: []string{"tok"}}, func(w http.ResponseWriter, r *http.Request) {
+		json.NewDecoder(r.Body).Decode(&got)
+		io.WriteString(w, `{"name":"projects/frict-test/messages/fake_message_id"}`)
+	})
+	f.ValidateOnly = true
+	if _, err := f.Send(context.Background(), Message{FID: "the-fid", Data: map[string]string{"challenge_id": "AAAA"}}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if got["validate_only"] != true {
+		t.Fatalf("body = %s, want validate_only true", mustJSON(t, got))
+	}
+}
+
 func TestFCMTokenFailureSendsNothing(t *testing.T) {
 	called := false
 	f := testFCM(t, &tokens{err: errors.New("token endpoint down")}, func(http.ResponseWriter, *http.Request) { called = true })
