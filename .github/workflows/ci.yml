@@ -84,5 +84,5 @@ jobs:
       - name: validate_only send through FCM HTTP v1
         env:
           FCM_ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
-          FCM_PROJECT_ID: dev-frict-auth
+          FCM_PROJECT_ID: frict-wrong-project-ci
         run: go test -tags fcmlive -run '^TestFCMLive$' -count=1 -v ./internal/push
