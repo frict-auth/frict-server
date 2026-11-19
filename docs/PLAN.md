@@ -387,36 +387,29 @@ issue → PR.
   approved under the org's third-party access.
 
 **Before M1**
-- ~~Register the `frict-cross-review` GitHub App~~ (done: Commit statuses
-  write only, installed on the org). Its private key is on the desktop; where
-  the poster runs, and so where the key lives, is still to decide. Original
-  steps, for reference: register at
-  https://github.com/organizations/frict-auth/settings/apps/new
-  ([docs](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)):
-  webhook Active unticked; repository permission **Commit statuses: Read &
-  write** only; installable on this account only. Note the App ID, generate a
-  private key, store it at `~/.config/frict/cross-review.pem` (mode 600),
-  install on `frict-server`.
-- An agent builds the poster (JWT → 1 h installation token → status on a
-  SHA) and posts one `cross-review` status, so the App appears as a source.
-- After CI's first green run and that first status: ruleset → Require status
-  checks → the CI job, plus `cross-review` with **Source** set to
-  `frict-cross-review`. Settings → General → Allow auto-merge.
+- ~~Register the `frict-cross-review` GitHub App~~ (done: App 5557312,
+  Commit statuses write only, installed on the org). Its private key is in
+  the agent VM at `~/.config/frict/cross-review.pem` (mode 600). The poster
+  is `tools/cross-review-status` in `gfree76/zart-agent-setup`.
+- ~~Rulesets~~ (done on both repos, per zart-agent-setup `docs/new-repo.md`):
+  required CI checks plus `cross-review` with source App 5557312, squash
+  only, auto-merge on.
 - The App gate stops a stray token from marking a PR reviewed. It does not
   stop an agent on the same machine from reading the key.
 
 **Before M2**
-- New GCP/Firebase project (suggest `frict-auth`; separate from chat
-  so a leaked sender key can't reach chat). It is needed only for FCM.
-- Register the Android package `app.frict.android`; download `google-services.json` and give its
-  path in plain words.
-- Sender service account with FCM Admin role; JSON key goes straight to the
-  box.
+- Dev Firebase: GCP project `dev-frict-auth`, separate from chat so a leaked
+  key can't reach chat, with the Android app `app.frict.android.dev` (debug
+  builds use `applicationIdSuffix .dev`). CI sends FCM as service account
+  `frict-fcm-ci` (FCM Admin) through keyless WIF: pool `github-actions`,
+  provider `github`, condition on the `repository_id` of frict-server or
+  frict-android. Live-FCM CI jobs skip fork PRs.
+- `google-services.json` for the dev app goes in `app/src/debug/`.
 - Restrict the Firebase API key to the package and its SHA-1s.
+- Prod project, the release app `app.frict.android` and the box's sender key
+  (`frict-fcm-sender`) come at M3.
 - Play Console: create the app, do the first AAB upload by hand, grant the
   release service account per-app permission, widen the WIF condition.
-- `frict-auth/frict-android` repo, same settings, ruleset and App install as
-  frict-server.
 
 **Before M3** — see "Production setup" below for the detail.
 - Cloudflare DNS for `api.frict.app`.
@@ -425,6 +418,7 @@ issue → PR.
 - `data/` and `secrets/` on the box, owned by uid 65532.
 - Deploy secrets in the repo.
 - Prod Authentik: Duo setup stage, validation stage, test user, test flow.
+- ~~Upgrade prod Authentik to 2026.8.5~~ (done).
 
 **Before M5**
 - Prod Authentik: LDAP authentication flow with the Frict validation stage.
@@ -595,6 +589,20 @@ any TLS or connection error; any HTTP status is a pass.
 scripts/duo-tls-check.sh <server container> https://api.frict.app
 scripts/duo-tls-check.sh <worker container> https://api.frict.app
 ```
+On the box the same two checks run from a systemd timer and after every
+Authentik container start. A pass pings healthchecks.io; a failure pings its
+`/fail` URL. healthchecks.io also alerts when pings stop, and its alerts don't
+go through Authentik.
+
+**4. Authentik versions.** Prod runs only Authentik versions that
+frict-server's `main` already tests. `gfree76/hetzner-setup` CI fails a bump
+that frict-server hasn't reached, and its upgrade runbook goes one minor
+version per hop.
+
+**5. Way back in.** A broken Duo stage locks out every user whose login uses
+it, the admin included. Before M3 points a real login at Frict, confirm an
+admin recovery link can be created over SSH on the box (`ak
+create_recovery_key`, unverified).
 
 **Fallback B (AWS ACM via ACME):** create an ACM ACME endpoint, add its
 validation CNAME in Cloudflare, add an `amazon.com` CAA record, register
