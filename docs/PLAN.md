@@ -379,8 +379,7 @@ issue → PR.
 - Repo settings: Actions workflow permissions read-only; "Require approval for
   all external contributors" for fork PR workflows.
 - ~~Ruleset on `main` of `frict-server`~~ (done): require PR (0 approvals),
-  block force-push and deletion, empty bypass list. `frict-android` has no
-  ruleset yet.
+  block force-push and deletion, empty bypass list.
 - Agent identity: `gfree76-claude-agent`, org member with Write on all repos
   (org base permission). Agents run in the agent VM (`gfree76/zart-agent-setup`),
   where `gh` is logged in as that account over OAuth; no PAT. GitHub CLI is
@@ -546,7 +545,7 @@ upload. Keep the name in one constant per codebase.
 - Repos public.
 - Human not a merge blocker; auto-merge gated by CI + cross-review status.
 - Alerts go to the approver app; recipients configured in Frict.
-- Live FCM tests in CI on every PR.
+- Live FCM tests in CI on every PR except fork PRs.
 - TLS: route A, Let's Encrypt plus the system CA bundle mounted over
   `duo_client`'s; fallback B, AWS ACM via ACME; upstream per-stage
   `disable_ca_pinning` in parallel.
@@ -589,15 +588,14 @@ any TLS or connection error; any HTTP status is a pass.
 scripts/duo-tls-check.sh <server container> https://api.frict.app
 scripts/duo-tls-check.sh <worker container> https://api.frict.app
 ```
-On the box the same two checks run from a systemd timer and after every
-Authentik container start. A pass pings healthchecks.io; a failure pings its
-`/fail` URL. healthchecks.io also alerts when pings stop, and its alerts don't
-go through Authentik.
+At M3 the same two checks go on the box, run from a systemd timer and after
+every Authentik container start. A pass pings healthchecks.io; a failure
+pings its `/fail` URL. healthchecks.io also alerts when pings stop, and its
+alerts don't go through Authentik.
 
 **4. Authentik versions.** Prod runs only Authentik versions that
-frict-server's `main` already tests. `gfree76/hetzner-setup` CI fails a bump
-that frict-server hasn't reached, and its upgrade runbook goes one minor
-version per hop.
+frict-server's `main` already tests, upgraded one release at a time to the
+latest patch of each (`gfree76/hetzner-setup` `docs/authentik-upgrade.md`).
 
 **5. Way back in.** A broken Duo stage locks out every user whose login uses
 it, the admin included. Before M3 points a real login at Frict, confirm an
