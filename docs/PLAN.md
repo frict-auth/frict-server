@@ -187,6 +187,10 @@ no CA option, so the bundle is always used.
   runs `duo_client`, as Authentik calls it, inside the running server and
   worker, and exits non-zero on any TLS or connection failure. CI runs the
   same check against the e2e stack's frict-server. Runbook in the appendix.
+- **Early warning:** Authentik releases arrive as Dependabot PRs bumping the
+  server and LDAP images in `e2e/compose.yaml` together. If the e2e TLS check
+  fails on one, fix the mount target in `e2e/compose.yaml` in the same PR
+  (target read as in appendix step 2).
 - **Fallback B: AWS ACM certificates via its ACME endpoint.** Every ACM chain
   ends at Amazon Root CA 1–4 or Starfield Services G2, all in Duo's bundle, so
   no mount is needed. About $1 per issuance, 45-day certificates, stock
