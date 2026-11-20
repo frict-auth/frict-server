@@ -4,6 +4,10 @@ updates:
     directory: /e2e
     schedule:
       interval: daily
+    cooldown:
+      default-days: 7
+      exclude:
+        - goauthentik/*
     groups:
       authentik:
         patterns:
@@ -12,7 +16,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
   - package-ecosystem: gomod
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7

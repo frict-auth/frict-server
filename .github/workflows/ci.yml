@@ -25,6 +25,8 @@ jobs:
           if [ -n "$unformatted" ]; then
             echo "gofmt needed on:"; echo "$unformatted"; exit 1
           fi
+      - name: go mod verify
+        run: go mod verify
       - name: go vet
         run: |
           go vet ./...
@@ -32,6 +34,10 @@ jobs:
           go vet -tags fcmlive ./...
       - name: go test -race
         run: go test -race -count=1 -v ./...
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
 
   e2e:
     runs-on: ubuntu-24.04
