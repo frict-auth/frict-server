@@ -1,0 +1,8 @@
+# CodeQL config for the `codeql` job in .github/workflows/ci.yml.
+# The only place a finding may be suppressed, so every suppression is reviewed in a PR diff.
+# Suppress a rule with a justification, e.g.:
+#
+# query-filters:
+#   - exclude:
+#       id: go/example-rule # why it is a false positive here
+name: frict-server
