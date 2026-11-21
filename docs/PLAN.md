@@ -409,10 +409,12 @@ issue → PR.
   frict-android. Live-FCM CI jobs skip fork PRs.
 - `google-services.json` for the dev app goes in `app/src/debug/`.
 - Restrict the Firebase API key to the package and its SHA-1s.
-- Prod project, the release app `app.frict.android` and the box's sender key
-  (`frict-fcm-sender`) come at M3.
+- Prod project: hosts the Play release service account `frict-play-release`
+  behind its own WIF pool, admitting only frict-android's `release`
+  environment (frict-android `docs/release.md`). The release app
+  `app.frict.android` and the box's sender key (`frict-fcm-sender`) come at M3.
 - Play Console: create the app, do the first AAB upload by hand, grant the
-  release service account per-app permission, widen the WIF condition.
+  release service account per-app permission.
 
 **Before M3** — see "Production setup" below for the detail.
 - Cloudflare DNS for `api.frict.app`.
