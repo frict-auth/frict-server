@@ -5,6 +5,7 @@ go 1.27.4
 require (
 	github.com/boombuler/barcode v1.1.0
 	golang.org/x/oauth2 v0.38.0
+	golang.org/x/text v0.3.7
 	modernc.org/sqlite v1.62.0
 )
 
