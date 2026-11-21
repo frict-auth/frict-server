@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Weekly scan of main between Dependabot's monthly runs: unit (go mod verify, govulncheck) and codeql only.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -40,6 +44,7 @@ jobs:
           "$(go env GOPATH)/bin/govulncheck" ./...
 
   e2e:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
