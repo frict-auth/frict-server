@@ -47,9 +47,7 @@ services:
     command: worker
 
   frict-server:
-    build:
-      context: ..
-      dockerfile: e2e/frict-server.Dockerfile
+    build: ..
     environment:
       FRICT_API_HOSTNAME: frict.frict.test
       FRICT_CLIENT_ID: DIFRICTE2E0000000000

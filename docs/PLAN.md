@@ -224,7 +224,10 @@ Carried over from chat-relay / chat-android.
     from any other token blocks the merge. It is posted only when a
     different-vendor review passes. This stops an implementer stamping its own
     PR; it is a process guard, not a defence against the orchestrator.
-  - Merge deploys; the post-deploy check can still fail the deploy.
+  - A merge to frict-server's `main` that changes what the image is built from
+    publishes the image. Deploying it waits for Geoffrey's approval in the
+    GitHub environment `production`; agents have Write, so they can neither
+    approve nor configure it (`docs/deploy.md`).
 - Changes to **prod Authentik** stay manual, by Geoffrey.
 - **The bar for blocking a PR is set at dispatch**, in the review brief, not
   discovered in round 6 (lesson from chat-android #3).
@@ -283,8 +286,12 @@ Carried over from chat-relay / chat-android.
     must stay on for that account.
 - Release pipeline (Android): semantic-release → signed AAB → Play internal
   track, keyless WIF. Same as chat-android.
-- Deploy (server): image build → Hetzner box via CI, post-deploy digest +
-  `/healthz` + `duo_client` ping checks.
+- Deploy (server): `deploy.yml` builds and publishes the image, waits for
+  Geoffrey's approval, and hands exactly that digest to `frict-deploy` on the
+  Hetzner box over an SSH key that can run nothing else. `frict-deploy` backs up
+  the database, checks the running digest and `/healthz`, and goes back to the
+  previous digest if either fails (`docs/deploy.md`). The `duo_client` check runs
+  on the box from a timer (appendix).
 
 ---
 
@@ -413,15 +420,16 @@ issue → PR.
   behind its own WIF pool, admitting only frict-android's `release`
   environment (frict-android `docs/release.md`). The release app
   `app.frict.android` and the box's sender key (`frict-fcm-sender`) come at M3.
-- Play Console: create the app, do the first AAB upload by hand, grant the
-  release service account per-app permission.
+- Play Console: create the app with its package name and grant the release
+  service account per-app permission.
 
 **Before M3** — see "Production setup" below for the detail.
 - Cloudflare DNS for `api.frict.app`.
 - nginx vhost, Let's Encrypt certificate and Authentik CA mount on the
   Hetzner box (appendix).
 - `data/` and `secrets/` on the box, owned by uid 65532.
-- Deploy secrets in the repo.
+- The `production` environment, its secrets, and the deploy key
+  (`docs/deploy.md`).
 - Prod Authentik: Duo setup stage, validation stage, test user, test flow.
 - ~~Upgrade prod Authentik to 2026.8.5~~ (done).
 
@@ -473,14 +481,14 @@ host.
 
 ### Hetzner box
 
-- nginx vhost `api.frict.app` → `127.0.0.1:<port>`. Container bound to
+- nginx vhost `api.frict.app` → `127.0.0.1:8081`. Container bound to
   loopback only.
 - Let's Encrypt certificate for `api.frict.app`, alongside `auth.` and
   `chat-relay.`.
 - Authentik server and worker: the host's system CA bundle mounted over
   `duo_client`'s `ca_certs.pem` (appendix).
 - `/home/deploy/frict/{data,secrets}` owned by uid 65532; FCM key at
-  `secrets/fcm-sa.json`, mode 0400.
+  `secrets/fcm-sa.json`, mode 0400. `docs/deploy.md` sets these up.
 - Deploy check: `scripts/duo-tls-check.sh` against `https://api.frict.app`
   in the Authentik server and worker (appendix).
 
@@ -550,6 +558,7 @@ upload. Keep the name in one constant per codebase.
 - Number matching: out of scope; non-compliance documented.
 - Repos public.
 - Human not a merge blocker; auto-merge gated by CI + cross-review status.
+- Production deploys of frict-server wait for Geoffrey's approval.
 - Alerts go to the approver app; recipients configured in Frict.
 - Live FCM tests in CI on every PR except fork PRs.
 - TLS: route A, Let's Encrypt plus the system CA bundle mounted over
