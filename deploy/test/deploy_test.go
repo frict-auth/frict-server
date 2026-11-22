@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -24,11 +25,14 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/frict-auth/frict-server/internal/store"
 )
 
 const (
 	imageRepo = "frict-auth/frict-server"
 	boxDir    = "/home/deploy/frict"
+	enrolled  = "user-enrolled-before-any-deploy"
 )
 
 // run executes a host command and returns its combined output and whether it
@@ -302,6 +306,10 @@ install -d -o 65532 -g 65532 -m 0700 `+boxDir+`/data `+boxDir+`/secrets
 printf %s test-client-secret > `+boxDir+`/secrets/duo-client-secret
 chown 65532:65532 `+boxDir+`/secrets/duo-client-secret
 chmod 0400 `+boxDir+`/secrets/duo-client-secret
+base64 -d > `+boxDir+`/data/frict.db <<'DB'
+`+database(t)+`
+DB
+chown 65532:65532 `+boxDir+`/data/frict.db
 install -o deploy -g deploy -m 0600 /dev/stdin `+boxDir+`/frict.env <<'ENV'
 FRICT_API_HOSTNAME=api.frict.app
 FRICT_CLIENT_ID=DITEST00000000000000
@@ -312,6 +320,27 @@ install -o deploy -g deploy -m 0600 /dev/stdin ~deploy/.ssh/authorized_keys <<'K
 `+keyOptions(t)+` `+pub+`
 KEY`)
 	return s
+}
+
+// database returns a base64 SQLite database with one user.
+func database(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "frict.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateEnrollment(context.Background(), "DU1", enrolled, "code", time.Now(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return base64.StdEncoding.EncodeToString(db)
 }
 
 // keyOptions returns docs/deploy.md's authorized_keys options.
@@ -375,6 +404,7 @@ func TestDeploy(t *testing.T) {
 	v4 := s.variant(t, 4, unhealthyDir, "")
 	migrates := s.variant(t, 5, patchedServer(t, unhealthyEdit, migrationEdit), copyServer)
 	unlabelled := s.push(t, imageRepo, unhealthyDir, "FROM scratch\n"+copyServer+"\nUSER 65532:65532\nENTRYPOINT [\"/frict-server\"]\n")
+	hostileLabel := s.push(t, imageRepo, unhealthyDir, "FROM scratch\n"+copyServer+"\nLABEL app.frict.main-commit='x[$(touch /tmp/pwned)]'\n")
 	other := s.push(t, "frict-auth/other", unhealthyDir, "FROM scratch\n"+copyServer+"\n")
 
 	t.Run("first deploy that fails leaves nothing running and says so", func(t *testing.T) {
@@ -415,6 +445,14 @@ func TestDeploy(t *testing.T) {
 	t.Run("refused input changes nothing", func(t *testing.T) {
 		before := s.snapshot(t)
 		hex := strings.TrimPrefix(v1, "sha256:")
+		refuse := func(sshArgs []string, name, refusal string) {
+			t.Helper()
+			out, ok := s.ssh(t, sshArgs...)
+			t.Logf("%q ok=%v %s", name, ok, out)
+			if ok || !strings.Contains(out, refusal) {
+				t.Errorf("%q: ok=%v, want %s: %s", name, ok, refusal, out)
+			}
+		}
 		for _, cmd := range []string{
 			"",
 			" ",
@@ -445,20 +483,20 @@ func TestDeploy(t *testing.T) {
 			"ghcr.io/frict-auth/other@" + other,
 			"docker ps",
 			"internal-sftp",
-			// Well-formed digests that are not a build of this image.
-			"sha256:" + strings.Repeat("0", 64),
-			other,
-			unlabelled,
 		} {
 			args := []string{"deploy@api.frict.app"}
 			if cmd != "" {
 				args = append(args, cmd)
 			}
-			out, ok := s.ssh(t, args...)
-			t.Logf("%q ok=%v %s", cmd, ok, out)
-			if ok || !strings.Contains(out, "REFUSED") {
-				t.Errorf("%q: ok=%v, want REFUSED: %s", cmd, ok, out)
-			}
+			refuse(args, cmd, "REFUSED: want sha256:")
+		}
+		for _, digest := range []struct{ name, digest, refusal string }{
+			{"unknown digest", "sha256:" + strings.Repeat("0", 64), "REFUSED: cannot pull"},
+			{"another image's digest", other, "REFUSED: cannot pull"},
+			{"an image the workflow didn't build", unlabelled, "REFUSED: the image has no app.frict.main-commit label"},
+			{"a command in the label", hostileLabel, "REFUSED: the image has no app.frict.main-commit label"},
+		} {
+			refuse([]string{"deploy@api.frict.app", digest.digest}, digest.name, digest.refusal)
 		}
 		if out, ok := s.ssh(t, "-s", "deploy@api.frict.app", "sftp"); ok {
 			t.Errorf("sftp: ok=%v, want a failure: %s", ok, out)
@@ -614,6 +652,7 @@ func TestDeploy(t *testing.T) {
 		backup := regexp.MustCompile(`backups/\S+\.tar`).FindString(out)
 		s.box(t, restoreCommands(t, filepath.Base(backup)))
 		s.wantServing(t, v4)
+		s.box(t, "grep -aq "+enrolled+" "+boxDir+"/data/frict.db")
 	})
 }
 
