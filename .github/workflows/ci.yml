@@ -115,19 +115,6 @@ jobs:
           fi
           echo "CodeQL: 0 findings"
 
-  probe:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&status=success&per_page=100" --jq '.workflow_runs | sort_by(-.run_number) | .[].head_sha' | head -3
-          docker version --format '{{.Server.Version}}'; docker info --format '{{.Driver}}'
-
   fcm-live:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
