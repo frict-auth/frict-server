@@ -31,7 +31,7 @@ import (
 
 const (
 	imageRepo = "frict-auth/frict-server"
-	boxDir    = "/home/deploy/frict"
+	boxDir    = "/srv/frict"
 	enrolled  = "user-enrolled-before-any-deploy"
 )
 
@@ -299,10 +299,8 @@ func up(t *testing.T) *stack {
 	must(t, s.hosts+"\n", s.env, "docker", "compose", "exec", "-T", "client", "sh", "-c", "cat > /root/known_hosts")
 
 	s.box(t, `for i in $(seq 60); do docker version >/dev/null 2>&1 && break; sleep 0.5; done; docker version >/dev/null
-install -o root -g root -m 0755 /deploy/frict-deploy /usr/local/bin/frict-deploy
-install -d -o deploy -g deploy -m 0750 `+boxDir+`
-install -o root -g root -m 0644 /deploy/compose.yaml `+boxDir+`/compose.yaml
-install -d -o 65532 -g 65532 -m 0700 `+boxDir+`/data `+boxDir+`/secrets
+cd /src
+`+docBlock(t, "### 2. Box")+`
 printf %s test-client-secret > `+boxDir+`/secrets/duo-client-secret
 chown 65532:65532 `+boxDir+`/secrets/duo-client-secret
 chmod 0400 `+boxDir+`/secrets/duo-client-secret
@@ -310,13 +308,12 @@ base64 -d > `+boxDir+`/data/frict.db <<'DB'
 `+database(t)+`
 DB
 chown 65532:65532 `+boxDir+`/data/frict.db
-install -o deploy -g deploy -m 0600 /dev/stdin `+boxDir+`/frict.env <<'ENV'
+install -o root -g root -m 0600 /dev/stdin `+boxDir+`/frict.env <<'ENV'
 FRICT_API_HOSTNAME=api.frict.app
 FRICT_CLIENT_ID=DITEST00000000000000
 FRICT_AUTHENTIK_URL=https://auth.example
 ENV
-install -d -o deploy -g deploy -m 0700 ~deploy/.ssh
-install -o deploy -g deploy -m 0600 /dev/stdin ~deploy/.ssh/authorized_keys <<'KEY'
+install -o root -g root -m 0644 /dev/stdin ~frict-deploy/.ssh/authorized_keys <<'KEY'
 `+keyOptions(t)+` `+pub+`
 KEY`)
 	return s
@@ -350,7 +347,7 @@ func keyOptions(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	options := regexp.MustCompile(`printf '(\S+) %s`).FindSubmatch(doc)
+	options := regexp.MustCompile(`printf '([^']+) %s\\n'`).FindSubmatch(doc)
 	if options == nil {
 		t.Fatal("docs/deploy.md has no authorized_keys line")
 	}
@@ -406,6 +403,24 @@ func TestDeploy(t *testing.T) {
 	unlabelled := s.push(t, imageRepo, unhealthyDir, "FROM scratch\n"+copyServer+"\nUSER 65532:65532\nENTRYPOINT [\"/frict-server\"]\n")
 	hostileLabel := s.push(t, imageRepo, unhealthyDir, "FROM scratch\n"+copyServer+"\nLABEL app.frict.main-commit='x[$(touch /tmp/pwned)]'\n")
 	other := s.push(t, "frict-auth/other", unhealthyDir, "FROM scratch\n"+copyServer+"\n")
+
+	t.Run("the deploy user can't use docker, nor sudo but for the script", func(t *testing.T) {
+		check := s.box(t, docBlock(t, "Check the user's groups and sudo rights:"))
+		if want := "frict-deploy\n    (root) NOPASSWD: /usr/local/bin/frict-deploy \"\""; check != want {
+			t.Errorf("docs/deploy.md's check printed\n%s\nwant\n%s", check, want)
+		}
+		for _, c := range []struct{ cmd, refusal string }{
+			{"docker version", "permission denied"},
+			{"sudo -n true", "sudo: a password is required"},
+			{"sudo -n docker version", "sudo: a password is required"},
+			{"sudo -n /usr/local/bin/frict-deploy " + v1, "sudo: a password is required"},
+		} {
+			out, ok := run(t, "", s.env, "docker", "compose", "exec", "-T", "box", "runuser", "-u", "frict-deploy", "--", "sh", "-c", c.cmd)
+			if ok || !strings.Contains(out, c.refusal) {
+				t.Errorf("%s as frict-deploy: ok=%v, want %q: %s", c.cmd, ok, c.refusal, out)
+			}
+		}
+	})
 
 	t.Run("first deploy that fails leaves nothing running and says so", func(t *testing.T) {
 		out, ok := s.deploy(t, crash)
@@ -482,9 +497,12 @@ func TestDeploy(t *testing.T) {
 			"ghcr.io/" + imageRepo + "@" + v1,
 			"ghcr.io/frict-auth/other@" + other,
 			"docker ps",
+			"sudo -n true",
+			"sudo -n -i",
+			"/usr/bin/sudo -n /usr/local/bin/frict-deploy " + v1,
 			"internal-sftp",
 		} {
-			args := []string{"deploy@api.frict.app"}
+			args := []string{"frict-deploy@api.frict.app"}
 			if cmd != "" {
 				args = append(args, cmd)
 			}
@@ -496,15 +514,15 @@ func TestDeploy(t *testing.T) {
 			{"an image the workflow didn't build", unlabelled, "REFUSED: the image has no app.frict.main-commit label"},
 			{"a command in the label", hostileLabel, "REFUSED: the image has no app.frict.main-commit label"},
 		} {
-			refuse([]string{"deploy@api.frict.app", digest.digest}, digest.name, digest.refusal)
+			refuse([]string{"frict-deploy@api.frict.app", digest.digest}, digest.name, digest.refusal)
 		}
-		if out, ok := s.ssh(t, "-s", "deploy@api.frict.app", "sftp"); ok {
+		if out, ok := s.ssh(t, "-s", "frict-deploy@api.frict.app", "sftp"); ok {
 			t.Errorf("sftp: ok=%v, want a failure: %s", ok, out)
 		}
-		if out, ok := s.ssh(t, "-tt", "deploy@api.frict.app", "sh"); ok || !strings.Contains(out, "PTY allocation request failed") {
+		if out, ok := s.ssh(t, "-tt", "frict-deploy@api.frict.app", "sh"); ok || !strings.Contains(out, "PTY allocation request failed") {
 			t.Errorf("pty: ok=%v, want no pty: %s", ok, out)
 		}
-		if out, ok := s.ssh(t, "-W", "127.0.0.1:8081", "deploy@api.frict.app"); ok || !strings.Contains(out, "administratively prohibited") {
+		if out, ok := s.ssh(t, "-W", "127.0.0.1:8081", "frict-deploy@api.frict.app"); ok || !strings.Contains(out, "administratively prohibited") {
 			t.Errorf("forwarding: ok=%v, want prohibited: %s", ok, out)
 		}
 		if after := s.snapshot(t); before != after {
@@ -591,7 +609,7 @@ func TestDeploy(t *testing.T) {
 	t.Run("a healthy container of another digest fails the deploy", func(t *testing.T) {
 		s.box(t, "sed -i 's/@\\${FRICT_DIGEST.*/@"+v1+"/' "+boxDir+"/compose.yaml")
 		out, ok := s.deploy(t, v4)
-		s.box(t, "install -o root -g root -m 0644 /deploy/compose.yaml "+boxDir+"/compose.yaml")
+		s.box(t, "install -o root -g root -m 0644 /src/deploy/compose.yaml "+boxDir+"/compose.yaml")
 		if ok || !strings.Contains(out, "the running container is not ghcr.io/"+imageRepo+"@"+v4) {
 			t.Errorf("ok=%v, want a failure that says which image isn't running", ok)
 		}
@@ -619,20 +637,27 @@ func TestDeploy(t *testing.T) {
 		s.compose(t, "pause", "registry")
 		ctx, cancel := context.WithCancel(context.Background())
 		var out bytes.Buffer
-		cmd := exec.CommandContext(ctx, "docker", "compose", "exec", "-T", "client", "ssh", "-F", "/dev/null", "-i", "/root/key",
-			"-o", "UserKnownHostsFile=/root/known_hosts", "deploy@api.frict.app", v4)
+		cmd := exec.CommandContext(ctx, "docker", "compose", "exec", "-T", "-e", "LANG=from-client", "-e", "LC_PROBE=from-client", "client",
+			"ssh", "-F", "/dev/null", "-i", "/root/key", "-o", "UserKnownHostsFile=/root/known_hosts", "-o", "SendEnv=LANG LC_PROBE",
+			"frict-deploy@api.frict.app", v4)
 		cmd.Env, cmd.Stdout, cmd.Stderr = append(os.Environ(), s.env...), &out, &out
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
 		s.box(t, `for i in $(seq 100); do pgrep -f 'docker pull' >/dev/null && exit 0; sleep 0.1; done; exit 1`)
-		if out, ok := s.ssh(t, "deploy@api.frict.app", v4); ok || !strings.Contains(out, "another deploy is running") {
+		env := s.box(t, `tr '\0' '\n' </proc/$(pgrep -o -x frict-deploy)/environ | sort`)
+		names := regexp.MustCompile(`(?m)=.*$`).ReplaceAllString(env, "")
+		if want := "HOME LANG LOGNAME MAIL PATH SHELL SSH_ORIGINAL_COMMAND SUDO_COMMAND SUDO_GID SUDO_UID SUDO_USER TERM USER"; strings.Join(strings.Fields(names), " ") != want ||
+			!strings.Contains(env, "\nSSH_ORIGINAL_COMMAND="+v4+"\n") || strings.Contains(env, "from-client") {
+			t.Errorf("frict-deploy's environment:\n%s\nwant the names %s, SSH_ORIGINAL_COMMAND=%s and nothing from the client", env, want, v4)
+		}
+		if out, ok := s.ssh(t, "frict-deploy@api.frict.app", v4); ok || !strings.Contains(out, "another deploy is running") {
 			t.Errorf("second deploy: ok=%v %s", ok, out)
 		}
 		s.compose(t, "exec", "-T", "client", "pkill", "-9", "-x", "ssh")
 		cancel()
 		cmd.Wait()
-		s.box(t, `for i in $(seq 100); do pgrep -f 'sshd: deploy' >/dev/null || exit 0; sleep 0.1; done; exit 1`)
+		s.box(t, `for i in $(seq 100); do pgrep -f 'sshd: frict-deploy' >/dev/null || exit 0; sleep 0.1; done; exit 1`)
 		s.compose(t, "unpause", "registry")
 		s.box(t, `flock -w 60 `+boxDir+`/.lock true`)
 		s.wantServing(t, v4)
@@ -656,21 +681,27 @@ func TestDeploy(t *testing.T) {
 	})
 }
 
-// restoreCommands returns docs/deploy.md's restore commands for one backup.
-func restoreCommands(t *testing.T, backup string) string {
+// docBlock returns the first bash block of docs/deploy.md after a line.
+func docBlock(t *testing.T, after string) string {
 	t.Helper()
 	doc, err := os.ReadFile("../../docs/deploy.md")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, section, found := strings.Cut(string(doc), "## Restore")
+	_, section, found := strings.Cut(string(doc), "\n"+after+"\n")
 	if !found {
-		t.Fatal("docs/deploy.md has no Restore section")
+		t.Fatalf("docs/deploy.md has no line %q", after)
 	}
 	_, block, found := strings.Cut(section, "```bash\n")
 	if !found {
-		t.Fatal("the Restore section has no bash block")
+		t.Fatalf("docs/deploy.md has no bash block after %q", after)
 	}
 	block, _, _ = strings.Cut(block, "```")
-	return strings.NewReplacer("<backup>.tar", backup, "sudo ", "").Replace(block)
+	return block
+}
+
+// restoreCommands returns docs/deploy.md's restore commands for one backup.
+func restoreCommands(t *testing.T, backup string) string {
+	t.Helper()
+	return strings.NewReplacer("<backup>.tar", backup, "sudo ", "").Replace(docBlock(t, "## Restore"))
 }

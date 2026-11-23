@@ -6,8 +6,9 @@ waits for Geoffrey's approval. The build job's summary shows the digest and the
 commits since the last successful deploy. To run it by hand: Actions → deploy →
 Run workflow, on `main`.
 
-Approving sends the digest over SSH to `frict-deploy` on the box, the only thing
-that key can run. It refuses anything that isn't a digest of this image and any
+Approving sends the digest over SSH to the box's `frict-deploy` user, whose key
+can only run `/usr/local/bin/frict-deploy` as root through sudo. The user is not
+in the `docker` group and may run nothing else as root. The script refuses anything that isn't a digest of this image and any
 build older than the deployed one, backs up `data/`, starts the new version, and
 goes back to the previous one if the new one isn't healthy. To go back on
 purpose, revert on `main`.
@@ -56,22 +57,43 @@ and `prevent_self_review` false, `custom_branch_policies` true, and one policy:
 
 ### 2. Box
 
-Needs Docker with Compose, `curl`, and the `deploy` user in the `docker` group.
-From a checkout of frict-server's `main`, as a user with sudo:
+Needs Docker with Compose, `curl` and sudo. From a checkout of frict-server's
+`main`, as a user with sudo:
 
 ```bash
 (
 set -e
+getent passwd frict-deploy >/dev/null || sudo useradd --create-home --shell /bin/sh frict-deploy
+sudo install -d -o root -g root -m 0755 /home/frict-deploy/.ssh
 sudo install -o root -g root -m 0755 deploy/frict-deploy /usr/local/bin/frict-deploy
-sudo install -d -o deploy -g deploy -m 0750 /home/deploy/frict
-sudo install -o root -g root -m 0644 deploy/compose.yaml /home/deploy/frict/compose.yaml
-sudo install -d -o 65532 -g 65532 -m 0700 /home/deploy/frict/data /home/deploy/frict/secrets
+sudo visudo -cqf deploy/sudoers
+sudo install -o root -g root -m 0440 deploy/sudoers /etc/sudoers.d/frict-deploy
+sudo visudo -cq
+sudo install -d -o root -g root -m 0755 /srv/frict
+sudo install -o root -g root -m 0644 deploy/compose.yaml /srv/frict/compose.yaml
+sudo install -d -o 65532 -g 65532 -m 0700 /srv/frict/data /srv/frict/secrets
 )
 ```
 
-Repeat it when `deploy/` changes; the workflow doesn't.
+Repeat it when `deploy/` changes; the workflow doesn't. `frict-deploy` gets no
+password, so it can't log in other than with the deploy key.
 
-**Configuration**: `/home/deploy/frict/frict.env`, `deploy:deploy`, mode 0600.
+`deploy/sudoers` lets `frict-deploy` run the script, without arguments, and
+passes it `SSH_ORIGINAL_COMMAND` and no other variable from the SSH session.
+
+Check the user's groups and sudo rights:
+
+```bash
+(
+id -nG frict-deploy
+sudo -l -U frict-deploy | sed '1,/may run the following commands/d'
+)
+```
+
+Expect `frict-deploy` alone, then `(root) NOPASSWD: /usr/local/bin/frict-deploy ""`.
+`docker` among the groups means the user can become root without the script.
+
+**Configuration**: `/srv/frict/frict.env`, `root:root`, mode 0600.
 `cmd/frict-server/main.go` documents each variable.
 
 | Variable | Value | Set in |
@@ -85,14 +107,14 @@ Repeat it when `deploy/` changes; the workflow doesn't.
 | `FRICT_LISTEN`, `FRICT_DB_PATH`, `FRICT_CLIENT_SECRET_FILE` | fixed | `compose.yaml` |
 
 No variable is itself secret. The secrets are two files in
-`/home/deploy/frict/secrets/`, `65532:65532`, mode 0400: `duo-client-secret`
+`/srv/frict/secrets/`, `65532:65532`, mode 0400: `duo-client-secret`
 (the Duo stage's client secret) and, for push, `fcm-sa.json` (the FCM sender
 key). Generate the first on the box:
 
 ```bash
 (
 set -e
-f=/home/deploy/frict/secrets/duo-client-secret
+f=/srv/frict/secrets/duo-client-secret
 sudo test -e "$f" || openssl rand -hex 20 | sudo install -o 65532 -g 65532 -m 0400 /dev/stdin "$f"
 )
 ```
@@ -107,15 +129,12 @@ set -e
 umask 077
 mkdir -p ~/keystores
 test -e ~/keystores/frict-deploy || ssh-keygen -q -t ed25519 -N '' -C frict-deploy -f ~/keystores/frict-deploy
-printf 'restrict,command="/usr/local/bin/frict-deploy" %s\n' "$(cat ~/keystores/frict-deploy.pub)"
+printf 'restrict,command="/usr/bin/sudo -n /usr/local/bin/frict-deploy" %s\n' "$(cat ~/keystores/frict-deploy.pub)"
 )
 ```
 
-On the box, append the line it prints to `/home/deploy/.ssh/authorized_keys`
-(`sudo -u deploy nano /home/deploy/.ssh/authorized_keys`).
-
-Members of the `docker` group can become root, so every other key in that file
-that isn't restricted to a command can also deploy.
+On the box, make the line it prints the only line of
+`/home/frict-deploy/.ssh/authorized_keys` (`sudo nano /home/frict-deploy/.ssh/authorized_keys`).
 
 ### 4. Host key and secrets
 
@@ -138,7 +157,7 @@ gh secret set DEPLOY_KNOWN_HOSTS --repo frict-auth/frict-server --env production
 Check the key from the desktop. `REFUSED` and nothing else means it works:
 
 ```bash
-ssh -i ~/keystores/frict-deploy -o IdentitiesOnly=yes -o UserKnownHostsFile=~/keystores/frict-known-hosts deploy@api.frict.app nothing
+ssh -i ~/keystores/frict-deploy -o IdentitiesOnly=yes -o UserKnownHostsFile=~/keystores/frict-known-hosts frict-deploy@api.frict.app nothing
 ```
 
 ### 5. Package visibility
@@ -164,8 +183,8 @@ The job's log ends with one of these:
 | `WENT BACK` | The previous version is running. |
 | `SERVER IS DOWN` | Nothing is serving. |
 
-frict-server's own log is on the box in `/home/deploy/frict/logs/`, not in the
-job's log, which is public.
+frict-server's own log is on the box in `/srv/frict/logs/` (readable with sudo),
+not in the job's log, which is public.
 
 frict-server refuses a database newer than it knows. If the failed version
 migrated it, going back can't work: the log says so, and the backup has to be
@@ -173,14 +192,14 @@ restored.
 
 ## Restore
 
-`/home/deploy/frict/.env` names the version that starts; it changes only when a
+`/srv/frict/.env` names the version that starts; it changes only when a
 deploy succeeds. Restoring loses what was written after the backup. On the box:
 
 ```bash
 (
 set -e
-cd /home/deploy/frict
-test -e backups/<backup>.tar
+cd /srv/frict
+sudo test -e backups/<backup>.tar
 sudo docker compose stop
 sudo rm -f data/frict.db data/frict.db-wal data/frict.db-shm
 sudo tar --numeric-owner -xf backups/<backup>.tar

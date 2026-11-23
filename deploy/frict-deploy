@@ -1,7 +1,7 @@
 #!/bin/bash
-# Deploys one digest of the frict-server image on the box. Runs as the forced
-# command of GitHub's deploy key, so SSH_ORIGINAL_COMMAND is the client's input:
-# one sha256 digest and nothing else. docs/deploy.md.
+# Deploys one digest of the frict-server image on the box. Runs as root through
+# sudo from the forced command of GitHub's deploy key, so SSH_ORIGINAL_COMMAND is
+# the client's input: one sha256 digest and nothing else. docs/deploy.md.
 #
 # Output reaches a public Actions log; frict-server's own logs stay in logs/.
 set -euo pipefail
@@ -9,7 +9,7 @@ export LC_ALL=C PATH=/usr/local/bin:/usr/bin:/bin
 umask 077
 
 image=ghcr.io/frict-auth/frict-server
-dir=/home/deploy/frict
+dir=/srv/frict
 url=http://127.0.0.1:8081/healthz
 health_wait=20
 
@@ -131,7 +131,7 @@ if ! dc "$digest" config --quiet; then
 fi
 
 # Nothing has the database open between stop and start, so the copy is
-# consistent. docker cp reads it as root; the deploy user can't.
+# consistent.
 replace() {
   echo "Deploying $image@$digest (commit $commit on main)"
   dc "$digest" stop frict-server &&

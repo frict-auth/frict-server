@@ -1,0 +1,3 @@
+# /etc/sudoers.d/frict-deploy. docs/deploy.md.
+Defaults!/usr/local/bin/frict-deploy env_keep = "SSH_ORIGINAL_COMMAND", !env_check
+frict-deploy ALL=(root) NOPASSWD: /usr/local/bin/frict-deploy ""

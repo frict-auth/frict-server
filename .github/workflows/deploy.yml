@@ -98,4 +98,4 @@ jobs:
           ssh -T -F /dev/null -i "$dir/key" -o IdentitiesOnly=yes -o BatchMode=yes \
             -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$dir/known_hosts" -o GlobalKnownHostsFile=/dev/null \
             -o ConnectTimeout=30 -o ServerAliveInterval=15 \
-            deploy@api.frict.app "$DIGEST"
+            frict-deploy@api.frict.app "$DIGEST"
