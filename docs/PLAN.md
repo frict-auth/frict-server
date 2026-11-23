@@ -516,7 +516,8 @@ host.
 - nginx vhost `api.frict.app` → `127.0.0.1:8081`, setting
   `X-Forwarded-For` to `$remote_addr`. Container bound to loopback only.
   nginx reaches the published port from the docker bridge, so
-  `FRICT_TRUSTED_PROXIES` names that bridge's gateway address.
+  `FRICT_TRUSTED_PROXIES` names that bridge's gateway, pinned to
+  `10.231.0.1` in `deploy/compose.yaml`.
 - Let's Encrypt certificate for `api.frict.app`, alongside `auth.` and
   `chat-relay.`.
 - Authentik server and worker: the host's system CA bundle mounted over

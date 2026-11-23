@@ -457,6 +457,24 @@ func TestDeploy(t *testing.T) {
 		}
 	})
 
+	t.Run("a proxy on the box is the pinned gateway, so its X-Forwarded-For names the client", func(t *testing.T) {
+		ipam := s.box(t, `docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}}{{end}}' frict_default`)
+		if want := "10.231.0.0/24 10.231.0.1"; ipam != want {
+			t.Errorf("frict_default subnet and gateway = %q, want %q", ipam, want)
+		}
+		for _, c := range []struct{ header, clientIP string }{
+			{"X-Probe: none", "10.231.0.1"},
+			{"X-Forwarded-For: 203.0.113.7", "203.0.113.7"},
+		} {
+			log := s.box(t, `since=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
+curl -sS -o /dev/null -X POST -H '`+c.header+`' http://127.0.0.1:8081/device/v1/pending
+docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_signature_rejected`)
+			if !strings.HasSuffix(log, " client_ip="+c.clientIP) || strings.Count(log, "\n") != 0 {
+				t.Errorf("request with %q logged %q, want client_ip=%s", c.header, log, c.clientIP)
+			}
+		}
+	})
+
 	t.Run("refused input changes nothing", func(t *testing.T) {
 		before := s.snapshot(t)
 		hex := strings.TrimPrefix(v1, "sha256:")

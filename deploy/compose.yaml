@@ -15,6 +15,8 @@ services:
       FRICT_LISTEN: ":8080"
       FRICT_DB_PATH: /data/frict.db
       FRICT_CLIENT_SECRET_FILE: /secrets/duo-client-secret
+      # nginx reaches the published port through this network's gateway.
+      FRICT_TRUSTED_PROXIES: 10.231.0.1
     ports:
       - 127.0.0.1:8081:8080
     volumes:
@@ -29,3 +31,10 @@ services:
         read_only: true
         bind:
           create_host_path: false
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 10.231.0.0/24
+          gateway: 10.231.0.1
