@@ -27,8 +27,8 @@ self-hosted: no Cisco/Duo account, no third-party push gateway beyond FCM/APNs.
   nothing from our server on the login page). Consequence, stated plainly:
   Frict does **not** meet NIST SP 800-63B-4 §3.1.3.1 for push
   authenticators and is vulnerable to push bombing in CISA's terms. Accepted
-  for household use; mitigated by request context, push rate limits, an
-  automatic pause, and alerts (see Safeguards).
+  for household use; mitigated by request context, push rate limits and an
+  automatic pause, with alerts raised by Authentik (see Safeguards).
 - Phishing resistance (no push scheme has it; WebAuthn covers that).
 - A native/forked Authentik stage.
 - De-Googled transport (UnifiedPush/ntfy) — later.
@@ -54,8 +54,8 @@ itself is unchanged, and the LDAP outpost already passes Duo push through.
   front server's `timeout_http_*` settings adding up, is inferred from source.
   Frict enforces its own expiry (60–120 s), well inside that.
 - The Duo stage's only settings are client ID, client secret, API hostname and
-  two admin keys. Nothing else — including alerting — is configurable from
-  Authentik.
+  two admin keys. Alerting is not a stage setting; it is an Authentik
+  notification rule (see Safeguards).
 
 Known Authentik quirks: the UI says "Duo" everywhere; a user with a Duo device
 is always offered it over TOTP (#22816).
@@ -65,7 +65,7 @@ is always offered it over TOTP (#22816).
 - **`frict-server` (Go, stdlib + `golang.org/x/oauth2`).** chat-relay grown up.
   - Duo-compatible endpoints for Authentik.
   - Device endpoints: enrollment, challenge fetch, signed answer, FID
-    registration.
+    registration, removal.
   - SQLite store, same pattern as chat-relay (schema version, migrations
     tested against a copy of the prior schema).
   - FCM HTTP v1 sender behind an interface (code from chat-relay #9).
@@ -101,38 +101,38 @@ is always offered it over TOTP (#22816).
 
 ### Safeguards
 
+Frict answers the Duo API accurately and protects the phone. What to do with
+an answer (alerts, who must use MFA, flows) is the Authentik admin's job.
+
 - From CIBA: opaque single-use IDs, expiry, server-set poll interval.
 - From privacyIDEA: keys exchanged at enrollment, signatures in both
   directions, a reason on every deny, poll fallback.
-- From NIST 800-63B-4: cap on pushes since the last successful login; a
-  failed-attempt counter that a new challenge does not reset. Decisions:
-  - Push cap: a total since the last successful login; once it is reached,
-    one push per `FRICT_PUSH_COOLDOWN`, so the lock lifts by itself
-    (§3.1.3.2 limit; §3.2.2 waiting-period technique).
-  - Failed attempts: denies and timeouts, not reset by a new challenge,
-    reset only by a successful login on that device; at `FRICT_MAX_FAILED`
-    (at most 100) the device is disabled (§3.1.3.2, §3.2.2).
-    `FRICT_MAX_FAILED` is a live threshold: raising it re-enables devices
-    disabled under the old limit.
-  - Recovery from a disabled device: an Authentik admin deletes the user's
-    Duo device and the user re-enrolls, which gives a new Frict user with
-    fresh counters. Frict has no admin tool (§3.2.2 "disabling that
-    authenticator").
-- **"I didn't start this" means the user's password is compromised** (the push
-  only happens after the password step). On that deny Frict:
-  1. Automatically pauses pushes for that user for N minutes (stops push
-     bombing with no human action).
-  2. Sends a high-priority alert to the approver app of every user in the
-     server's `alert_recipients` config (default: the admin):
-     > Someone has geoffrey's password. Sign-in to Grafana from 203.0.113.7
-     > at 14:02 was denied. [Reset password] [Revoke sessions]
-
-     The buttons are deep links into Authentik's admin UI, so Frict holds no
-     Authentik admin token.
-
-  Authentik's own event log tells them apart: its `login_failed` event
-  records `duo_response.status` `fraud` for "I didn't start this" and `deny`
-  for "cancel" (`e2e/login_test.go`).
+- From NIST 800-63B-4: a cap on pushes since the last successful login;
+  once it is reached, one push per `FRICT_PUSH_COOLDOWN`, so the lock lifts
+  by itself (§3.1.3.2 limit; §3.2.2 waiting-period technique). Frict never
+  disables a device; to stop one, an Authentik admin deletes the user's Duo
+  device.
+- **"I didn't start this" means the user's password is compromised** (the
+  push only happens after the password step). Frict answers `/auth` with
+  Duo's `fraud` status, and `FRICT_NOT_ME_COUNT` such answers within
+  `FRICT_NOT_ME_WINDOW` pause that user's pushes for `FRICT_PAUSE`. An
+  approved login does not reset the count. During a pause `/auth` is
+  refused at once (below), so a push bomber gets nothing to tap.
+- **Alerting is Authentik's.** Its `login_failed` event records
+  `duo_response.status` `fraud` for "I didn't start this" and `deny` for
+  "cancel" (`e2e/login_test.go`). A notification rule bound to this
+  expression policy alerts on fraud only:
+  ```python
+  event = request.context.get("event")
+  if not event or event.action != "login_failed":
+      return False
+  args = event.context.get("auth_method_args") or {}
+  return (args.get("duo_response") or {}).get("status") == "fraud"
+  ```
+  Measured on Authentik 2026.8.6: one notification per fraud answer, none
+  for deny, timeout, wrong password, `locked_out` or approve. Don't alert on
+  `locked_out`: Authentik's login page resubmits by itself, dozens of times
+  a minute while a pause lasts.
 
   Limits, all set in frict-server's environment (`cmd/frict-server/main.go`):
 
@@ -140,30 +140,63 @@ is always offered it over TOTP (#22816).
   |---|---|---|
   | `FRICT_PUSH_CAP` | 10 | A person rarely needs more than a few tries per login; 10 leaves room for a missed push or two. |
   | `FRICT_PUSH_COOLDOWN` | 15 min | Holds a push bomber to 4 pushes an hour, inside §3.2.2's "30 seconds up to an hour". |
-  | `FRICT_MAX_FAILED` | 20 | Twice the cap and well under §3.2.2's 100, so ignoring pushes alone can't disable a device within a day. |
-  | `FRICT_PAUSE` | 30 min | Long enough for an admin to read the alert and reset the password, short enough that a mistaken tap doesn't lock the user out for the day. |
-  | `FRICT_ALERT_RECIPIENTS` | `akadmin` | Authentik's bootstrap admin username. |
-  | `FRICT_ALERT_TTL` | 24 h | A phone that was off overnight still gets the alert on its next poll. |
-  | `FRICT_AUTHENTIK_URL` | none (required) | Base of the alert links. |
+  | `FRICT_NOT_ME_COUNT` | 2 | One mistaken tap costs nothing: Authentik sends a new push at once, and approving it logs in. |
+  | `FRICT_NOT_ME_WINDOW` | 60 min | Two reports in an hour are an attack, not a slip. |
+  | `FRICT_PAUSE` | 30 min | Long enough for the admin to act on Authentik's alert, short enough that the user isn't locked out for the day. |
 
   When a safeguard refuses a push, `/auth` answers `deny` with Duo's
   `locked_out` status ("The user has been disabled due to authentication
   failures", duo.com/docs/authapi) and says which safeguard in `status_msg`;
   Authentik records both in `login_failed`. A refused `/auth` sends no push
-  and counts as neither a push nor a failed attempt.
+  and counts as no push.
 
-  Authentik 2026.8.5's `/auth` call supplies the alert's fields
+  Authentik 2026.8.5's `/auth` call supplies what the phone shows
   (`authenticator_validate/challenge.py:267-290`): `display_username` (the
   Authentik username), `ipaddr` (the client IP), `pushinfo` with `Domain`
   (the login host) and `Application` (only when the flow was started for an
   application), and `type` ("<brand> Login request"). It sends no time;
-  Frict records when the push was created and when it was reported.
+  Frict records when the push was created.
 
-  Authentik's admin UI has no per-action URL, and a user's page needs the
-  user's primary key, which Frict can't look up without an API token. Both
-  buttons open the admin user list filtered to that username, whose row
-  holds "Set password", "Create recovery link" and the "Revoke Sessions"
-  action.
+### Removal
+
+"Remove this phone" in the app deletes the enrollment on frict-server first
+(`/device/v1/remove`, signed with the `device_key`): the user, the device
+and all its login records. If frict-server is unreachable or refuses, the
+app says so and offers to remove the phone anyway. Frict never tells
+Authentik. Authentik's next `/auth` for that user ID gets Duo's own answer
+for an unknown user, HTTP 400 with code 40002, which Authentik logs as
+`configuration_error`; the same login can still use TOTP.
+
+### Retention
+
+frict-server keeps a login record (the challenge with the IP, username,
+domain and application Authentik sent) until it expired more than
+max(24 h, `FRICT_NOT_ME_WINDOW`) ago, so every answer the pause counts is
+still there. It deletes older records at startup and every hour. A
+removal deletes the user's records at once. The username Authentik sends at
+enrollment is stored with the user; nothing uses it.
+
+### Security log
+
+Every rejected request is one `WARN` line in the service log with message
+`security`, for alerting to be built on later. Fields: `time`, `event`,
+`endpoint` (the request path), `reason`, `user_id` (only when the request
+names one of the form Frict issues; not verified), `client_ip`. Signatures,
+keys, secrets, activation codes and FIDs are never logged.
+
+| `event` | `reason` |
+|---|---|
+| `duo_signature_rejected` | `missing_credentials`, `malformed_header`, `unknown_client_id`, `missing_date`, `malformed_date`, `stale_date`, `repeated_x_duo_header`, `bad_signature` |
+| `duo_request_rejected` | `unreadable_body`, `bad_params`, `unknown_user` (also a malformed or removed user ID) |
+| `device_signature_rejected` | `missing_credentials`, `malformed_header`, `malformed_user_id`, `stale_timestamp`, `bad_signature`, `wrong_endpoint` (valid for another device endpoint: a replay), `unknown_device`, `internal_error` |
+| `device_request_rejected` | `unreadable_body`, `bad_request`, `bad_enroll_body`, `activation_invalid`, `activation_used` (a replayed enrollment), `user_mismatch`, `challenge_not_found`, `challenge_not_pending` (a replayed answer) |
+
+`client_ip` is the TCP peer, unless the peer is in `FRICT_TRUSTED_PROXIES`
+(default loopback): then it is the last `X-Forwarded-For` hop that is not
+itself a trusted proxy, or `X-Real-IP` when there is no `X-Forwarded-For`.
+The proxy must set `X-Forwarded-For` itself (`$remote_addr`) or append to
+it. In a container the proxy's address is the network's gateway, not
+loopback. `locked_out` answers are not security events.
 
 ### TLS: getting past Duo's certificate pinning
 
@@ -350,18 +383,17 @@ scope.
 Result: **GO** (`docs/m0-findings.md`).
 
 **M1 — Server core.** Duo endpoints, enrollment, challenges, signature checks,
-rate limits, auto-pause, alert plumbing. Proven by compose e2e with the fake
-phone.
+rate limits, auto-pause. Proven by compose e2e with the fake phone.
 
 **M2 — Android approver.** QR enrollment, Keystore key with attestation,
-biometric approve, poll fallback, alert display. Proven by emulator e2e, then
-a real phone.
+biometric approve, poll fallback, removal. Proven by emulator e2e, then a
+real phone.
 
 **M3 — Deploy.** Server on the Hetzner box. In prod Authentik, a dedicated
 test user and flow get a Duo stage pointing at Frict. Then Geoffrey.
 
 **M4 — Hardening.** Attestation verified against Google's root; re-enrollment
-after key invalidation; audit log; pinned minimum app version.
+after key invalidation; pinned minimum app version.
 
 **M5 — LDAP / Linux login.** Only if M0 said yes.
 
@@ -481,8 +513,10 @@ host.
 
 ### Hetzner box
 
-- nginx vhost `api.frict.app` → `127.0.0.1:8081`. Container bound to
-  loopback only.
+- nginx vhost `api.frict.app` → `127.0.0.1:8081`, setting
+  `X-Forwarded-For` to `$remote_addr`. Container bound to loopback only.
+  nginx reaches the published port from the docker bridge, so
+  `FRICT_TRUSTED_PROXIES` names that bridge's gateway address.
 - Let's Encrypt certificate for `api.frict.app`, alongside `auth.` and
   `chat-relay.`.
 - Authentik server and worker: the host's system CA bundle mounted over
@@ -517,7 +551,11 @@ waiting to be cleaned up.
 4. **Test user** `frict-test`, enrolled through
    `https://auth.itsalwaysreefreemas.org/if/flow/frict-test-authentication/`.
    Executing the flow by its slug means no brand or default flow changes.
-5. Acceptance: approve, deny, "I didn't start this" (alert arrives), timeout.
+5. Notification rule on the fraud expression policy (Safeguards), sent to
+   the admins' group.
+6. Acceptance: approve, deny, "I didn't start this" twice (Authentik's alert
+   arrives, pushes pause), timeout, "Remove this phone" (next login is a
+   configuration error).
 
 **M3 → real use.** Once you've lived with it on the test user: enroll your
 own account, then put `frict-validate` into `default-authentication-flow`.
@@ -559,7 +597,8 @@ upload. Keep the name in one constant per codebase.
 - Repos public.
 - Human not a merge blocker; auto-merge gated by CI + cross-review status.
 - Production deploys of frict-server wait for Geoffrey's approval.
-- Alerts go to the approver app; recipients configured in Frict.
+- Frict stays thin: it answers the Duo API accurately and protects the
+  phone; Authentik's notification rules do the alerting.
 - Live FCM tests in CI on every PR except fork PRs.
 - TLS: route A, Let's Encrypt plus the system CA bundle mounted over
   `duo_client`'s; fallback B, AWS ACM via ACME; upstream per-stage
@@ -577,6 +616,8 @@ number (`docs/m0-findings.md` (d) and "Number matching").
   PERMISSION_DENIED (actions run 44539165608 attempt 2; negative control
   run 44542161659).
 - Whether Authentik will accept a per-stage `disable_ca_pinning` option.
+- Review block vs mute during a pause before V1. Frict blocks: a paused
+  `/auth` is answered `locked_out` at once.
 
 ---
 

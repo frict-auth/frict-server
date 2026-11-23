@@ -3,31 +3,25 @@
 package e2e
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/frict-auth/frict-server/internal/fakephone"
 )
 
-// TestNotMePausesAndAlertsAdmin: "I didn't start this" pauses the user's
-// pushes, so Authentik's next login attempt is denied without a push, and
-// the admin's phone, enrolled as akadmin (the default alert recipient),
-// receives an alert about it on its next poll.
-func TestNotMePausesAndAlertsAdmin(t *testing.T) {
-	adminPhone, err := enrollViaDuoAPI("akadmin")
-	if err != nil {
-		t.Fatal(err)
-	}
+// TestNotMeTwicePauses: with the default FRICT_NOT_ME_COUNT of 2, one "I
+// didn't start this" leaves pushes on; a second pauses them, so Authentik's
+// next login attempt is denied at once, without a push.
+func TestNotMeTwicePauses(t *testing.T) {
 	username, d := enrolledUser(t, "fiona")
-	b, c, _ := pushLogin(t, username, d, func(id string) { answerOrError(t, d, id, "deny", "not_me", http.StatusOK) })
-	expectDenied(t, b, c, username, "fraud")
+	for range 2 {
+		b, c, _ := pushLogin(t, username, d, func(id string) { answerOrError(t, d, id, "deny", "not_me", http.StatusOK) })
+		expectDenied(t, b, c, username, "fraud")
+	}
 
 	retry := newBrowser(t)
-	c = retry.expect(retry.passwordStep(username), "ak-stage-authenticator-validate")
+	c := retry.expect(retry.passwordStep(username), "ak-stage-authenticator-validate")
 	uid := duoDeviceUID(t, c)
 	start := time.Now()
 	c = retry.do("POST", map[string]any{"component": "ak-stage-authenticator-validate", "duo": uid})
@@ -39,46 +33,58 @@ func TestNotMePausesAndAlertsAdmin(t *testing.T) {
 	if elapsed > 10*time.Second {
 		t.Fatalf("paused login took %s: frict-server waited on a push", elapsed)
 	}
-	if p, err := d.poll(); err != nil || len(p.ChallengeIDs) != 0 || len(p.Alerts) != 0 {
-		t.Fatalf("user's phone after the paused login: %+v (err %v), want no challenge and no alert", p, err)
+	if ids, err := d.pending(); err != nil || len(ids) != 0 {
+		t.Fatalf("phone after the paused login: %v (err %v), want no challenge", ids, err)
+	}
+}
+
+// TestRemovedPhoneIsUnknownToAuthentik: after the phone removes itself,
+// Authentik's next push login gets Duo's unknown-user answer (400, 40002),
+// which Authentik records as a configuration error, and frict-server logs
+// the rejected /auth as a security event.
+func TestRemovedPhoneIsUnknownToAuthentik(t *testing.T) {
+	username, d := enrolledUser(t, "remy")
+	if status, body := d.remove(); status != http.StatusOK || body != "{}" {
+		t.Fatalf("remove: %d %s, want 200 {}", status, body)
+	}
+	if status, body := d.remove(); status != http.StatusUnauthorized || body != `{"error":"unauthorized"}` {
+		t.Fatalf("second remove: %d %s, want 401 unauthorized", status, body)
 	}
 
-	p, err := adminPhone.poll()
+	login := newBrowser(t)
+	c := login.expect(login.passwordStep(username), "ak-stage-authenticator-validate")
+	c = login.do("POST", map[string]any{"component": "ak-stage-authenticator-validate", "duo": duoDeviceUID(t, c)})
+	login.expect(c, "ak-stage-authenticator-validate")
+	if errs := c.ResponseErrors["duo"]; len(errs) == 0 || errs[0].String != "Duo denied access" {
+		t.Fatalf("want 'Duo denied access' on the duo field: %s", c.raw)
+	}
+	if status, who := login.whoami(); status == 200 {
+		t.Fatalf("login for a removed phone produced a session for %q", who)
+	}
+
+	var events struct {
+		Results []struct {
+			Context map[string]any `json:"context"`
+		} `json:"results"`
+	}
+	if err := admin("GET", "/api/v3/events/events/?action=configuration_error&username="+url.QueryEscape(username), nil, &events); err != nil {
+		t.Fatal(err)
+	}
+	const want = "Failed to DUO authenticate user: Received 400 Invalid request parameters: user_id"
+	found := false
+	for _, e := range events.Results {
+		found = found || e.Context["message"] == want
+	}
+	if !found {
+		t.Fatalf("no configuration_error event %q for %s; got %+v", want, username, events.Results)
+	}
+
+	out, err := composeCmd("logs", "--no-color", "frict-server").CombinedOutput()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("frict-server logs: %v\n%s", err, out)
 	}
-	var found []fakephone.Alert
-	for _, a := range p.Alerts {
-		if a.Username == username {
-			found = append(found, a)
-		}
-	}
-	if len(found) != 1 {
-		t.Fatalf("admin alerts for %s: %+v, want 1 (all alerts %+v)", username, found, p.Alerts)
-	}
-	a := found[0]
-	t.Logf("alert as the admin's phone sees it: %+v", a)
-	if a.IPAddr == "" || !strings.Contains(a.PushInfo, "Domain=") || a.Type == "" || a.Attempted == 0 || a.Reported < a.Attempted {
-		t.Fatalf("alert %+v lacks Authentik's sign-in fields", a)
-	}
-	for name, link := range map[string]string{"reset_password_url": a.ResetPasswordURL, "revoke_sessions_url": a.RevokeSessionsURL} {
-		frag, ok := strings.CutPrefix(link, env.baseURL+"/if/admin/#/identity/users;")
-		if !ok {
-			t.Fatalf("%s %q does not open %s's admin user list", name, link, env.baseURL)
-		}
-		raw, err := url.PathUnescape(frag)
-		var params map[string]string
-		if err != nil || json.Unmarshal([]byte(raw), &params) != nil || params["ak-user-list-search"] != username {
-			t.Fatalf("%s %q does not search for %s", name, link, username)
-		}
-	}
-	var users struct {
-		Results []struct{ Username string } `json:"results"`
-	}
-	if err := admin("GET", "/api/v3/core/users/?search="+url.QueryEscape(username), nil, &users); err != nil {
-		t.Fatal(err)
-	}
-	if len(users.Results) != 1 || users.Results[0].Username != username {
-		t.Fatalf("Authentik's user search for %q, the one the admin link sets, found %+v", username, users.Results)
+	line := "msg=security event=duo_request_rejected endpoint=/auth/v2/auth reason=unknown_user user_id=" + d.act.UserID + " client_ip="
+	if !strings.Contains(string(out), line) {
+		t.Fatalf("frict-server logged no %q", line)
 	}
 }

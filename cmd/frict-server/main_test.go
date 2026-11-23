@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/frict-auth/frict-server/internal/duosig"
 	"github.com/frict-auth/frict-server/internal/server"
+	"github.com/frict-auth/frict-server/internal/store"
 )
 
 // isolateHome points HOME at an empty directory, so nothing a test starts
@@ -31,7 +34,6 @@ func TestLoadConfig(t *testing.T) {
 		"FRICT_CLIENT_ID":          "DIXXXX",
 		"FRICT_CLIENT_SECRET_FILE": "/secrets/duo-client-secret",
 		"FRICT_DB_PATH":            "/data/frict.db",
-		"FRICT_AUTHENTIK_URL":      "https://auth.example",
 	}
 	without := func(keys ...string) map[string]string {
 		m := map[string]string{}
@@ -46,13 +48,19 @@ func TestLoadConfig(t *testing.T) {
 	with := func(k, v string) map[string]string { m := without(); m[k] = v; return m }
 	sg := func(edit func(*server.Safeguards)) server.Safeguards {
 		s := defaultSafeguards
-		s.AuthentikURL = "https://auth.example"
 		edit(&s)
 		return s
 	}
 	defaults := sg(func(*server.Safeguards) {})
 	want := func(listen string, ttl time.Duration, s server.Safeguards) config {
-		return config{listen, "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", ttl, s, fcmConfig{}}
+		return config{listen, "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", ttl, s, server.LoopbackProxies, fcmConfig{}}
+	}
+	withProxies := func(c config, ps ...string) config {
+		c.TrustedProxies = nil
+		for _, p := range ps {
+			c.TrustedProxies = append(c.TrustedProxies, netip.MustParsePrefix(p))
+		}
+		return c
 	}
 	withFCM := func(c config) config { c.FCM = fcmConfig{"frict-test", "/secrets/fcm-sa.json"}; return c }
 
@@ -73,15 +81,17 @@ func TestLoadConfig(t *testing.T) {
 		{"safeguards set", func() map[string]string {
 			m := with("FRICT_PUSH_CAP", "5")
 			m["FRICT_PUSH_COOLDOWN"] = "5m"
-			m["FRICT_MAX_FAILED"] = "100"
+			m["FRICT_NOT_ME_COUNT"] = "3"
+			m["FRICT_NOT_ME_WINDOW"] = "2h"
 			m["FRICT_PAUSE"] = "1h"
-			m["FRICT_ALERT_RECIPIENTS"] = " akadmin, sec ,,"
-			m["FRICT_ALERT_TTL"] = "48h"
 			return m
 		}(), want(":8080", 60*time.Second, sg(func(s *server.Safeguards) {
-			s.PushCap, s.PushCooldown, s.MaxFailed, s.Pause = 5, 5*time.Minute, 100, time.Hour
-			s.AlertRecipients, s.AlertTTL = []string{"akadmin", "sec"}, 48*time.Hour
+			s.PushCap, s.PushCooldown, s.NotMeCount, s.NotMeWindow, s.Pause = 5, 5*time.Minute, 3, 2*time.Hour, time.Hour
 		})), ""},
+		{"trusted proxies", with("FRICT_TRUSTED_PROXIES", " 172.17.0.1, 10.0.0.0/8 ,::1,::ffff:192.0.2.1,10.1.2.3/8"),
+			withProxies(want(":8080", 60*time.Second, defaults), "172.17.0.1/32", "10.0.0.0/8", "::1/128", "192.0.2.1/32", "10.0.0.0/8"), ""},
+		{"trusted proxy not an address", with("FRICT_TRUSTED_PROXIES", "localhost"), config{}, "FRICT_TRUSTED_PROXIES"},
+		{"trusted proxies empty item", with("FRICT_TRUSTED_PROXIES", "127.0.0.1,"), config{}, "FRICT_TRUSTED_PROXIES"},
 		{"fcm set", func() map[string]string {
 			m := with("FRICT_FCM_PROJECT_ID", "frict-test")
 			m["FRICT_FCM_CREDENTIALS_FILE"] = "/secrets/fcm-sa.json"
@@ -89,21 +99,17 @@ func TestLoadConfig(t *testing.T) {
 		}(), withFCM(want(":8080", 60*time.Second, defaults)), ""},
 		{"fcm project without key", with("FRICT_FCM_PROJECT_ID", "frict-test"), config{}, "FRICT_FCM_CREDENTIALS_FILE"},
 		{"fcm key without project", with("FRICT_FCM_CREDENTIALS_FILE", "/secrets/fcm-sa.json"), config{}, "FRICT_FCM_PROJECT_ID"},
-		{"max failed above NIST's 100", with("FRICT_MAX_FAILED", "101"), config{}, "FRICT_MAX_FAILED"},
-		{"max failed zero", with("FRICT_MAX_FAILED", "0"), config{}, "FRICT_MAX_FAILED"},
+		{"not me count zero", with("FRICT_NOT_ME_COUNT", "0"), config{}, "FRICT_NOT_ME_COUNT"},
+		{"not me window no unit", with("FRICT_NOT_ME_WINDOW", "3600"), config{}, "FRICT_NOT_ME_WINDOW"},
 		{"push cap zero", with("FRICT_PUSH_CAP", "0"), config{}, "FRICT_PUSH_CAP"},
 		{"push cap not a number", with("FRICT_PUSH_CAP", "ten"), config{}, "FRICT_PUSH_CAP"},
 		{"cooldown fractional", with("FRICT_PUSH_COOLDOWN", "1.5s"), config{}, "FRICT_PUSH_COOLDOWN"},
 		{"pause zero", with("FRICT_PAUSE", "0s"), config{}, "FRICT_PAUSE"},
-		{"alert ttl no unit", with("FRICT_ALERT_TTL", "3600"), config{}, "FRICT_ALERT_TTL"},
-		{"no alert recipients", with("FRICT_ALERT_RECIPIENTS", " , "), config{}, "FRICT_ALERT_RECIPIENTS"},
-		{"authentik url without scheme", with("FRICT_AUTHENTIK_URL", "auth.example"), config{}, "FRICT_AUTHENTIK_URL"},
-		{"no authentik url", without("FRICT_AUTHENTIK_URL"), config{}, "FRICT_AUTHENTIK_URL"},
 		{"no hostname", without("FRICT_API_HOSTNAME"), config{}, "FRICT_API_HOSTNAME"},
 		{"no client id", without("FRICT_CLIENT_ID"), config{}, "FRICT_CLIENT_ID"},
 		{"no secret file", without("FRICT_CLIENT_SECRET_FILE"), config{}, "FRICT_CLIENT_SECRET_FILE"},
 		{"no db path", without("FRICT_DB_PATH"), config{}, "FRICT_DB_PATH"},
-		{"all missing named", map[string]string{}, config{}, "FRICT_API_HOSTNAME, FRICT_CLIENT_ID, FRICT_CLIENT_SECRET_FILE, FRICT_DB_PATH, FRICT_AUTHENTIK_URL"},
+		{"all missing named", map[string]string{}, config{}, "FRICT_API_HOSTNAME, FRICT_CLIENT_ID, FRICT_CLIENT_SECRET_FILE, FRICT_DB_PATH"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -134,7 +140,7 @@ func testConfig(t *testing.T, secret string) config {
 	if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return config{APIHostname: "api.frict.test", ClientID: "DIXXXX", ClientSecretFile: secretFile, DBPath: filepath.Join(dir, "frict.db"), ChallengeTTL: 60 * time.Second, Safeguards: defaultSafeguards}
+	return config{APIHostname: "api.frict.test", ClientID: "DIXXXX", ClientSecretFile: secretFile, DBPath: filepath.Join(dir, "frict.db"), ChallengeTTL: 60 * time.Second, Safeguards: defaultSafeguards, TrustedProxies: server.LoopbackProxies}
 }
 
 type running struct {
@@ -368,5 +374,79 @@ func TestRunRejectsBadFCMKey(t *testing.T) {
 				t.Fatalf("run = %v, want an error containing %q", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestRetentionIsAtLeastADayAndTheNotMeWindow(t *testing.T) {
+	for window, want := range map[time.Duration]time.Duration{
+		time.Hour:      24 * time.Hour,
+		24 * time.Hour: 24 * time.Hour,
+		48 * time.Hour: 48 * time.Hour,
+	} {
+		if got := retention(server.Safeguards{NotMeWindow: window}); got != want {
+			t.Errorf("retention with a %s window = %s, want %s", window, got, want)
+		}
+	}
+}
+
+// TestRunPrunesLoginRecordsAtStartup: a challenge that expired more than
+// the retention ago is gone once the server is up; a newer one stays.
+func TestRunPrunesLoginRecordsAtStartup(t *testing.T) {
+	cfg := testConfig(t, "s3cret")
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	now := time.Now()
+	keep := retention(cfg.Safeguards)
+	if err := st.CreateEnrollment(ctx, "DUAAAAAAAAAAAAAAAAAAAAAAAAAA", "alice", "CODE", now, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Enroll(ctx, "CODE", "DUAAAAAAAAAAAAAAAAAAAAAAAAAA", store.Device{DeviceKey: []byte{1}, ApprovalKey: []byte{2}, Attestation: []byte("{}"), EnrolledAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	old, recent := make([]byte, 16), make([]byte, 16)
+	recent[0] = 1
+	for id, created := range map[*[]byte]time.Time{&old: now.Add(-keep - 2*time.Minute), &recent: now.Add(-keep + time.Minute)} {
+		c := store.Challenge{ID: *id, UserID: "DUAAAAAAAAAAAAAAAAAAAAAAAAAA", CreatedAt: created, ExpiresAt: created.Add(time.Minute)}
+		if _, err := st.StartPush(ctx, c, store.Limits{PushCap: 100, Cooldown: time.Second}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	runCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(runCtx, cfg, ln, slog.New(slog.NewTextHandler(logs, nil))) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "pruned login records") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no prune at startup; logs:\n%s", logs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run = %v", err)
+	}
+	if !strings.Contains(logs.String(), "deleted=1 ") {
+		t.Fatalf("startup prune did not delete exactly the old challenge; logs:\n%s", logs)
+	}
+	st, err = store.Open(cfg.DBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.CloseChallenge(ctx, old); !errors.Is(err, store.ErrChallengeNotFound) {
+		t.Fatalf("old challenge after startup: %v, want deleted", err)
+	}
+	if _, err := st.CloseChallenge(ctx, recent); err != nil {
+		t.Fatalf("recent challenge after startup: %v, want kept", err)
 	}
 }

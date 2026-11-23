@@ -237,7 +237,7 @@ const copyServer = "COPY frict-server /frict-server"
 
 var (
 	unhealthyEdit = [3]string{"internal/server/server.go", "\tif err := s.store.Ping(ctx); err != nil {", "\tif err := s.store.Ping(ctx); err == nil {"}
-	migrationEdit = [3]string{"internal/store/store.go", "\tCREATE INDEX alerts_by_recipient ON alerts (recipient_user_id, created_at);`,", "\tCREATE INDEX alerts_by_recipient ON alerts (recipient_user_id, created_at);`,\n\t`CREATE TABLE newer (id INTEGER) STRICT;`,"}
+	migrationEdit = [3]string{"internal/store/store.go", "\tALTER TABLE users DROP COLUMN failed_attempts;`,", "\tALTER TABLE users DROP COLUMN failed_attempts;`,\n\t`CREATE TABLE newer (id INTEGER) STRICT;`,"}
 )
 
 // writeCerts makes a throwaway CA and a certificate for ghcr.io.
@@ -312,7 +312,6 @@ chown 65532:65532 `+boxDir+`/data/frict.db
 install -o root -g root -m 0600 /dev/stdin `+boxDir+`/frict.env <<'ENV'
 FRICT_API_HOSTNAME=api.frict.app
 FRICT_CLIENT_ID=DITEST00000000000000
-FRICT_AUTHENTIK_URL=https://auth.example
 ENV
 install -o root -g root -m 0644 /dev/stdin ~frict-deploy/.ssh/authorized_keys <<'KEY'
 `+keyOptions(t)+` `+pub+`

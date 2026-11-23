@@ -25,6 +25,7 @@ const (
 	ChallengePath = "/device/v1/challenge"
 	AnswerPath    = "/device/v1/answer"
 	FIDPath       = "/device/v1/fid"
+	RemovePath    = "/device/v1/remove"
 )
 
 type Phone struct {
@@ -112,20 +113,6 @@ func (p *Phone) PendingRequest(a Activation, now time.Time) (*http.Request, erro
 type Pending struct {
 	ChallengeIDs []string `json:"challenge_ids"`
 	PollInterval int      `json:"poll_interval"`
-	Alerts       []Alert  `json:"alerts"`
-}
-
-// Alert says someone reported a push as "I didn't start this".
-type Alert struct {
-	AlertID           string `json:"alert_id"`
-	Username          string `json:"username"`
-	IPAddr            string `json:"ipaddr"`
-	PushInfo          string `json:"pushinfo"`
-	Type              string `json:"type"`
-	Attempted         int64  `json:"attempted"`
-	Reported          int64  `json:"reported"`
-	ResetPasswordURL  string `json:"reset_password_url"`
-	RevokeSessionsURL string `json:"revoke_sessions_url"`
 }
 
 // ChallengeRequest fetches challenge id's details, signed with the
@@ -177,6 +164,12 @@ func (p *Phone) FIDRequest(a Activation, fid string, now time.Time) (*http.Reque
 		return nil, err
 	}
 	return SignedRequest("https://"+a.Host, FIDPath, a.UserID, now.Unix(), body, p.DeviceKey)
+}
+
+// RemoveRequest deletes a's enrollment from the server, signed with the
+// device_key.
+func (p *Phone) RemoveRequest(a Activation, now time.Time) (*http.Request, error) {
+	return SignedRequest("https://"+a.Host, RemovePath, a.UserID, now.Unix(), []byte("{}"), p.DeviceKey)
 }
 
 // SignedRequest builds a POST to base+path whose Authorization header claims

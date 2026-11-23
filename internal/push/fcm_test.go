@@ -117,7 +117,7 @@ func TestFCMErrorMapping(t *testing.T) {
 				w.WriteHeader(tc.status)
 				io.WriteString(w, tc.body)
 			})
-			_, err := f.Send(context.Background(), Message{FID: "secret-fid", Data: map[string]string{"alert_id": "secret-id"}})
+			_, err := f.Send(context.Background(), Message{FID: "secret-fid", Data: map[string]string{"challenge_id": "secret-id"}})
 			if err == nil {
 				t.Fatal("Send succeeded, want an error")
 			}

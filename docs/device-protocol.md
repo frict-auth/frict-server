@@ -29,7 +29,7 @@ Each device holds two non-exportable P-256 keys in StrongBox/TEE:
 
 | Key | User auth | Signs |
 |---|---|---|
-| `device_key` | none | enroll, challenge fetch, poll, FID update |
+| `device_key` | none | enroll, challenge fetch, poll, FID update, removal |
 | `approval_key` | biometric on every use | answers only |
 
 Two keys because PLAN requires a biometric on every use of the approval
@@ -117,6 +117,9 @@ captured request (a proxy log, a debug dump) is worth:
   Single use is what stops this, not the time window, which outlasts the
   challenge's 60–120 s expiry.
 - **Enroll** carries a single-use activation code.
+- **Removal** replayed finds the enrollment gone and gets `401`. A captured
+  poll has the same `{}` body as a removal; the signed `path` keeps it from
+  being replayed as one.
 - **Fetch and poll** are reads; a replay within 5 minutes returns what the
   original did.
 - **FID update** replayed within 5 minutes can set an FID the device has since
@@ -134,7 +137,7 @@ All under `https://<api host>/device/v1/`. Responses are JSON. Errors are
 | Status | `error` | When |
 |---|---|---|
 | 400 | `bad_request` | The body doesn't parse, has unknown or missing fields, or a value outside those listed below. |
-| 401 | `unauthorized` | Any verification failure, including a user with no enrolled device. |
+| 401 | `unauthorized` | Any verification failure, including a user with no enrolled device (never enrolled or removed). |
 | 404 | `not_found` | See each endpoint. |
 | 409 | `not_pending` | `answer` only. |
 
@@ -208,9 +211,11 @@ Authentik's Duo validation stage calls `/auth/v2/auth` synchronously with
 `factor=auto`, `async=0`, `user_id`, `ipaddr`, `type`, `display_username`,
 `device=auto` and `pushinfo`
 (`authentik/stages/authenticator_validate/challenge.py:276-290`). Frict
-answers `400` (`stat: FAIL`) for `async=1`, a factor other than `auto` or
-`push`, or a `user_id` with no enrolled device; Authentik records that as a
-configuration error (`challenge.py:307-314`).
+answers `400` (`stat: FAIL`, code `40002`) for `async=1`, a factor other
+than `auto` or `push`, or a `user_id` with no enrolled device, never
+enrolled or removed: Duo's "invalid parameter value", which its `/auth`
+docs give for a user that does not exist. Authentik records
+that as a configuration error (`challenge.py:307-314`).
 
 Otherwise Frict creates a challenge and holds the call open until the
 device answers, the challenge expires (`FRICT_CHALLENGE_TTL`, 60–120 s,
@@ -230,23 +235,17 @@ own (duo.com/docs/authapi, `/auth` status values):
 | deny, `cancel` | `deny` | `deny` | `Login request denied.` |
 | deny, `not_me` | `deny` | `fraud` | `Login request reported as fraudulent.` |
 | expired | `deny` | `timeout` | `Login timed out.` |
-| refused by a safeguard | `deny` | `locked_out` | Which safeguard: the device is disabled, pushes are paused, or the push cap is reached. |
+| refused by a safeguard | `deny` | `locked_out` | Which safeguard: pushes are paused, or the push cap is reached. |
 
 A safeguard (PLAN Safeguards) can refuse `/auth` before any challenge
 exists: it answers at once with `locked_out`, which Duo documents as "The
 user has been disabled due to authentication failures" with result `deny`
 (duo.com/docs/authapi, `/auth` response formats). In the order checked:
 
-1. **Disabled.** `FRICT_MAX_FAILED` denies and timeouts since the user's
-   last approval, counted across challenges, including Authentik ending
-   the call early. Only an approval resets the count. A disabled device
-   stays disabled until it is re-enrolled: an Authentik admin deletes the
-   user's Duo device, and the next login runs the Duo setup stage, which
-   creates a new Frict user. The threshold is checked live, so raising
-   `FRICT_MAX_FAILED` re-enables devices whose count is under the new
-   value.
-2. **Paused.** Within `FRICT_PAUSE` of a `not_me` deny.
-3. **Capped.** `FRICT_PUSH_CAP` pushes since the last approval, and the
+1. **Paused.** Within `FRICT_PAUSE` of the `not_me` deny that made
+   `FRICT_NOT_ME_COUNT` of them within `FRICT_NOT_ME_WINDOW`. An approval
+   does not reset the count.
+2. **Capped.** `FRICT_PUSH_CAP` pushes since the last approval, and the
    last push was under `FRICT_PUSH_COOLDOWN` ago. An approval resets the
    count.
 
@@ -272,29 +271,9 @@ pending.
 ### `pending` (signed with `device_key`)
 
 Request `{}`: an object with no fields. Response
-`{"challenge_ids": ["…"], "poll_interval": 5, "alerts": […]}`: the user's
-pending, unexpired challenges, oldest first (an empty list when there are
-none), how many seconds to wait before polling again (server-set, as in
-CIBA), and the user's alerts.
-
-An alert says someone answered a push with `not_me`. Every enrolled user
-whose username is in `FRICT_ALERT_RECIPIENTS` gets one per such deny, and it
-is listed in every poll for `FRICT_ALERT_TTL` after the deny, and pushed
-once when it is created (see Push); the app shows each `alert_id` once.
-Oldest first, empty when there are none:
-
-```json
-{"alert_id": "…", "username": "geoffrey", "ipaddr": "203.0.113.7",
- "pushinfo": "Domain=…&Application=…", "type": "authentik Login request",
- "attempted": 1762345678, "reported": 1762345690,
- "reset_password_url": "https://auth.example/if/admin/#/identity/users;…",
- "revoke_sessions_url": "https://auth.example/if/admin/#/identity/users;…"}
-```
-
-`username`, `ipaddr`, `pushinfo` and `type` are the denied challenge's, as
-Authentik sent them. `attempted` is when that push was created and
-`reported` when it was denied, in unix seconds. Both URLs open Authentik's
-admin user list filtered to `username` (PLAN Safeguards).
+`{"challenge_ids": ["…"], "poll_interval": 5}`: the user's pending,
+unexpired challenges, oldest first (an empty list when there are none), and
+how many seconds to wait before polling again (server-set, as in CIBA).
 
 ### `answer` (signed with `approval_key`)
 
@@ -305,7 +284,7 @@ admin user list filtered to `username` (PLAN Safeguards).
 | Field | Values |
 |---|---|
 | `decision` | `approve` or `deny` |
-| `reason` | Required with `deny`, absent with `approve`: `not_me` ("I didn't start this": pauses pushes and alerts, see PLAN Safeguards) or `cancel`. |
+| `reason` | Required with `deny`, absent with `approve`: `not_me` ("I didn't start this": Authentik gets Duo's `fraud`, and enough of them pause pushes, see PLAN Safeguards) or `cancel`. |
 
 Any other combination, including `deny` with no `reason`, is `400`.
 `200 {}` on success; `409` if the challenge was already answered or has
@@ -319,6 +298,23 @@ from then on. A dead FID reported by FCM clears only the stored FID, never
 the enrollment (PLAN Domain lessons): the device keeps polling and answering,
 and gets pushes again once it sends a FID.
 
+### `remove` (signed with `device_key`)
+
+Request `{}`: an object with no fields. Deletes the user's enrollment and
+everything stored for it: the device, its keys and FID, and every challenge
+with what Authentik sent for it. Answer: `200 {}`.
+
+After it, the device's keys verify nothing, and `/auth/v2/auth` for the user
+ID gets `400`, code `40002` (Login above); Frict does not tell Authentik.
+The user ID is not reused: enrolling again goes through Authentik's setup
+stage, which creates a new user.
+
+A second removal, or any removal after the enrollment is gone, gets
+`401 {"error": "unauthorized"}`: with the stored key deleted, the server
+can't tell the device from anyone else. The app treats `401` from `remove`
+as already removed. (`401` also means a clock more than 5 minutes off, as on
+every endpoint.) A body other than `{}` gets `400`.
+
 ## Push
 
 A push wakes the app; it never says what to approve. Each is an FCM HTTP v1
@@ -326,17 +322,11 @@ data message to the device's FID, with Android priority `high`, which FCM
 tries to deliver at once, waking a device in Doze. FCM may deprioritize
 high-priority messages that don't lead to a user-visible notification, so
 the app shows one for each (firebase.google.com/docs/cloud-messaging/android-message-priority).
-Two `data` payloads:
-
-| When | `data` |
-|---|---|
-| `/auth/v2/auth` creates a challenge for the user | `{"challenge_id": "<22 chars>"}` |
-| A `not_me` deny creates an alert for a recipient | `{"alert_id": "<22 chars>"}` |
-
-Both IDs are 16 random bytes, base64url without padding, the same IDs
-`pending` lists. The app fetches everything else with signed requests:
-`challenge` for a challenge ID, `pending` for an alert ID. So Google sees
-neither who is signing in to what nor the alert's contents.
+One `data` payload, sent when `/auth/v2/auth` creates a challenge for the
+user: `{"challenge_id": "<22 chars>"}`, 16 random bytes, base64url without
+padding, the same ID `pending` lists. The app fetches everything else with
+a signed `challenge` request, so Google never sees who is signing in to
+what.
 
 Push is best effort. `/auth` doesn't wait on it, and a failed push changes
 nothing about the challenge; the app finds it by polling `pending` at

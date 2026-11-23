@@ -116,66 +116,29 @@ func TestRefusedAuthSendsNoPush(t *testing.T) {
 }
 
 // TestPushPayloadHasNoChallengeDetails: a push carries one opaque ID and
-// nothing Authentik sent, for challenges and alerts alike.
+// nothing Authentik sent. A not_me deny pushes nothing to anyone, an
+// enrolled "admin" included.
 func TestPushPayloadHasNoChallengeDetails(t *testing.T) {
 	fake := push.NewFake()
 	f, _ := newPushFixture(t, testSafeguards, fake)
-	admin, adminPhone := f.enrolledPhone("admin")
+	admin, _ := f.enrolledPhone("admin")
 	a, phone := f.enrolledPhone("alice")
 	f.push(a, phone, "deny", "not_me", "fraud")
 	got := f.settledPushes(fake)
-	if len(got) != 2 {
-		t.Fatalf("pushes %+v, want alice's challenge and admin's alert", got)
+	if len(got) != 1 {
+		t.Fatalf("pushes %+v, want only alice's challenge", got)
 	}
-	if got[0].FID != phone.FID {
-		got[0], got[1] = got[1], got[0]
+	m := got[0]
+	if m.FID != phone.FID || len(m.Data) != 1 || m.Data["challenge_id"] == "" {
+		t.Fatalf("push %+v, want only challenge_id to %s", m, phone.FID)
 	}
-	alertID := f.alerts(admin, adminPhone)[0].AlertID
-	for i, want := range []struct{ fid, key string }{{phone.FID, "challenge_id"}, {adminPhone.FID, "alert_id"}} {
-		m := got[i]
-		if m.FID != want.fid || len(m.Data) != 1 || m.Data[want.key] == "" {
-			t.Fatalf("push %d = %+v, want only %s to %s", i, m, want.key, want.fid)
+	if _, ok := decodeID(m.Data["challenge_id"]); !ok {
+		t.Fatalf("challenge_id %q is not a 16-byte ID", m.Data["challenge_id"])
+	}
+	for _, detail := range []string{"élodie", "203.0.113.7", "Grafana", "auth.example", "Login request", a.UserID, admin.UserID} {
+		if strings.Contains(m.Data["challenge_id"], detail) {
+			t.Fatalf("push carries %q: %+v", detail, m)
 		}
-		if _, ok := decodeID(m.Data[want.key]); !ok {
-			t.Fatalf("push %d %s %q is not a 16-byte ID", i, want.key, m.Data[want.key])
-		}
-		for _, detail := range []string{"élodie", "203.0.113.7", "Grafana", "auth.example", "Login request", a.UserID, admin.UserID} {
-			if strings.Contains(m.Data[want.key], detail) {
-				t.Fatalf("push %d carries %q: %+v", i, detail, m)
-			}
-		}
-	}
-	if got[1].Data["alert_id"] != alertID {
-		t.Fatalf("alert push %+v, want alert_id %s from the poll", got[1], alertID)
-	}
-}
-
-func TestNotMePushesEachAlertRecipient(t *testing.T) {
-	fake := push.NewFake()
-	f, _ := newPushFixture(t, safeguards(func(sg *Safeguards) { sg.AlertRecipients = []string{"admin", "sec"} }), fake)
-	admin, adminPhone := f.enrolledPhone("admin")
-	sec, secPhone := f.enrolledPhone("sec")
-	alice, alicePhone := f.enrolledPhone("alice")
-	f.enrolledPhone("bob")
-
-	f.push(alice, alicePhone, "deny", "cancel", "deny")
-	if got := f.settledPushes(fake); len(got) != 1 || got[0].FID != alicePhone.FID {
-		t.Fatalf("pushes after a cancel deny %+v, want only alice's challenge", got)
-	}
-
-	f.push(alice, alicePhone, "deny", "not_me", "fraud")
-	got := map[string]string{}
-	for _, m := range f.settledPushes(fake) {
-		if id, ok := m.Data["alert_id"]; ok {
-			got[m.FID] = id
-		}
-	}
-	want := map[string]string{
-		adminPhone.FID: f.alerts(admin, adminPhone)[0].AlertID,
-		secPhone.FID:   f.alerts(sec, secPhone)[0].AlertID,
-	}
-	if len(got) != len(want) || got[adminPhone.FID] != want[adminPhone.FID] || got[secPhone.FID] != want[secPhone.FID] {
-		t.Fatalf("alert pushes by FID %v, want %v (one per recipient, none to alice or bob)", got, want)
 	}
 }
 

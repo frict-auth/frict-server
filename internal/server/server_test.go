@@ -48,13 +48,11 @@ type fixture struct {
 
 // testSafeguards are loose enough that tests not about them never hit one.
 var testSafeguards = Safeguards{
-	PushCap:         100,
-	PushCooldown:    time.Minute,
-	MaxFailed:       100,
-	Pause:           10 * time.Minute,
-	AlertRecipients: []string{"admin"},
-	AlertTTL:        24 * time.Hour,
-	AuthentikURL:    "https://auth.example",
+	PushCap:      100,
+	PushCooldown: time.Minute,
+	NotMeCount:   100,
+	NotMeWindow:  time.Hour,
+	Pause:        10 * time.Minute,
 }
 
 // newFixture's pushes expire after 60 s.
@@ -79,7 +77,7 @@ func newFixtureSender(t *testing.T, challengeTTL time.Duration, sg Safeguards, s
 	}
 	t.Cleanup(func() { st.Close() })
 	f.st = st
-	f.srv = New(f.verifier(), st, challengeTTL, sg, sender, log)
+	f.srv = New(f.verifier(), st, challengeTTL, sg, LoopbackProxies, sender, log)
 	t.Cleanup(f.srv.Close)
 	f.h = f.srv.Handler()
 	return f
@@ -101,7 +99,12 @@ func (f *fixture) verifier() duosig.Verifier {
 	return duosig.Verifier{IKey: clientID, SKey: secret, Host: host, MaxSkew: 5 * time.Minute, Now: f.now}
 }
 
+// serve handles r as if it arrived over the network: from httptest's peer
+// address, unless r names another.
 func (f *fixture) serve(r *http.Request) *httptest.ResponseRecorder {
+	if r.RemoteAddr == "" {
+		r.RemoteAddr = "192.0.2.1:1234"
+	}
 	w := httptest.NewRecorder()
 	f.h.ServeHTTP(w, r)
 	return w
@@ -228,7 +231,7 @@ func TestDuoSignedPassesBodyThrough(t *testing.T) {
 	const body = `{"username":"élodie"}`
 	f := newFixture(t)
 	var got string
-	h := New(f.verifier(), f.st, time.Minute, testSafeguards, nil, slog.New(slog.DiscardHandler)).duoSigned(func(w http.ResponseWriter, r *http.Request) {
+	h := New(f.verifier(), f.st, time.Minute, testSafeguards, LoopbackProxies, nil, slog.New(slog.DiscardHandler)).duoSigned(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read body: %v", err)
@@ -504,7 +507,7 @@ func TestHealthz(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			New(f.verifier(), tc.store, time.Minute, testSafeguards, nil, slog.New(slog.DiscardHandler)).Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			New(f.verifier(), tc.store, time.Minute, testSafeguards, LoopbackProxies, nil, slog.New(slog.DiscardHandler)).Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 			if w.Code != tc.want {
 				t.Fatalf("status = %d, want %d", w.Code, tc.want)
 			}

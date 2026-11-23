@@ -3,9 +3,7 @@ package server
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"net/http"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -79,7 +77,6 @@ func (f *fixture) wantPushed(a fakephone.Activation, phone *fakephone.Phone) {
 
 func safeguards(edit func(*Safeguards)) Safeguards {
 	sg := testSafeguards
-	sg.AlertRecipients = append([]string(nil), sg.AlertRecipients...)
 	edit(&sg)
 	return sg
 }
@@ -123,170 +120,70 @@ func TestPushCooldownLetsOnePushPerWindow(t *testing.T) {
 	}
 }
 
-// TestFailedCountSurvivesNewChallenge: denies and timeouts add up across
-// challenges; a new challenge does not reset the count, and MaxFailed of
-// them disable the device.
-func TestFailedCountSurvivesNewChallenge(t *testing.T) {
-	f := newFixtureWith(t, time.Minute, safeguards(func(sg *Safeguards) { sg.MaxFailed = 3 }))
+// TestDeniesAndTimeoutsNeverDisable: however many cancels and timeouts a
+// user piles up, pushes go on; only the push cap and a not_me pause
+// refuse them.
+func TestDeniesAndTimeoutsNeverDisable(t *testing.T) {
+	f := newFixture(t)
 	a, phone := f.enrolledPhone("alice")
-	f.wantPushed(a, phone)
-	f.timeout(a, phone)
-	f.wantPushed(a, phone)
-	f.wantRefused(a, "disabled")
-}
-
-func TestSuccessfulLoginResetsFailedCount(t *testing.T) {
-	f := newFixtureWith(t, time.Minute, safeguards(func(sg *Safeguards) { sg.MaxFailed = 3 }))
-	a, phone := f.enrolledPhone("alice")
-	f.wantPushed(a, phone)
-	f.wantPushed(a, phone)
+	for range 30 {
+		f.wantPushed(a, phone)
+		f.timeout(a, phone)
+	}
 	f.push(a, phone, "approve", "", "allow")
-	f.wantPushed(a, phone)
-	f.wantPushed(a, phone)
-	f.wantPushed(a, phone)
-	f.wantRefused(a, "disabled")
 }
 
-// TestDisabledDeviceGetsNoPush: a disabled device stays disabled however
-// long the user waits, while another user's pushes go on.
-func TestDisabledDeviceGetsNoPush(t *testing.T) {
-	f := newFixtureWith(t, time.Minute, safeguards(func(sg *Safeguards) { sg.MaxFailed = 1 }))
+// notMeSafeguards pause for 10 minutes after 2 not_me denies within an
+// hour.
+var notMeSafeguards = safeguards(func(sg *Safeguards) { sg.NotMeCount, sg.NotMeWindow, sg.Pause = 2, time.Hour, 10*time.Minute })
+
+func TestNotMeCountPausesPushes(t *testing.T) {
+	f := newFixtureWith(t, time.Minute, notMeSafeguards)
+	a, phone := f.enrolledPhone("alice")
+	f.push(a, phone, "deny", "not_me", "fraud")
+	f.setClock(t0.Add(time.Minute))
+	f.wantPushed(a, phone)
+	f.push(a, phone, "deny", "not_me", "fraud")
+	f.setClock(t0.Add(time.Minute + time.Second))
+	f.wantRefused(a, "paused")
+	f.setClock(t0.Add(11*time.Minute - time.Second))
+	f.wantRefused(a, "paused")
+	f.pending(a, phone, 0)
+	f.setClock(t0.Add(11 * time.Minute))
+	f.wantPushed(a, phone)
+}
+
+// TestApprovalDoesNotResetNotMeCount: a not_me, an approved login, then
+// another not_me within the window still pause pushes.
+func TestApprovalDoesNotResetNotMeCount(t *testing.T) {
+	f := newFixtureWith(t, time.Minute, notMeSafeguards)
+	a, phone := f.enrolledPhone("alice")
+	f.push(a, phone, "deny", "not_me", "fraud")
+	f.setClock(t0.Add(time.Minute))
+	f.push(a, phone, "approve", "", "allow")
+	f.setClock(t0.Add(2 * time.Minute))
+	f.push(a, phone, "deny", "not_me", "fraud")
+	f.wantRefused(a, "paused")
+}
+
+func TestNotMesOutsideWindowDoNotPause(t *testing.T) {
+	f := newFixtureWith(t, time.Minute, notMeSafeguards)
 	a, phone := f.enrolledPhone("alice")
 	b, bobPhone := f.enrolledPhone("bob")
+	f.push(a, phone, "deny", "not_me", "fraud")
+	f.push(b, bobPhone, "deny", "not_me", "fraud")
+	f.setClock(t0.Add(time.Hour))
+	f.push(a, phone, "deny", "not_me", "fraud")
 	f.wantPushed(a, phone)
-	f.wantRefused(a, "disabled")
-	f.setClock(t0.Add(30 * 24 * time.Hour))
-	f.wantRefused(a, "disabled")
-	f.pending(a, phone, 0)
 	f.wantPushed(b, bobPhone)
 }
 
-func TestNotMePausesPushes(t *testing.T) {
-	f := newFixtureWith(t, time.Minute, safeguards(func(sg *Safeguards) { sg.Pause = 10 * time.Minute }))
-	a, phone := f.enrolledPhone("alice")
-	f.push(a, phone, "deny", "not_me", "fraud")
-	f.setClock(t0.Add(time.Second))
-	f.wantRefused(a, "paused")
-	f.setClock(t0.Add(10*time.Minute - time.Second))
-	f.wantRefused(a, "paused")
-	f.setClock(t0.Add(10 * time.Minute))
-	f.wantPushed(a, phone)
-}
-
-// alerts polls as the phone and returns the alerts in its answer.
-func (f *fixture) alerts(a fakephone.Activation, phone *fakephone.Phone) []fakephone.Alert {
-	f.t.Helper()
-	w := f.serve(must[*http.Request](f.t)(phone.PendingRequest(a, f.now())))
-	var p fakephone.Pending
-	if w.Code != http.StatusOK || json.Unmarshal(w.Body.Bytes(), &p) != nil {
-		f.t.Fatalf("pending: %d %s", w.Code, w.Body)
-	}
-	if p.Alerts == nil {
-		f.t.Fatalf("pending without an alerts list: %s", w.Body)
-	}
-	return p.Alerts
-}
-
-// adminSearch is the username an Authentik admin UI link searches for, read
-// back the way the UI reads it (web/src/elements/router/RouteMatch.ts).
-func adminSearch(t *testing.T, link string) string {
-	t.Helper()
-	const prefix = "https://auth.example/if/admin/#/identity/users;"
-	if !strings.HasPrefix(link, prefix) {
-		t.Fatalf("link %q does not open Authentik's user list", link)
-	}
-	raw, err := url.PathUnescape(strings.TrimPrefix(link, prefix))
-	if err != nil {
-		t.Fatalf("link %q: %v", link, err)
-	}
-	var params map[string]string
-	if err := json.Unmarshal([]byte(raw), &params); err != nil || len(params) != 1 {
-		t.Fatalf("link %q params %q: want one JSON parameter", link, raw)
-	}
-	return params["ak-user-list-search"]
-}
-
-func TestNotMeAlertsEachRecipient(t *testing.T) {
-	f := newFixtureWith(t, time.Minute, safeguards(func(sg *Safeguards) { sg.AlertRecipients = []string{"admin", "sec"} }))
-	admin, adminPhone := f.enrolledPhone("admin")
-	sec, secPhone := f.enrolledPhone("sec")
-	alice, alicePhone := f.enrolledPhone("alice")
-	bob, bobPhone := f.enrolledPhone("bob")
-
-	done := f.startAuth(context.Background(), alice.UserID)
-	id := f.pending(alice, alicePhone, 1)[0]
-	f.setClock(t0.Add(5 * time.Second))
-	wantStatus(t, "not_me", f.answer(alice, alicePhone, id, "deny", "not_me"), http.StatusOK, "{}")
-	wantResult(t, f.authResult(done), "deny", "fraud")
-
-	got := f.alerts(admin, adminPhone)
-	if len(got) != 1 {
-		t.Fatalf("admin alerts %+v, want 1", got)
-	}
-	al := got[0]
-	want := fakephone.Alert{AlertID: al.AlertID, Username: "élodie", IPAddr: "203.0.113.7",
-		PushInfo: "Domain=auth.example&Application=Grafana", Type: "authentik Login request",
-		Attempted: t0.Unix(), Reported: t0.Add(5 * time.Second).Unix(),
-		ResetPasswordURL: al.ResetPasswordURL, RevokeSessionsURL: al.RevokeSessionsURL}
-	if al != want {
-		t.Fatalf("alert %+v, want %+v", al, want)
-	}
-	if _, ok := decodeID(al.AlertID); !ok {
-		t.Fatalf("alert_id %q is not 16 base64url bytes", al.AlertID)
-	}
-	for name, link := range map[string]string{"reset_password_url": al.ResetPasswordURL, "revoke_sessions_url": al.RevokeSessionsURL} {
-		if got := adminSearch(t, link); got != "élodie" {
-			t.Fatalf("%s searches for %q, want élodie", name, got)
-		}
-	}
-
-	secAlerts := f.alerts(sec, secPhone)
-	if len(secAlerts) != 1 || secAlerts[0].AlertID == al.AlertID || secAlerts[0].Username != "élodie" {
-		t.Fatalf("sec alerts %+v, want one of its own for élodie", secAlerts)
-	}
-	if again := f.alerts(admin, adminPhone); len(again) != 1 || again[0] != al {
-		t.Fatalf("admin's second poll %+v, want the same alert", again)
-	}
-	for name, who := range map[string]struct {
-		a     fakephone.Activation
-		phone *fakephone.Phone
-	}{"alice": {alice, alicePhone}, "bob": {bob, bobPhone}} {
-		if got := f.alerts(who.a, who.phone); len(got) != 0 {
-			t.Fatalf("%s is not a recipient but got alerts %+v", name, got)
-		}
-	}
-
-	asAdmin := func(key *fakephone.Phone, approval bool) *http.Request {
-		k := key.DeviceKey
-		if approval {
-			k = key.ApprovalKey
-		}
-		return must[*http.Request](t)(fakephone.SignedRequest("https://"+host, fakephone.PendingPath, admin.UserID, f.now().Unix(), []byte("{}"), k))
-	}
-	wantStatus(t, "bob polls as admin", f.serve(asAdmin(bobPhone, false)), http.StatusUnauthorized, `{"error":"unauthorized"}`)
-	wantStatus(t, "admin polls with the approval_key", f.serve(asAdmin(adminPhone, true)), http.StatusUnauthorized, `{"error":"unauthorized"}`)
-	unsigned := must[*http.Request](t)(fakephone.SignedRequest("https://"+host, fakephone.PendingPath, admin.UserID, f.now().Unix(), []byte("{}"), adminPhone.DeviceKey))
-	unsigned.Header.Del("Authorization")
-	wantStatus(t, "unsigned poll", f.serve(unsigned), http.StatusUnauthorized, `{"error":"unauthorized"}`)
-
-	f.setClock(t0.Add(5*time.Second + 24*time.Hour - time.Second))
-	if got := f.alerts(admin, adminPhone); len(got) != 1 {
-		t.Fatalf("admin alerts just before AlertTTL: %+v, want 1", got)
-	}
-	f.setClock(t0.Add(5*time.Second + 24*time.Hour))
-	if got := f.alerts(admin, adminPhone); len(got) != 0 {
-		t.Fatalf("admin alerts at AlertTTL: %+v, want none", got)
-	}
-}
-
-func TestCancelDenyNeitherPausesNorAlerts(t *testing.T) {
-	f := newFixture(t)
-	admin, adminPhone := f.enrolledPhone("admin")
+func TestCancelDenyDoesNotPause(t *testing.T) {
+	f := newFixtureWith(t, time.Minute, safeguards(func(sg *Safeguards) { sg.NotMeCount = 1 }))
 	a, phone := f.enrolledPhone("alice")
 	f.push(a, phone, "deny", "cancel", "deny")
 	f.setClock(t0.Add(time.Second))
 	f.wantPushed(a, phone)
-	if got := f.alerts(admin, adminPhone); len(got) != 0 {
-		t.Fatalf("admin alerts after a cancel deny: %+v, want none", got)
-	}
+	f.push(a, phone, "deny", "not_me", "fraud")
+	f.wantRefused(a, "paused")
 }
