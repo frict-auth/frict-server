@@ -84,7 +84,7 @@ func verifies(key *ecdsa.PublicKey, sig, signed []byte) bool {
 // well formed, whether or not the request verifies.
 func ClaimedUserID(h string) string {
 	creds, _ := strings.CutPrefix(h, scheme)
-	id, _, _ := strings.Cut(creds, ":")
+	id := strings.Split(creds, ":")[0]
 	if !ValidUserID(id) {
 		return ""
 	}
