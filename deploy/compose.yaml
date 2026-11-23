@@ -1,0 +1,31 @@
+# frict-server on the box: /home/deploy/frict/compose.yaml. docs/deploy.md.
+name: frict
+
+services:
+  frict-server:
+    image: ghcr.io/frict-auth/frict-server@${FRICT_DIGEST:?set by frict-deploy}
+    restart: unless-stopped
+    # frict-server waits up to 15 s for in-flight requests.
+    stop_grace_period: 20s
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    env_file: frict.env
+    environment:
+      FRICT_LISTEN: ":8080"
+      FRICT_DB_PATH: /data/frict.db
+      FRICT_CLIENT_SECRET_FILE: /secrets/duo-client-secret
+    ports:
+      - 127.0.0.1:8081:8080
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./secrets
+        target: /secrets
+        read_only: true
+        bind:
+          create_host_path: false

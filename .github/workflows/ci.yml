@@ -36,8 +36,18 @@ jobs:
           go vet ./...
           go vet -tags e2e ./...
           go vet -tags fcmlive ./...
+          go vet -tags deploy ./...
+      - name: actionlint and shellcheck
+        run: |
+          lint() { docker run --rm --volume "$PWD:/repo:ro" --workdir /repo "$@"; }
+          image=docker.io/rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          lint "$image" -color
+          mapfile -t scripts < <(git ls-files '*.sh' deploy/frict-deploy)
+          lint --entrypoint shellcheck "$image" "${scripts[@]}"
       - name: go test -race
         run: go test -race -count=1 -v ./...
+      - name: Build, publish and deploy against a local registry and box
+        run: go test -tags deploy -count=1 -v ./deploy/test
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.10.0

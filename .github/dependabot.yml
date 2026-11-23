@@ -1,7 +1,9 @@
 version: 2
 updates:
   - package-ecosystem: docker-compose
-    directory: /e2e
+    directories:
+      - /e2e
+      - /deploy/test
     schedule:
       interval: daily
     cooldown:
@@ -14,11 +16,10 @@ updates:
           - goauthentik/*
   - package-ecosystem: docker
     directories:
-      - /e2e
+      - /
+      - /deploy/test
       - /e2e/sssd
       - /e2e/zbar
-    exclude-paths:
-      - compose.yaml
     schedule:
       interval: monthly
     cooldown:

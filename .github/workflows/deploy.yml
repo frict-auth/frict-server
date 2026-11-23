@@ -1,0 +1,101 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    # What the image is built from.
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - go.mod
+      - go.sum
+      - cmd/**
+      - internal/**
+      - "!**/*_test.go"
+      - "!**/testdata/**"
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  IMAGE: ghcr.io/frict-auth/frict-server
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Build
+        run: |
+          set -euo pipefail
+          docker build \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "app.frict.main-commit=$(git rev-list --count HEAD)" \
+            --tag "$IMAGE:$GITHUB_SHA" .
+      - name: Push
+        id: push
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | docker login "${IMAGE%%/*}" --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$GITHUB_SHA"
+          docker logout "${IMAGE%%/*}"
+          digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE:$GITHUB_SHA" | sed -n "s|^$IMAGE@||p")"
+          if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::$IMAGE:$GITHUB_SHA has no single digest: '$digest'"; exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Summary to read before approving
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          scripts/deploy-summary.sh "$DIGEST" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    environment: production
+    # One deploy at a time, never cancelled halfway. frict-deploy refuses a
+    # build older than the deployed one, in whatever order jobs get here.
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    steps:
+      - name: Deploy this digest
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          for name in DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS DIGEST; do
+            if [ -z "${!name}" ]; then
+              echo "::error::$name is empty. DEPLOY_* are secrets of the production environment (docs/deploy.md)."; exit 1
+            fi
+          done
+          umask 077
+          dir="$(mktemp -d)"
+          trap 'rm -rf "${dir:?}"' EXIT
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$dir/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$dir/known_hosts"
+          ssh -T -F /dev/null -i "$dir/key" -o IdentitiesOnly=yes -o BatchMode=yes \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$dir/known_hosts" -o GlobalKnownHostsFile=/dev/null \
+            -o ConnectTimeout=30 -o ServerAliveInterval=15 \
+            deploy@api.frict.app "$DIGEST"

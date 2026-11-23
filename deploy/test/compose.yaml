@@ -1,0 +1,36 @@
+name: frict-deploy-test
+
+services:
+  # Stands in for GHCR, with a certificate from a throwaway CA the box trusts.
+  registry:
+    image: docker.io/library/registry:3.1.2@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
+    environment:
+      REGISTRY_HTTP_ADDR: :443
+      REGISTRY_HTTP_TLS_CERTIFICATE: /certs/ghcr.pem
+      REGISTRY_HTTP_TLS_KEY: /certs/ghcr.key
+      OTEL_TRACES_EXPORTER: none
+    volumes:
+      - ${CERTS:?}:/certs:ro
+    ports:
+      - 127.0.0.1::443
+    networks:
+      default:
+        aliases: [ghcr.io]
+
+  box:
+    build: .
+    privileged: true
+    volumes:
+      - ..:/deploy:ro
+      - ${CERTS:?}/ca.pem:/etc/docker/certs.d/ghcr.io/ca.crt:ro
+      - /var/lib/docker
+      - /var/lib/containerd
+    networks:
+      default:
+        aliases: [api.frict.app]
+
+  # Where the workflow's deploy step runs.
+  client:
+    build: .
+    command: sleep infinity
+    init: true
