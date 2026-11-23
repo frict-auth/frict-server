@@ -8,9 +8,10 @@ Run workflow, on `main`.
 
 Approving sends the digest over SSH to the box's `frict-deploy` user, whose key
 can only run `/usr/local/bin/frict-deploy` as root through sudo. The user is not
-in the `docker` group and may run nothing else as root. The script refuses anything that isn't a digest of this image and any
-build older than the deployed one, backs up `data/`, starts the new version, and
-goes back to the previous one if the new one isn't healthy. To go back on
+in the `docker` group and may run nothing else as root. The script refuses
+anything that isn't a digest of this image and any build older than the deployed
+one, backs up `data/`, starts the new version, and goes back to the previous one
+if the new one isn't healthy. To go back on
 purpose, revert on `main`.
 
 ## Setup
