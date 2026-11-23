@@ -9,13 +9,12 @@
 //	FRICT_CLIENT_SECRET_FILE  file holding the Duo stage client secret (required)
 //	FRICT_DB_PATH             SQLite database file, created if missing (required)
 //	FRICT_CHALLENGE_TTL       how long a push waits for the device's answer: whole seconds from 60s to 120s (default 60s)
-//	FRICT_AUTHENTIK_URL       Authentik's base URL, e.g. https://auth.example, for alert links (required)
 //	FRICT_PUSH_CAP            pushes since a user's last successful login before the cooldown applies, at least 1 (default 10)
 //	FRICT_PUSH_COOLDOWN       once over the cap, the least time between pushes (default 15m)
-//	FRICT_MAX_FAILED          denies and timeouts since the last successful login that disable the device, 1 to 100 (default 20)
-//	FRICT_PAUSE               how long "I didn't start this" stops pushes to that user (default 30m)
-//	FRICT_ALERT_RECIPIENTS    comma-separated Authentik usernames alerted on "I didn't start this" (default akadmin)
-//	FRICT_ALERT_TTL           how long an alert stays in the device's poll (default 24h)
+//	FRICT_NOT_ME_COUNT        "I didn't start this" answers that pause the user's pushes, at least 1 (default 2) ...
+//	FRICT_NOT_ME_WINDOW       ... when given within this long (default 60m)
+//	FRICT_PAUSE               how long the pause lasts (default 30m)
+//	FRICT_TRUSTED_PROXIES     comma-separated addresses or CIDR prefixes whose X-Forwarded-For and X-Real-IP name the client (default 127.0.0.0/8,::1)
 //	FRICT_FCM_PROJECT_ID      Firebase project to push through
 //	FRICT_FCM_CREDENTIALS_FILE  that project's FCM sender service-account key (JSON)
 //
@@ -23,7 +22,10 @@
 // gives the reason for each default.
 //
 // Push is on only when both FRICT_FCM_* are set; with neither, the server
-// sends no pushes and devices find challenges and alerts by polling.
+// sends no pushes and devices find challenges by polling.
+//
+// Login records are deleted once they expired more than
+// max(24h, FRICT_NOT_ME_WINDOW) ago: at startup and every hour.
 //
 // SIGINT or SIGTERM stops accepting connections and waits up to 15 s for
 // in-flight requests.
@@ -37,7 +39,7 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/url"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strconv"
@@ -60,21 +62,20 @@ const (
 	// answers the login with HTTP 408 (docs/m0-findings.md (c′)).
 	maxChallengeTTL = 120 * time.Second
 
-	// maxFailedLimit is NIST SP 800-63B-4 §3.2.2's upper bound on
-	// consecutive failed attempts before an authenticator is disabled.
-	maxFailedLimit = 100
+	// minRetention is the least time a finished login record is kept.
+	minRetention  = 24 * time.Hour
+	pruneInterval = time.Hour
 
 	// fcmTimeout bounds each HTTP request to FCM or its token endpoint.
 	fcmTimeout = 10 * time.Second
 )
 
 var defaultSafeguards = server.Safeguards{
-	PushCap:         10,
-	PushCooldown:    15 * time.Minute,
-	MaxFailed:       20,
-	Pause:           30 * time.Minute,
-	AlertRecipients: []string{"akadmin"},
-	AlertTTL:        24 * time.Hour,
+	PushCap:      10,
+	PushCooldown: 15 * time.Minute,
+	NotMeCount:   2,
+	NotMeWindow:  60 * time.Minute,
+	Pause:        30 * time.Minute,
 }
 
 type config struct {
@@ -85,6 +86,7 @@ type config struct {
 	DBPath           string
 	ChallengeTTL     time.Duration
 	Safeguards       server.Safeguards
+	TrustedProxies   []netip.Prefix
 	FCM              fcmConfig
 }
 
@@ -114,19 +116,13 @@ func loadConfig(getenv func(string) string) (config, error) {
 		c.ChallengeTTL = ttl
 	}
 	c.Safeguards = defaultSafeguards
-	c.Safeguards.AuthentikURL = getenv("FRICT_AUTHENTIK_URL")
-	if v := c.Safeguards.AuthentikURL; v != "" {
-		if u, err := url.Parse(v); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-			return config{}, fmt.Errorf("FRICT_AUTHENTIK_URL=%q: want an http(s) URL", v)
-		}
-	}
 	for _, n := range []struct {
 		name     string
 		dst      *int
 		min, max int
 	}{
 		{"FRICT_PUSH_CAP", &c.Safeguards.PushCap, 1, math.MaxInt32},
-		{"FRICT_MAX_FAILED", &c.Safeguards.MaxFailed, 1, maxFailedLimit},
+		{"FRICT_NOT_ME_COUNT", &c.Safeguards.NotMeCount, 1, math.MaxInt32},
 	} {
 		if v := getenv(n.name); v != "" {
 			i, err := strconv.Atoi(v)
@@ -141,8 +137,8 @@ func loadConfig(getenv func(string) string) (config, error) {
 		dst  *time.Duration
 	}{
 		{"FRICT_PUSH_COOLDOWN", &c.Safeguards.PushCooldown},
+		{"FRICT_NOT_ME_WINDOW", &c.Safeguards.NotMeWindow},
 		{"FRICT_PAUSE", &c.Safeguards.Pause},
-		{"FRICT_ALERT_TTL", &c.Safeguards.AlertTTL},
 	} {
 		if v := getenv(d.name); v != "" {
 			dur, err := time.ParseDuration(v)
@@ -152,15 +148,15 @@ func loadConfig(getenv func(string) string) (config, error) {
 			*d.dst = dur
 		}
 	}
-	if v := getenv("FRICT_ALERT_RECIPIENTS"); v != "" {
-		c.Safeguards.AlertRecipients = nil
-		for _, name := range strings.Split(v, ",") {
-			if name = strings.TrimSpace(name); name != "" {
-				c.Safeguards.AlertRecipients = append(c.Safeguards.AlertRecipients, name)
+	c.TrustedProxies = server.LoopbackProxies
+	if v := getenv("FRICT_TRUSTED_PROXIES"); v != "" {
+		c.TrustedProxies = nil
+		for _, item := range strings.Split(v, ",") {
+			p, err := parsePrefix(strings.TrimSpace(item))
+			if err != nil {
+				return config{}, fmt.Errorf("FRICT_TRUSTED_PROXIES=%q: %w", v, err)
 			}
-		}
-		if len(c.Safeguards.AlertRecipients) == 0 {
-			return config{}, fmt.Errorf("FRICT_ALERT_RECIPIENTS=%q: want at least one username", v)
+			c.TrustedProxies = append(c.TrustedProxies, p)
 		}
 	}
 	c.FCM = fcmConfig{ProjectID: getenv("FRICT_FCM_PROJECT_ID"), CredentialsFile: getenv("FRICT_FCM_CREDENTIALS_FILE")}
@@ -173,7 +169,6 @@ func loadConfig(getenv func(string) string) (config, error) {
 		{"FRICT_CLIENT_ID", c.ClientID},
 		{"FRICT_CLIENT_SECRET_FILE", c.ClientSecretFile},
 		{"FRICT_DB_PATH", c.DBPath},
-		{"FRICT_AUTHENTIK_URL", c.Safeguards.AuthentikURL},
 	} {
 		if req.value == "" {
 			missing = append(missing, req.name)
@@ -183,6 +178,44 @@ func loadConfig(getenv func(string) string) (config, error) {
 		return config{}, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
 	}
 	return c, nil
+}
+
+// parsePrefix reads an address as the prefix holding just it, or a CIDR
+// prefix.
+func parsePrefix(s string) (netip.Prefix, error) {
+	if a, err := netip.ParseAddr(s); err == nil {
+		a = a.Unmap()
+		return netip.PrefixFrom(a, a.BitLen()), nil
+	}
+	p, err := netip.ParsePrefix(s)
+	if err != nil {
+		return netip.Prefix{}, fmt.Errorf("%q is neither an IP address nor a CIDR prefix", s)
+	}
+	return p.Masked(), nil
+}
+
+// retention is how long a finished login record is kept: long enough to
+// count its not_me deny.
+func retention(sg server.Safeguards) time.Duration { return max(minRetention, sg.NotMeWindow) }
+
+// pruneLoginRecords deletes login records past retention now, then every
+// pruneInterval until ctx is done.
+func pruneLoginRecords(ctx context.Context, st *store.Store, keep time.Duration, log *slog.Logger) {
+	ticker := time.NewTicker(pruneInterval)
+	defer ticker.Stop()
+	for {
+		n, err := st.DeleteChallengesBefore(ctx, time.Now().Add(-keep))
+		if err != nil {
+			log.Error("prune login records", "err", err)
+		} else {
+			log.Info("pruned login records", "deleted", n, "retention", keep.String())
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func main() {
@@ -237,7 +270,18 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 		MaxSkew: 5 * time.Minute,
 		Now:     time.Now,
 	}
-	h := server.New(v, st, cfg.ChallengeTTL, cfg.Safeguards, sender, log)
+	pruneCtx, stopPrune := context.WithCancel(ctx)
+	pruned := make(chan struct{})
+	go func() {
+		defer close(pruned)
+		pruneLoginRecords(pruneCtx, st, retention(cfg.Safeguards), log)
+	}()
+	defer func() {
+		stopPrune()
+		<-pruned
+	}()
+
+	h := server.New(v, st, cfg.ChallengeTTL, cfg.Safeguards, cfg.TrustedProxies, sender, log)
 	defer h.Close()
 	srv := &http.Server{
 		Handler:           h.Handler(),
@@ -248,11 +292,10 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 	go func() { served <- srv.Serve(ln) }()
 	log.Info("listening", "addr", ln.Addr().String(), "api_hostname", cfg.APIHostname, "challenge_ttl", cfg.ChallengeTTL.String(),
 		"push_cap", cfg.Safeguards.PushCap, "push_cooldown", cfg.Safeguards.PushCooldown.String(),
-		"max_failed", cfg.Safeguards.MaxFailed, "pause", cfg.Safeguards.Pause.String(),
-		"alert_recipients", strings.Join(cfg.Safeguards.AlertRecipients, ","), "alert_ttl", cfg.Safeguards.AlertTTL.String(),
-		"authentik_url", cfg.Safeguards.AuthentikURL)
+		"not_me_count", cfg.Safeguards.NotMeCount, "not_me_window", cfg.Safeguards.NotMeWindow.String(),
+		"pause", cfg.Safeguards.Pause.String(), "trusted_proxies", fmt.Sprint(cfg.TrustedProxies))
 	if sender == nil {
-		log.Warn("push disabled: FRICT_FCM_PROJECT_ID and FRICT_FCM_CREDENTIALS_FILE are unset; devices find challenges and alerts only by polling")
+		log.Warn("push disabled: FRICT_FCM_PROJECT_ID and FRICT_FCM_CREDENTIALS_FILE are unset; devices find challenges only by polling")
 	} else {
 		log.Info("push enabled", "fcm_project", cfg.FCM.ProjectID)
 	}

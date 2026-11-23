@@ -137,8 +137,8 @@ func TestVerifyRejectsMalformedUserIDBeforeSignature(t *testing.T) {
 				looked = true
 				return &key.PublicKey, nil
 			})
-			if !errors.Is(err, ErrMalformedHeader) {
-				t.Fatalf("Verify = %v, want ErrMalformedHeader", err)
+			if !errors.Is(err, ErrMalformedUserID) || !errors.Is(err, ErrMalformedHeader) {
+				t.Fatalf("Verify = %v, want ErrMalformedUserID", err)
 			}
 			if looked {
 				t.Fatal("key was looked up for a malformed user_id")
@@ -166,7 +166,10 @@ func TestVerifyRejects(t *testing.T) {
 		{"wrong key", request(fakephone.EnrollPath, header(alice, unix, schemeSig(t, other, alice, unix, fakephone.EnrollPath, body)), body), ErrBadSignature},
 		{"user_id swapped", request(fakephone.EnrollPath, header(bob, unix, good), body), ErrBadSignature},
 		{"unix_seconds changed", request(fakephone.EnrollPath, header(alice, unix-1, good), body), ErrBadSignature},
-		{"signed for another path", request(fakephone.EnrollPath, header(alice, unix, schemeSig(t, key, alice, unix, "/device/v1/fid", body)), body), ErrBadSignature},
+		{"signed for another endpoint", request(fakephone.EnrollPath, header(alice, unix, schemeSig(t, key, alice, unix, "/device/v1/fid", body)), body), ErrWrongEndpoint},
+		{"signed for remove, sent to pending", request(fakephone.PendingPath, header(alice, unix, schemeSig(t, key, alice, unix, fakephone.RemovePath, "{}")), "{}"), ErrWrongEndpoint},
+		{"signed for pending, sent to remove", request(fakephone.RemovePath, header(alice, unix, schemeSig(t, key, alice, unix, fakephone.PendingPath, "{}")), "{}"), ErrWrongEndpoint},
+		{"signed for an unknown path", request(fakephone.EnrollPath, header(alice, unix, schemeSig(t, key, alice, unix, "/device/v1/nope", body)), body), ErrBadSignature},
 		{"body changed", request(fakephone.EnrollPath, header(alice, unix, good), body+" "), ErrBadSignature},
 	}
 	for _, tc := range tests {
@@ -176,9 +179,33 @@ func TestVerifyRejects(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, err = Verify(tc.req, sent, now, func(string) (*ecdsa.PublicKey, error) { return &key.PublicKey, nil })
-			if !errors.Is(err, tc.wantErr) {
+			if !errors.Is(err, tc.wantErr) || tc.wantErr == ErrBadSignature && errors.Is(err, ErrWrongEndpoint) {
 				t.Fatalf("Verify = %v, want %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestClaimedUserID(t *testing.T) {
+	for h, want := range map[string]string{
+		header(alice, 1, "sig"):                  alice,
+		"Frict-P256 " + alice:                    alice,
+		header(strings.ToLower(alice), 1, "sig"): "",
+		"Frict-P256 DU1:1:sig":                   "",
+		"":                                       "",
+		"Basic eDp5":                             "",
+	} {
+		if got := ClaimedUserID(h); got != want {
+			t.Errorf("ClaimedUserID(%q) = %q, want %q", h, got, want)
+		}
+	}
+}
+
+// TestPathsMatchFakePhone: every path the fake phone signs for is one
+// Verify knows, so a cross-endpoint signature is told apart.
+func TestPathsMatchFakePhone(t *testing.T) {
+	want := []string{fakephone.EnrollPath, fakephone.PendingPath, fakephone.ChallengePath, fakephone.AnswerPath, fakephone.FIDPath, fakephone.RemovePath}
+	if fmt.Sprint(Paths) != fmt.Sprint(want) {
+		t.Fatalf("Paths = %v, want %v", Paths, want)
 	}
 }

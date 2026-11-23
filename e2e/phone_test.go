@@ -54,7 +54,7 @@ func enrollPhone(phone *fakephone.Phone, act fakephone.Activation) (int, string)
 	return send(req)
 }
 
-// poll asks frict-server for the account's pending challenges and alerts.
+// poll asks frict-server for the account's pending challenges.
 func (d device) poll() (fakephone.Pending, error) {
 	req, err := d.phone.PendingRequest(d.act, time.Now())
 	if err != nil {
@@ -111,6 +111,15 @@ func (d device) details(id string) (fakephone.Challenge, error) {
 
 func (d device) answer(id, decision, reason string) (int, string) {
 	req, err := d.phone.AnswerRequest(d.act, id, decision, reason, time.Now())
+	if err != nil {
+		return 0, err.Error()
+	}
+	return send(req)
+}
+
+// remove deletes the account's enrollment from frict-server.
+func (d device) remove() (int, string) {
+	req, err := d.phone.RemoveRequest(d.act, time.Now())
 	if err != nil {
 		return 0, err.Error()
 	}

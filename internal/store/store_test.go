@@ -154,8 +154,6 @@ func TestOpenRejectsNewerSchema(t *testing.T) {
 func TestSchemaConstraints(t *testing.T) {
 	const id = `x'00112233445566778899aabbccddeeff'`
 	const challenge = `INSERT INTO challenges (id, user_id, ipaddr, pushinfo, status, created_at, expires_at, answered_at, reason) VALUES `
-	const alertFor = `INSERT INTO challenges (id, user_id, ipaddr, pushinfo, created_at, expires_at) VALUES (` + id + `, 'DU1', '', '', 100, 160);
-		INSERT INTO alerts (id, recipient_user_id, challenge_id, created_at) VALUES `
 	tests := []struct {
 		name   string
 		stmt   string
@@ -178,12 +176,7 @@ func TestSchemaConstraints(t *testing.T) {
 		{"challenge for unknown user", challenge + `(` + id + `, 'DU404', '', '', 'pending', 100, 160, NULL, NULL)`, false},
 		{"device for known user", `INSERT INTO devices (user_id, device_key, approval_key, attestation, fid, enrolled_at) VALUES ('DU1', x'01', x'02', x'03', 'fid', 1)`, true},
 		{"device for unknown user", `INSERT INTO devices (user_id, device_key, approval_key, attestation, fid, enrolled_at) VALUES ('DU404', x'01', x'02', x'03', 'fid', 1)`, false},
-		{"negative failed_attempts", `UPDATE users SET failed_attempts = -1 WHERE user_id = 'DU1'`, false},
 		{"negative pushes_since_success", `UPDATE users SET pushes_since_success = -1 WHERE user_id = 'DU1'`, false},
-		{"alert for a challenge", alertFor + `(x'0f0e0d0c0b0a09080706050403020100', 'DU1', ` + id + `, 100)`, true},
-		{"15-byte alert id", alertFor + `(x'0f0e0d0c0b0a090807060504030201', 'DU1', ` + id + `, 100)`, false},
-		{"alert for unknown recipient", alertFor + `(x'0f0e0d0c0b0a09080706050403020100', 'DU404', ` + id + `, 100)`, false},
-		{"alert for unknown challenge", alertFor + `(x'0f0e0d0c0b0a09080706050403020100', 'DU1', x'ffffffffffffffffffffffffffffffff', 100)`, false},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -199,27 +192,6 @@ func TestSchemaConstraints(t *testing.T) {
 				t.Fatal("accepted, want a constraint error")
 			}
 		})
-	}
-}
-
-func TestDeletingUserRemovesDeviceChallengesAndAlerts(t *testing.T) {
-	s, _ := openTemp(t)
-	for _, stmt := range []string{
-		`INSERT INTO users (user_id, username, created_at) VALUES ('DU1', 'alice', 1)`,
-		`INSERT INTO devices (user_id, device_key, approval_key, attestation, enrolled_at) VALUES ('DU1', x'01', x'02', x'03', 1)`,
-		`INSERT INTO challenges (id, user_id, ipaddr, pushinfo, created_at, expires_at) VALUES (x'00112233445566778899aabbccddeeff', 'DU1', '', '', 100, 160)`,
-		`INSERT INTO alerts (id, recipient_user_id, challenge_id, created_at) VALUES (x'0f0e0d0c0b0a09080706050403020100', 'DU1', x'00112233445566778899aabbccddeeff', 100)`,
-		`DELETE FROM users WHERE user_id = 'DU1'`,
-	} {
-		if _, err := s.db.Exec(stmt); err != nil {
-			t.Fatalf("%s: %v", stmt, err)
-		}
-	}
-	for _, table := range []string{"devices", "challenges", "alerts"} {
-		var n int
-		if err := s.db.QueryRow(`SELECT count(*) FROM ` + table).Scan(&n); err != nil || n != 0 {
-			t.Fatalf("%s rows after deleting the user = %d err:%v, want 0", table, n, err)
-		}
 	}
 }
 
@@ -381,7 +353,7 @@ func enrolled(t *testing.T) *Store {
 }
 
 // noLimits never refuses a push.
-var noLimits = Limits{PushCap: 1000, Cooldown: time.Second, MaxFailed: 1000}
+var noLimits = Limits{PushCap: 1000, Cooldown: time.Second}
 
 func challengeID(b byte) []byte { return []byte{b, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, b} }
 
@@ -418,7 +390,7 @@ func TestPendingChallengesAreTheUsersUnexpiredOnes(t *testing.T) {
 	pushTo(t, s, challengeID(2), aliceID, t0.Add(30*time.Second))
 	pushTo(t, s, challengeID(3), bobID, t0)
 	answered := pushTo(t, s, challengeID(4), aliceID, t0)
-	if err := s.AnswerChallenge(ctx, answered.ID, aliceID, Outcome{Status: ChallengeApproved}, t0, Fraud{}); err != nil {
+	if err := s.AnswerChallenge(ctx, answered.ID, aliceID, Outcome{Status: ChallengeApproved}, t0, NotMe{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -465,10 +437,10 @@ func TestAnswerChallengeOnce(t *testing.T) {
 			s := enrolled(t)
 			ctx := context.Background()
 			c := pushTo(t, s, challengeID(1), aliceID, t0)
-			if err := s.AnswerChallenge(ctx, c.ID, aliceID, answer, t0.Add(time.Second), Fraud{}); err != nil {
+			if err := s.AnswerChallenge(ctx, c.ID, aliceID, answer, t0.Add(time.Second), NotMe{}); err != nil {
 				t.Fatalf("first answer: %v", err)
 			}
-			if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeApproved}, t0.Add(2*time.Second), Fraud{}); !errors.Is(err, ErrChallengeNotPending) {
+			if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeApproved}, t0.Add(2*time.Second), NotMe{}); !errors.Is(err, ErrChallengeNotPending) {
 				t.Fatalf("second answer: %v, want ErrChallengeNotPending", err)
 			}
 			got, err := s.CloseChallenge(ctx, c.ID)
@@ -487,19 +459,19 @@ func TestAnswerChallengeRejected(t *testing.T) {
 	ctx := context.Background()
 	c := pushTo(t, s, challengeID(1), aliceID, t0)
 	approve := Outcome{Status: ChallengeApproved}
-	if err := s.AnswerChallenge(ctx, c.ID, bobID, approve, t0, Fraud{}); !errors.Is(err, ErrChallengeNotFound) {
+	if err := s.AnswerChallenge(ctx, c.ID, bobID, approve, t0, NotMe{}); !errors.Is(err, ErrChallengeNotFound) {
 		t.Fatalf("bob answering alice's challenge: %v, want ErrChallengeNotFound", err)
 	}
-	if err := s.AnswerChallenge(ctx, challengeID(9), aliceID, approve, t0, Fraud{}); !errors.Is(err, ErrChallengeNotFound) {
+	if err := s.AnswerChallenge(ctx, challengeID(9), aliceID, approve, t0, NotMe{}); !errors.Is(err, ErrChallengeNotFound) {
 		t.Fatalf("unknown challenge: %v, want ErrChallengeNotFound", err)
 	}
-	if err := s.AnswerChallenge(ctx, c.ID, aliceID, approve, c.ExpiresAt, Fraud{}); !errors.Is(err, ErrChallengeNotPending) {
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, approve, c.ExpiresAt, NotMe{}); !errors.Is(err, ErrChallengeNotPending) {
 		t.Fatalf("answer at expiry: %v, want ErrChallengeNotPending", err)
 	}
-	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeDenied}, t0, Fraud{}); err == nil {
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeDenied}, t0, NotMe{}); err == nil {
 		t.Fatal("deny without a reason accepted")
 	}
-	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeDenied, Reason: "bored"}, t0, Fraud{}); err == nil {
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeDenied, Reason: "bored"}, t0, NotMe{}); err == nil {
 		t.Fatal("deny with an unknown reason accepted")
 	}
 	if got := pendingIDs(t, s, aliceID, t0); len(got) != 1 {
@@ -518,7 +490,7 @@ func TestCloseChallengeExpiresPending(t *testing.T) {
 	if got != (Outcome{Status: ChallengeExpired}) {
 		t.Fatalf("CloseChallenge on a pending challenge = %+v, want expired", got)
 	}
-	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeApproved}, t0, Fraud{}); !errors.Is(err, ErrChallengeNotPending) {
+	if err := s.AnswerChallenge(ctx, c.ID, aliceID, Outcome{Status: ChallengeApproved}, t0, NotMe{}); !errors.Is(err, ErrChallengeNotPending) {
 		t.Fatalf("answer after close: %v, want ErrChallengeNotPending", err)
 	}
 }
@@ -610,5 +582,148 @@ func TestClearFIDKeepsNewerFID(t *testing.T) {
 	}
 	if got := fidOf(t, s, aliceID); got != "" {
 		t.Fatalf("FID after clearing it = %q, want empty", got)
+	}
+}
+
+// rowsOf counts table's rows for userID.
+func rowsOf(t *testing.T, s *Store, table, userID string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM `+table+` WHERE user_id = ?`, userID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestRemoveUserDeletesEverythingItsOwn: removal deletes the user, its device
+// and all its challenges, answered or not, and nothing of another user's.
+// The removed user then has no device to push to, and a second removal
+// finds nothing.
+func TestRemoveUserDeletesEverythingItsOwn(t *testing.T) {
+	s := enrolled(t)
+	ctx := context.Background()
+	approved := pushTo(t, s, challengeID(1), aliceID, t0)
+	if err := s.AnswerChallenge(ctx, approved.ID, aliceID, Outcome{Status: ChallengeApproved}, t0, NotMe{}); err != nil {
+		t.Fatal(err)
+	}
+	pending := pushTo(t, s, challengeID(2), aliceID, t0)
+	pushTo(t, s, challengeID(3), bobID, t0)
+
+	if err := s.RemoveUser(ctx, aliceID); err != nil {
+		t.Fatalf("RemoveUser: %v", err)
+	}
+	for _, table := range []string{"users", "devices", "challenges"} {
+		if n := rowsOf(t, s, table, aliceID); n != 0 {
+			t.Errorf("%s rows for alice after removal = %d, want 0", table, n)
+		}
+		if n := rowsOf(t, s, table, bobID); n == 0 {
+			t.Errorf("%s rows for bob after alice's removal = 0, want his kept", table)
+		}
+	}
+	if err := s.RemoveUser(ctx, aliceID); !errors.Is(err, ErrNoDevice) {
+		t.Fatalf("second RemoveUser: %v, want ErrNoDevice", err)
+	}
+	if _, err := s.StartPush(ctx, Challenge{ID: challengeID(4), UserID: aliceID, CreatedAt: t0, ExpiresAt: t0.Add(time.Minute)}, noLimits); !errors.Is(err, ErrNoDevice) {
+		t.Fatalf("StartPush for a removed user: %v, want ErrNoDevice", err)
+	}
+	if _, err := s.CloseChallenge(ctx, pending.ID); !errors.Is(err, ErrChallengeNotFound) {
+		t.Fatalf("CloseChallenge of a removed user's challenge: %v, want ErrChallengeNotFound", err)
+	}
+}
+
+func TestRemoveUserNeedsADevice(t *testing.T) {
+	s := enrolling(t)
+	if err := s.RemoveUser(context.Background(), aliceID); !errors.Is(err, ErrNoDevice) {
+		t.Fatalf("RemoveUser before enrollment: %v, want ErrNoDevice", err)
+	}
+	if got, err := s.EnrollmentStatusOf(context.Background(), aliceID, aliceCode, t0); err != nil || got != EnrollmentWaiting {
+		t.Fatalf("enrollment after a refused removal: %q %v, want waiting", got, err)
+	}
+}
+
+// TestDeleteChallengesBefore deletes challenges that expired before the
+// cutoff, answered or not, and keeps the rest.
+func TestDeleteChallengesBefore(t *testing.T) {
+	s := enrolled(t)
+	ctx := context.Background()
+	old := pushTo(t, s, challengeID(1), aliceID, t0)
+	if err := s.AnswerChallenge(ctx, old.ID, aliceID, Outcome{Status: ChallengeDenied, Reason: "not_me"}, t0, NotMe{Count: 1, Window: time.Hour, Pause: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	pushTo(t, s, challengeID(2), bobID, t0)
+	edge := pushTo(t, s, challengeID(3), aliceID, t0.Add(time.Second))
+
+	n, err := s.DeleteChallengesBefore(ctx, edge.ExpiresAt)
+	if err != nil || n != 2 {
+		t.Fatalf("DeleteChallengesBefore = %d %v, want 2", n, err)
+	}
+	if got := rowsOf(t, s, "challenges", aliceID) + rowsOf(t, s, "challenges", bobID); got != 1 {
+		t.Fatalf("challenges left = %d, want only the one expiring at the cutoff", got)
+	}
+	if _, err := s.CloseChallenge(ctx, edge.ID); err != nil {
+		t.Fatalf("challenge expiring at the cutoff: %v, want it kept", err)
+	}
+}
+
+// notMe answers a new challenge for alice with not_me at at.
+func notMe(t *testing.T, s *Store, b byte, at time.Time, policy NotMe) {
+	t.Helper()
+	c := pushTo(t, s, challengeID(b), aliceID, at)
+	if err := s.AnswerChallenge(context.Background(), c.ID, aliceID, Outcome{Status: ChallengeDenied, Reason: "not_me"}, at, policy); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// pausedAt reports whether alice's pushes are paused at at.
+func pausedAt(t *testing.T, s *Store, b byte, at time.Time) bool {
+	t.Helper()
+	lock, err := s.StartPush(context.Background(), Challenge{ID: challengeID(b), UserID: aliceID, CreatedAt: at, ExpiresAt: at.Add(time.Minute)}, noLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lock == LockPaused
+}
+
+func TestNotMeCountWithinWindowPauses(t *testing.T) {
+	policy := NotMe{Count: 3, Window: time.Hour, Pause: 30 * time.Minute}
+	for _, tc := range []struct {
+		name  string
+		third time.Duration
+		pause bool
+	}{
+		{"third just inside the window", time.Hour - time.Second, true},
+		{"third at the window", time.Hour, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := enrolled(t)
+			notMe(t, s, 1, t0, policy)
+			notMe(t, s, 2, t0.Add(time.Minute), policy)
+			if pausedAt(t, s, 3, t0.Add(2*time.Minute)) {
+				t.Fatal("paused after 2 not_me denies, want 3")
+			}
+			at := t0.Add(tc.third)
+			notMe(t, s, 4, at, policy)
+			if got := pausedAt(t, s, 5, at); got != tc.pause {
+				t.Fatalf("paused after the third not_me = %v, want %v", got, tc.pause)
+			}
+		})
+	}
+}
+
+func TestApprovalDoesNotResetNotMeCount(t *testing.T) {
+	policy := NotMe{Count: 2, Window: time.Hour, Pause: 30 * time.Minute}
+	s := enrolled(t)
+	notMe(t, s, 1, t0, policy)
+	ok := pushTo(t, s, challengeID(2), aliceID, t0.Add(time.Minute))
+	if err := s.AnswerChallenge(context.Background(), ok.ID, aliceID, Outcome{Status: ChallengeApproved}, t0.Add(time.Minute), policy); err != nil {
+		t.Fatal(err)
+	}
+	at := t0.Add(2 * time.Minute)
+	notMe(t, s, 3, at, policy)
+	if !pausedAt(t, s, 4, at) {
+		t.Fatal("not paused after not_me, approve, not_me")
+	}
+	if !pausedAt(t, s, 5, at.Add(30*time.Minute-time.Second)) || pausedAt(t, s, 6, at.Add(30*time.Minute)) {
+		t.Fatal("pause does not last exactly Pause")
 	}
 }

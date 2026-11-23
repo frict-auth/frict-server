@@ -16,6 +16,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sync"
 	"time"
@@ -49,32 +50,23 @@ type Store interface {
 	StartPush(ctx context.Context, c store.Challenge, lim store.Limits) (store.Lock, error)
 	PendingChallenges(ctx context.Context, userID string, now time.Time) ([]store.Challenge, error)
 	PendingChallenge(ctx context.Context, id []byte, userID string, now time.Time) (store.Challenge, error)
-	AnswerChallenge(ctx context.Context, id []byte, userID string, answer store.Outcome, now time.Time, fraud store.Fraud) error
+	AnswerChallenge(ctx context.Context, id []byte, userID string, answer store.Outcome, now time.Time, notMe store.NotMe) error
 	CloseChallenge(ctx context.Context, id []byte) (store.Outcome, error)
-	Alerts(ctx context.Context, recipientUserID string, since time.Time) ([]store.Alert, error)
-	AlertRecipients(ctx context.Context, challengeID []byte) ([]store.AlertRecipient, error)
+	RemoveUser(ctx context.Context, userID string) error
 }
 
-// Safeguards limit pushes and say what a not_me deny does
+// Safeguards limit pushes and say when not_me denies pause them
 // (docs/PLAN.md Safeguards). Durations are whole seconds.
 type Safeguards struct {
 	// PushCap pushes since a user's last successful login, after which
 	// the user gets one push per PushCooldown.
 	PushCap      int
 	PushCooldown time.Duration
-	// MaxFailed denies and timeouts since the last successful login
-	// disable the device until it is re-enrolled.
-	MaxFailed int
-	// Pause is how long a not_me deny stops pushes to that user.
-	Pause time.Duration
-	// AlertRecipients are the Authentik usernames whose enrolled devices
-	// get an alert on every not_me deny.
-	AlertRecipients []string
-	// AlertTTL is how long an alert is listed in /device/v1/pending.
-	AlertTTL time.Duration
-	// AuthentikURL is Authentik's base URL, e.g. https://auth.example, for
-	// the alert's links into its admin UI.
-	AuthentikURL string
+	// NotMeCount not_me denies within NotMeWindow stop pushes to that
+	// user for Pause.
+	NotMeCount  int
+	NotMeWindow time.Duration
+	Pause       time.Duration
 }
 
 // Server serves one Authentik Duo stage. The verifier's Host is the API
@@ -84,6 +76,7 @@ type Server struct {
 	store        Store
 	challengeTTL time.Duration
 	safeguards   Safeguards
+	trusted      []netip.Prefix
 	sender       push.Sender
 	log          *slog.Logger
 
@@ -95,9 +88,10 @@ type Server struct {
 
 // New returns a Server whose pushes expire challengeTTL after /auth/v2/auth
 // creates them. challengeTTL is whole seconds, since the store keeps
-// timestamps in seconds. A nil sender sends no pushes: devices poll.
-func New(v duosig.Verifier, st Store, challengeTTL time.Duration, sg Safeguards, sender push.Sender, log *slog.Logger) *Server {
-	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, safeguards: sg, sender: sender, log: log, answered: map[string]chan struct{}{}}
+// timestamps in seconds. Forwarding headers name the client only on
+// requests from a trusted proxy. A nil sender sends no pushes: devices poll.
+func New(v duosig.Verifier, st Store, challengeTTL time.Duration, sg Safeguards, trusted []netip.Prefix, sender push.Sender, log *slog.Logger) *Server {
+	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, safeguards: sg, trusted: trusted, sender: sender, log: log, answered: map[string]chan struct{}{}}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -111,6 +105,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /device/v1/challenge", s.deviceChallenge)
 	mux.HandleFunc("POST /device/v1/answer", s.deviceAnswer)
 	mux.HandleFunc("POST /device/v1/fid", s.deviceFID)
+	mux.HandleFunc("POST /device/v1/remove", s.deviceRemove)
 	return mux
 }
 
@@ -132,11 +127,12 @@ func (s *Server) duoSigned(next http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 		if err != nil {
+			s.security(r, evDuoRequest, "unreadable_body", "")
 			duoFail(w, http.StatusBadRequest, 40002, "Invalid request body")
 			return
 		}
 		if err := s.verifier.Verify(r, body); err != nil {
-			s.log.Warn("duo signature rejected", "path", r.URL.Path, "reason", err.Error())
+			s.security(r, evDuoSignature, duoReason(err), duoUserID(body))
 			duoFail(w, http.StatusUnauthorized, 40103, "Invalid signature in request credentials")
 			return
 		}
@@ -159,6 +155,7 @@ func duoParams(r *http.Request) (map[string]string, error) {
 func (s *Server) duoEnroll(w http.ResponseWriter, r *http.Request) {
 	p, err := duoParams(r)
 	if err != nil || p["username"] == "" {
+		s.security(r, evDuoRequest, "bad_params", "")
 		duoFail(w, http.StatusBadRequest, 40002, "Missing required request parameters: username")
 		return
 	}
@@ -192,6 +189,7 @@ func (s *Server) duoEnroll(w http.ResponseWriter, r *http.Request) {
 func (s *Server) duoEnrollStatus(w http.ResponseWriter, r *http.Request) {
 	p, err := duoParams(r)
 	if err != nil || p["user_id"] == "" || p["activation_code"] == "" {
+		s.security(r, evDuoRequest, "bad_params", p["user_id"])
 		duoFail(w, http.StatusBadRequest, 40002, "Missing required request parameters: user_id, activation_code")
 		return
 	}
@@ -238,6 +236,7 @@ type enrollRequest struct {
 func (s *Server) deviceEnroll(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
+		s.security(r, evDeviceRequest, "unreadable_body", devicesig.ClaimedUserID(r.Header.Get("Authorization")))
 		deviceFail(w, http.StatusBadRequest, "bad_request")
 		return
 	}
@@ -251,7 +250,8 @@ func (s *Server) deviceEnroll(w http.ResponseWriter, r *http.Request) {
 		return key, perr
 	})
 	if err != nil {
-		s.log.Warn("device enroll rejected", "reason", err.Error())
+		event, reason := deviceRejection(err)
+		s.security(r, event, reason, devicesig.ClaimedUserID(r.Header.Get("Authorization")))
 		deviceFail(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -259,7 +259,8 @@ func (s *Server) deviceEnroll(w http.ResponseWriter, r *http.Request) {
 	err = s.store.Enroll(r.Context(), req.ActivationCode, userID, dev)
 	switch {
 	case errors.Is(err, store.ErrActivationInvalid), errors.Is(err, store.ErrActivationUsed), errors.Is(err, store.ErrUserMismatch):
-		s.log.Warn("device enroll rejected", "user_id", userID, "reason", err.Error())
+		event, reason := deviceRejection(err)
+		s.security(r, event, reason, userID)
 		deviceFail(w, http.StatusUnauthorized, "unauthorized")
 		return
 	case err != nil:

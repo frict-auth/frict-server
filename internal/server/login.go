@@ -5,12 +5,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/rand"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
-	"strings"
 	"time"
 
 	"github.com/frict-auth/frict-server/internal/devicesig"
@@ -24,14 +21,17 @@ import (
 func (s *Server) duoAuth(w http.ResponseWriter, r *http.Request) {
 	p, err := duoParams(r)
 	if err != nil {
+		s.security(r, evDuoRequest, "bad_params", "")
 		duoFail(w, http.StatusBadRequest, 40002, "Invalid request parameters")
 		return
 	}
 	if p["async"] == "1" {
+		s.security(r, evDuoRequest, "bad_params", p["user_id"])
 		duoFail(w, http.StatusBadRequest, 40002, "Invalid request parameters: async is not supported")
 		return
 	}
 	if p["factor"] != "auto" && p["factor"] != "push" {
+		s.security(r, evDuoRequest, "bad_params", p["user_id"])
 		duoFail(w, http.StatusBadRequest, 40002, "Invalid request parameters: factor must be auto or push")
 		return
 	}
@@ -55,12 +55,11 @@ func (s *Server) duoAuth(w http.ResponseWriter, r *http.Request) {
 	// CloseChallenge below, or it stays pending for the device until it
 	// expires.
 	lock, err := s.store.StartPush(context.WithoutCancel(r.Context()), c, store.Limits{
-		PushCap: s.safeguards.PushCap, Cooldown: s.safeguards.PushCooldown, MaxFailed: s.safeguards.MaxFailed,
+		PushCap: s.safeguards.PushCap, Cooldown: s.safeguards.PushCooldown,
 	})
 	switch {
 	case errors.Is(err, store.ErrNoDevice):
-		s.log.Warn("auth for a user without a device", "user_id", userID)
-		duoFail(w, http.StatusBadRequest, 40002, "Invalid request parameters: user_id")
+		s.unknownUser(w, r, userID)
 		return
 	case err != nil:
 		s.log.Error("auth: store", "err", err)
@@ -82,6 +81,10 @@ func (s *Server) duoAuth(w http.ResponseWriter, r *http.Request) {
 	case <-r.Context().Done():
 	}
 	out, err := s.store.CloseChallenge(context.WithoutCancel(r.Context()), id)
+	if errors.Is(err, store.ErrChallengeNotFound) {
+		s.unknownUser(w, r, userID)
+		return
+	}
 	if err != nil {
 		s.log.Error("auth: store", "err", err)
 		duoFail(w, http.StatusInternalServerError, 50000, "Internal error")
@@ -93,6 +96,13 @@ func (s *Server) duoAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("challenge closed", "user_id", userID, "challenge_id", encodeID(id), "status", string(out.Status), "reason", out.Reason)
 	duoOK(w, duoResult(out))
+}
+
+// unknownUser answers /auth for a user_id with no device, never enrolled or
+// removed, as Duo answers an unknown user: 400, code 40002.
+func (s *Server) unknownUser(w http.ResponseWriter, r *http.Request, userID string) {
+	s.security(r, evDuoRequest, "unknown_user", userID)
+	duoFail(w, http.StatusBadRequest, 40002, "Invalid request parameters: user_id")
 }
 
 // duoResult is the /auth response for a challenge's outcome, in Duo's
@@ -120,9 +130,8 @@ func duoResult(o store.Outcome) map[string]string {
 // it in its login_failed event with the rest of the response.
 func lockedOut(l store.Lock) map[string]string {
 	msg := map[store.Lock]string{
-		store.LockDisabled: "Device disabled after too many failed attempts; re-enroll it.",
-		store.LockPaused:   "Pushes paused after a sign-in was reported as fraudulent.",
-		store.LockCapped:   "Too many pushes since the last successful login; try again later.",
+		store.LockPaused: "Pushes paused after sign-ins were reported as fraudulent.",
+		store.LockCapped: "Too many pushes since the last successful login; try again later.",
 	}[l]
 	return map[string]string{"result": "deny", "status": "locked_out", "status_msg": msg}
 }
@@ -165,6 +174,7 @@ func decodeID(s string) ([]byte, bool) {
 func (s *Server) deviceSigned(w http.ResponseWriter, r *http.Request, keyOf func(store.Device) []byte) (userID string, body []byte, ok bool) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
+		s.security(r, evDeviceRequest, "unreadable_body", devicesig.ClaimedUserID(r.Header.Get("Authorization")))
 		deviceFail(w, http.StatusBadRequest, "bad_request")
 		return "", nil, false
 	}
@@ -176,7 +186,8 @@ func (s *Server) deviceSigned(w http.ResponseWriter, r *http.Request, keyOf func
 		return p256FromDER(keyOf(d))
 	})
 	if err != nil {
-		s.log.Warn("device request rejected", "path", r.URL.Path, "reason", err.Error())
+		event, reason := deviceRejection(err)
+		s.security(r, event, reason, devicesig.ClaimedUserID(r.Header.Get("Authorization")))
 		deviceFail(w, http.StatusUnauthorized, "unauthorized")
 		return "", nil, false
 	}
@@ -193,11 +204,10 @@ func (s *Server) devicePending(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := decodeStrict(body, &struct{}{}); err != nil {
-		deviceFail(w, http.StatusBadRequest, "bad_request")
+		s.badRequest(w, r, userID)
 		return
 	}
-	now := s.verifier.Now()
-	cs, err := s.store.PendingChallenges(r.Context(), userID, now)
+	cs, err := s.store.PendingChallenges(r.Context(), userID, s.verifier.Now())
 	if err != nil {
 		s.log.Error("pending: store", "err", err)
 		deviceFail(w, http.StatusInternalServerError, "internal")
@@ -207,41 +217,13 @@ func (s *Server) devicePending(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cs {
 		ids = append(ids, encodeID(c.ID))
 	}
-	as, err := s.store.Alerts(r.Context(), userID, now.Add(-s.safeguards.AlertTTL+time.Second))
-	if err != nil {
-		s.log.Error("pending: store", "err", err)
-		deviceFail(w, http.StatusInternalServerError, "internal")
-		return
-	}
-	alerts := []map[string]any{}
-	for _, a := range as {
-		admin := AuthentikUserURL(s.safeguards.AuthentikURL, a.DisplayUsername)
-		alerts = append(alerts, map[string]any{
-			"alert_id":            encodeID(a.ID),
-			"username":            a.DisplayUsername,
-			"ipaddr":              a.IPAddr,
-			"pushinfo":            a.PushInfo,
-			"type":                a.Type,
-			"attempted":           a.AttemptedAt.Unix(),
-			"reported":            a.ReportedAt.Unix(),
-			"reset_password_url":  admin,
-			"revoke_sessions_url": admin,
-		})
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"challenge_ids": ids, "poll_interval": PollInterval, "alerts": alerts})
+	writeJSON(w, http.StatusOK, map[string]any{"challenge_ids": ids, "poll_interval": PollInterval})
 }
 
-// AuthentikUserURL opens Authentik's admin user list filtered to username.
-// That row carries both alert actions: Recovery's "Set password" and
-// "Create recovery link", and the "Revoke Sessions" bulk action
-// (web/src/admin/users/UserListPage.ts in 2026.8.5). A user's own page needs
-// the user's primary key, which Frict cannot look up without an Authentik
-// API token. The list reads its search from the route parameter
-// "ak-user-list-search", JSON after ";" in the hash, URI-encoded
-// (web/src/elements/table/Table.ts, web/src/elements/router/RouteMatch.ts).
-func AuthentikUserURL(base, username string) string {
-	params, _ := json.Marshal(map[string]string{"ak-user-list-search": username})
-	return strings.TrimRight(base, "/") + "/if/admin/#/identity/users;" + url.PathEscape(string(params))
+// badRequest answers a verified device request whose body is malformed.
+func (s *Server) badRequest(w http.ResponseWriter, r *http.Request, userID string) {
+	s.security(r, evDeviceRequest, "bad_request", userID)
+	deviceFail(w, http.StatusBadRequest, "bad_request")
 }
 
 type challengeRequest struct {
@@ -261,11 +243,12 @@ func (s *Server) deviceChallenge(w http.ResponseWriter, r *http.Request) {
 		id, valid = decodeID(req.ChallengeID)
 	}
 	if !valid {
-		deviceFail(w, http.StatusBadRequest, "bad_request")
+		s.badRequest(w, r, userID)
 		return
 	}
 	c, err := s.store.PendingChallenge(r.Context(), id, userID, s.verifier.Now())
 	if errors.Is(err, store.ErrChallengeNotFound) {
+		s.security(r, evDeviceRequest, "challenge_not_found", userID)
 		deviceFail(w, http.StatusNotFound, "not_found")
 		return
 	} else if err != nil {
@@ -319,18 +302,18 @@ func (s *Server) deviceAnswer(w http.ResponseWriter, r *http.Request) {
 	}
 	id, answer, ok := parseAnswer(body)
 	if !ok {
-		deviceFail(w, http.StatusBadRequest, "bad_request")
+		s.badRequest(w, r, userID)
 		return
 	}
-	now := s.verifier.Now()
-	fraud := store.Fraud{PausedUntil: now.Add(s.safeguards.Pause), AlertRecipients: s.safeguards.AlertRecipients}
-	err := s.store.AnswerChallenge(r.Context(), id, userID, answer, now, fraud)
+	notMe := store.NotMe{Count: s.safeguards.NotMeCount, Window: s.safeguards.NotMeWindow, Pause: s.safeguards.Pause}
+	err := s.store.AnswerChallenge(r.Context(), id, userID, answer, s.verifier.Now(), notMe)
 	switch {
 	case errors.Is(err, store.ErrChallengeNotFound):
+		s.security(r, evDeviceRequest, "challenge_not_found", userID)
 		deviceFail(w, http.StatusNotFound, "not_found")
 		return
 	case errors.Is(err, store.ErrChallengeNotPending):
-		s.log.Warn("answer for a closed challenge", "user_id", userID, "challenge_id", encodeID(id))
+		s.security(r, evDeviceRequest, "challenge_not_pending", userID)
 		deviceFail(w, http.StatusConflict, "not_pending")
 		return
 	case err != nil:
@@ -340,8 +323,5 @@ func (s *Server) deviceAnswer(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Info("challenge answered", "user_id", userID, "challenge_id", encodeID(id), "status", string(answer.Status), "reason", answer.Reason)
 	s.wakeAuth(id)
-	if answer.Reason == "not_me" {
-		s.pushAlerts(r.Context(), id)
-	}
 	writeJSON(w, http.StatusOK, struct{}{})
 }

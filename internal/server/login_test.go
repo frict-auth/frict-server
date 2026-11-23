@@ -437,3 +437,14 @@ func TestDeviceEnrollConcurrentSameCode(t *testing.T) {
 		t.Fatalf("status counts %v, want one 200 and %d 401", count, racers-1)
 	}
 }
+
+// TestPendingAnswersOnlyChallengesAndInterval: the poll's answer has exactly
+// its two documented fields, after a not_me deny too.
+func TestPendingAnswersOnlyChallengesAndInterval(t *testing.T) {
+	f := newFixture(t)
+	f.enrolledPhone("admin")
+	a, phone := f.enrolledPhone("alice")
+	f.push(a, phone, "deny", "not_me", "fraud")
+	w := f.serve(must[*http.Request](t)(phone.PendingRequest(a, f.now())))
+	wantStatus(t, "pending", w, http.StatusOK, `{"challenge_ids":[],"poll_interval":5}`)
+}

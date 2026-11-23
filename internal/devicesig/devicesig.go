@@ -28,9 +28,21 @@ const (
 var (
 	ErrMissingCredentials = errors.New("missing Authorization header")
 	ErrMalformedHeader    = errors.New("malformed Authorization header")
+	ErrMalformedUserID    = fmt.Errorf("%w: user_id", ErrMalformedHeader)
 	ErrStale              = errors.New("unix_seconds outside allowed clock skew")
 	ErrBadSignature       = errors.New("signature does not verify")
+	ErrWrongEndpoint      = fmt.Errorf("%w: signed for another endpoint", ErrBadSignature)
 )
+
+// Paths are the device API's endpoints.
+var Paths = []string{
+	"/device/v1/enroll",
+	"/device/v1/pending",
+	"/device/v1/challenge",
+	"/device/v1/answer",
+	"/device/v1/fid",
+	"/device/v1/remove",
+}
 
 // KeyFunc returns the public key that must have signed a request carrying
 // userID in its Authorization header.
@@ -38,7 +50,8 @@ type KeyFunc func(userID string) (*ecdsa.PublicKey, error)
 
 // Verify checks r's Authorization header against body, in the order the
 // protocol fixes: header format, freshness against now, then the signature
-// with the key keyFor returns. It returns the header's user_id.
+// with the key keyFor returns. It returns the header's user_id. A signature
+// that is valid for another of Paths is ErrWrongEndpoint.
 func Verify(r *http.Request, body []byte, now time.Time, keyFor KeyFunc) (string, error) {
 	userID, unix, sig, err := parseAuthorization(r.Header.Get("Authorization"))
 	if err != nil {
@@ -51,11 +64,31 @@ func Verify(r *http.Request, body []byte, now time.Time, keyFor KeyFunc) (string
 	if err != nil {
 		return "", err
 	}
-	digest := sha256.Sum256(SignedBytes(userID, unix, r.URL.Path, body))
-	if !ecdsa.VerifyASN1(key, digest[:], sig) {
+	if !verifies(key, sig, SignedBytes(userID, unix, r.URL.Path, body)) {
+		for _, p := range Paths {
+			if p != r.URL.Path && verifies(key, sig, SignedBytes(userID, unix, p, body)) {
+				return "", ErrWrongEndpoint
+			}
+		}
 		return "", ErrBadSignature
 	}
 	return userID, nil
+}
+
+func verifies(key *ecdsa.PublicKey, sig, signed []byte) bool {
+	digest := sha256.Sum256(signed)
+	return ecdsa.VerifyASN1(key, digest[:], sig)
+}
+
+// ClaimedUserID returns the user_id an Authorization header names, if it is
+// well formed, whether or not the request verifies.
+func ClaimedUserID(h string) string {
+	creds, _ := strings.CutPrefix(h, scheme)
+	id, _, _ := strings.Cut(creds, ":")
+	if !ValidUserID(id) {
+		return ""
+	}
+	return id
 }
 
 // SignedBytes is the byte string a device signs for one request.
@@ -91,7 +124,7 @@ func parseAuthorization(h string) (userID string, unix int64, sig []byte, err er
 		return "", 0, nil, fmt.Errorf("%w: want user_id:unix_seconds:signature", ErrMalformedHeader)
 	}
 	if !ValidUserID(parts[0]) {
-		return "", 0, nil, fmt.Errorf("%w: user_id", ErrMalformedHeader)
+		return "", 0, nil, ErrMalformedUserID
 	}
 	if !allDigits(parts[1]) || len(parts[1]) > 12 {
 		return "", 0, nil, fmt.Errorf("%w: unix_seconds", ErrMalformedHeader)

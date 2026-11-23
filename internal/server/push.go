@@ -14,8 +14,7 @@ import (
 const pushTimeout = 30 * time.Second
 
 // wake pushes data to userID's device in the background. Nothing waits on
-// the result: a device that misses a push finds its challenges and alerts
-// by polling /device/v1/pending. Close waits for pushes in flight.
+// the result: a device that misses a push finds its challenges by polling /device/v1/pending. Close waits for pushes in flight.
 func (s *Server) wake(userID string, data map[string]string) {
 	if s.sender == nil {
 		return
@@ -53,19 +52,6 @@ func (s *Server) wake(userID string, data map[string]string) {
 // handling requests.
 func (s *Server) Close() { s.pushes.Wait() }
 
-// pushAlerts wakes each recipient of the alerts a not_me deny of
-// challengeID created.
-func (s *Server) pushAlerts(ctx context.Context, challengeID []byte) {
-	rs, err := s.store.AlertRecipients(ctx, challengeID)
-	if err != nil {
-		s.log.Error("push alerts: store", "challenge_id", encodeID(challengeID), "err", err)
-		return
-	}
-	for _, r := range rs {
-		s.wake(r.UserID, map[string]string{"alert_id": encodeID(r.AlertID)})
-	}
-}
-
 type fidRequest struct {
 	FID string `json:"fid"`
 }
@@ -79,12 +65,13 @@ func (s *Server) deviceFID(w http.ResponseWriter, r *http.Request) {
 	}
 	var req fidRequest
 	if err := decodeStrict(body, &req); err != nil || req.FID == "" {
-		deviceFail(w, http.StatusBadRequest, "bad_request")
+		s.badRequest(w, r, userID)
 		return
 	}
 	err := s.store.SetFID(r.Context(), userID, req.FID)
 	switch {
 	case errors.Is(err, store.ErrNoDevice):
+		s.security(r, evDeviceSignature, "unknown_device", userID)
 		deviceFail(w, http.StatusUnauthorized, "unauthorized")
 		return
 	case err != nil:

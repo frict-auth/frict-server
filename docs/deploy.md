@@ -78,10 +78,10 @@ Repeat it when `deploy/` changes; the workflow doesn't.
 |---|---|---|
 | `FRICT_API_HOSTNAME` | `api.frict.app` | `frict.env`, required |
 | `FRICT_CLIENT_ID` | Duo stage client ID | `frict.env`, required |
-| `FRICT_AUTHENTIK_URL` | `https://auth.itsalwaysreefreemas.org` | `frict.env`, required |
+| `FRICT_TRUSTED_PROXIES` | gateway of the `frict_default` network (`docker network inspect frict_default`) | `frict.env` |
 | `FRICT_FCM_PROJECT_ID` | prod Firebase project | `frict.env`, both or neither |
 | `FRICT_FCM_CREDENTIALS_FILE` | `/secrets/fcm-sa.json` | `frict.env`, both or neither |
-| `FRICT_CHALLENGE_TTL`, `FRICT_PUSH_CAP`, `FRICT_PUSH_COOLDOWN`, `FRICT_MAX_FAILED`, `FRICT_PAUSE`, `FRICT_ALERT_RECIPIENTS`, `FRICT_ALERT_TTL` | default if unset | `frict.env`, optional |
+| `FRICT_CHALLENGE_TTL`, `FRICT_PUSH_CAP`, `FRICT_PUSH_COOLDOWN`, `FRICT_NOT_ME_COUNT`, `FRICT_NOT_ME_WINDOW`, `FRICT_PAUSE` | default if unset | `frict.env`, optional |
 | `FRICT_LISTEN`, `FRICT_DB_PATH`, `FRICT_CLIENT_SECRET_FILE` | fixed | `compose.yaml` |
 
 No variable is itself secret. The secrets are two files in
