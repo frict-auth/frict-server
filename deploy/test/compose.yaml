@@ -21,7 +21,7 @@ services:
     build: .
     privileged: true
     volumes:
-      - ..:/deploy:ro
+      - ..:/src/deploy:ro
       - ${CERTS:?}/ca.pem:/etc/docker/certs.d/ghcr.io/ca.crt:ro
       - /var/lib/docker
       - /var/lib/containerd
