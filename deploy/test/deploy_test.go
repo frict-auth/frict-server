@@ -290,6 +290,7 @@ func up(t *testing.T) *stack {
 			must(t, "", nil, "docker", append([]string{"image", "rm", "--no-prune"}, s.images...)...)
 		}
 	})
+	s.compose(t, "down", "--volumes", "--remove-orphans")
 	s.compose(t, "up", "--build", "--detach")
 	s.registry = s.compose(t, "port", "registry", "443")
 
