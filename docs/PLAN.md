@@ -521,7 +521,7 @@ host.
   `chat-relay.`.
 - Authentik server and worker: the host's system CA bundle mounted over
   `duo_client`'s `ca_certs.pem` (appendix).
-- `/home/deploy/frict/{data,secrets}` owned by uid 65532; FCM key at
+- `/srv/frict/{data,secrets}` owned by uid 65532; FCM key at
   `secrets/fcm-sa.json`, mode 0400. `docs/deploy.md` sets these up.
 - Deploy check: `scripts/duo-tls-check.sh` against `https://api.frict.app`
   in the Authentik server and worker (appendix).
