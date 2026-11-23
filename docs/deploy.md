@@ -101,11 +101,11 @@ Expect `frict-deploy` alone, then `(root) NOPASSWD: /usr/local/bin/frict-deploy 
 |---|---|---|
 | `FRICT_API_HOSTNAME` | `api.frict.app` | `frict.env`, required |
 | `FRICT_CLIENT_ID` | Duo stage client ID | `frict.env`, required |
-| `FRICT_TRUSTED_PROXIES` | gateway of the `frict_default` network (`docker network inspect frict_default`) | `frict.env` |
 | `FRICT_FCM_PROJECT_ID` | prod Firebase project | `frict.env`, both or neither |
 | `FRICT_FCM_CREDENTIALS_FILE` | `/secrets/fcm-sa.json` | `frict.env`, both or neither |
 | `FRICT_CHALLENGE_TTL`, `FRICT_PUSH_CAP`, `FRICT_PUSH_COOLDOWN`, `FRICT_NOT_ME_COUNT`, `FRICT_NOT_ME_WINDOW`, `FRICT_PAUSE` | default if unset | `frict.env`, optional |
 | `FRICT_LISTEN`, `FRICT_DB_PATH`, `FRICT_CLIENT_SECRET_FILE` | fixed | `compose.yaml` |
+| `FRICT_TRUSTED_PROXIES` | `10.231.0.1`, the gateway of the network `compose.yaml` pins | `compose.yaml` |
 
 No variable is itself secret. The secrets are two files in
 `/srv/frict/secrets/`, `65532:65532`, mode 0400: `duo-client-secret`
