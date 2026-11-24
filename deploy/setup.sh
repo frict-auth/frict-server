@@ -42,8 +42,33 @@ fi
 secret=$dir/secrets/duo-client-secret
 [[ -e $secret ]] || openssl rand -hex 20 | install -o 65532 -g 65532 -m 0400 /dev/stdin "$secret"
 env=$dir/frict.env
-[[ -e $env ]] || printf 'FRICT_API_HOSTNAME=%s\nFRICT_CLIENT_ID=DI%s\n' "$host" "$(openssl rand -hex 9 | tr a-f A-F)" |
-  install -o root -g root -m 0600 /dev/stdin "$env"
+[[ -e $env ]] || install -o root -g root -m 0600 /dev/stdin "$env" <<ENV
+# frict-server's configuration. cmd/frict-server/main.go documents each variable.
+# compose.yaml sets FRICT_LISTEN, FRICT_DB_PATH, FRICT_CLIENT_SECRET_FILE and FRICT_TRUSTED_PROXIES; its values win over this file.
+
+# Needed now: the API hostname typed into Authentik's Duo stage.
+FRICT_API_HOSTNAME=$host
+# Needed now: the client ID typed into Authentik's Duo stage, with the secret in $secret.
+FRICT_CLIENT_ID=DI$(openssl rand -hex 9 | tr a-f A-F)
+
+# Only for push, later: the Firebase project to push through. Set both FCM lines or neither.
+#FRICT_FCM_PROJECT_ID=
+# Only for push, later: its FCM sender key, saved as $dir/secrets/fcm-sa.json.
+#FRICT_FCM_CREDENTIALS_FILE=/secrets/fcm-sa.json
+
+# Optional, default 60s: how long a push waits for the device's answer, 60s to 120s.
+#FRICT_CHALLENGE_TTL=60s
+# Optional, default 10: pushes since a user's last successful login before the cooldown applies.
+#FRICT_PUSH_CAP=10
+# Optional, default 15m: once over the cap, the least time between pushes.
+#FRICT_PUSH_COOLDOWN=15m
+# Optional, default 2: "I didn't start this" answers that pause the user's pushes ...
+#FRICT_NOT_ME_COUNT=2
+# Optional, default 60m: ... when given within this long.
+#FRICT_NOT_ME_WINDOW=60m
+# Optional, default 30m: how long the pause lasts.
+#FRICT_PAUSE=30m
+ENV
 
 echo "Installed $user and $dir."
 if [[ ! -s $home/.ssh/authorized_keys ]]; then
