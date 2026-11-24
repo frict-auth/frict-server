@@ -1,7 +1,7 @@
 //go:build deploy
 
 // Package deploy runs deploy.yml's own build, push and deploy steps against a
-// registry and a box in containers: a real sshd with docs/deploy.md's forced
+// registry and a deployment server in containers: a real sshd with docs/deploy.md's forced
 // command, a real Docker daemon, and frict-deploy as it runs in production.
 package deploy
 
@@ -11,9 +11,11 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
@@ -31,7 +33,7 @@ import (
 
 const (
 	imageRepo = "frict-auth/frict-server"
-	boxDir    = "/srv/frict"
+	srvDir    = "/srv/frict"
 	enrolled  = "user-enrolled-before-any-deploy"
 )
 
@@ -90,9 +92,12 @@ type stack struct {
 	env      []string // for docker compose
 	registry string   // host:port of the registry as the host sees it
 	key      string
-	hosts    string // known_hosts line of the box
+	hosts    string // known_hosts line of the deployment server
 	base     int    // app.frict.main-commit of the image the workflow built
 	images   []string
+	// installOut is what the first install printed; fresh is installed() after it.
+	installOut, fresh string
+	frictEnv          string // frict.env as the first install wrote it
 }
 
 func (s *stack) compose(t *testing.T, args ...string) string {
@@ -100,17 +105,17 @@ func (s *stack) compose(t *testing.T, args ...string) string {
 	return must(t, "", s.env, "docker", append([]string{"compose"}, args...)...)
 }
 
-// box runs a root shell script on the box.
-func (s *stack) box(t *testing.T, script string) string {
+// server runs a root shell script on the deployment server.
+func (s *stack) server(t *testing.T, script string) string {
 	t.Helper()
-	return must(t, script, s.env, "docker", "compose", "exec", "-T", "box", "bash", "-euo", "pipefail", "-s")
+	return must(t, script, s.env, "docker", "compose", "exec", "-T", "server", "bash", "-euo", "pipefail", "-s")
 }
 
 // ssh runs the ssh client with the deploy key and arbitrary arguments.
 func (s *stack) ssh(t *testing.T, args ...string) (string, bool) {
 	t.Helper()
 	return run(t, "", s.env, "docker", append([]string{"compose", "exec", "-T", "client",
-		"ssh", "-F", "/dev/null", "-i", "/root/key", "-o", "BatchMode=yes", "-o", "UserKnownHostsFile=/root/known_hosts", "-o", "ConnectTimeout=10"}, args...)...)
+		"ssh", "-F", "/dev/null", "-i", "/root/DEPLOY_SSH_KEY", "-o", "BatchMode=yes", "-o", "UserKnownHostsFile=/root/DEPLOY_KNOWN_HOSTS", "-o", "ConnectTimeout=10"}, args...)...)
 }
 
 // deployStep runs deploy.yml's deploy step.
@@ -143,27 +148,27 @@ func (s *stack) mustDeploy(t *testing.T, digest string) string {
 // snapshot is everything a refused deploy must leave alone.
 func (s *stack) snapshot(t *testing.T) string {
 	t.Helper()
-	return s.box(t, `cd `+boxDir+`
+	return s.server(t, `cd `+srvDir+`
 cat .env
 find . -mindepth 1 -not -path './logs*' -not -name .lock -not -path './data/*' -printf '%p %u %m %T@\n' | sort
 ls /tmp`) + "\n" + s.containers(t)
 }
 
-// containers identifies the box's containers and when they started.
+// containers identifies the deployment server's containers and when they started.
 func (s *stack) containers(t *testing.T) string {
 	t.Helper()
-	return s.box(t, `docker ps --all --quiet | xargs docker inspect --format '{{.Id}} {{.Image}} {{.State.StartedAt}} {{.RestartCount}}'`)
+	return s.server(t, `docker ps --all --quiet | xargs docker inspect --format '{{.Id}} {{.Image}} {{.State.StartedAt}} {{.RestartCount}}'`)
 }
 
 // running returns the repository digest of the running container's image.
 func (s *stack) running(t *testing.T) string {
 	t.Helper()
-	return s.box(t, `docker ps --quiet --filter label=com.docker.compose.project=frict | xargs -r docker inspect --format '{{.Image}}' | xargs -r docker image inspect --format '{{join .RepoDigests " "}}'`)
+	return s.server(t, `docker ps --quiet --filter label=com.docker.compose.project=frict | xargs -r docker inspect --format '{{.Image}}' | xargs -r docker image inspect --format '{{join .RepoDigests " "}}'`)
 }
 
 func (s *stack) healthz(t *testing.T) string {
 	t.Helper()
-	return s.box(t, `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/healthz || true`)
+	return s.server(t, `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8081/healthz || true`)
 }
 
 func (s *stack) wantServing(t *testing.T, digest string) {
@@ -271,7 +276,104 @@ func writeCerts(t *testing.T, dir string) {
 	write("ghcr.key", "EC PRIVATE KEY", keyDER)
 }
 
-// up starts the stack and sets the box up as docs/deploy.md does.
+// ghShim stands in for gh on the workstation: `gh secret set NAME` keeps the
+// secret in /root/NAME.
+const ghShim = `#!/bin/sh
+if [ "$1 $2" != "secret set" ] || [ "$4 $5 $6 $7" != "--repo frict-auth/frict-server --env production" ] || [ $# != 7 ]; then
+  echo "unexpected: gh $*" >&2; exit 1
+fi
+umask 077
+cat > "/root/$3"
+`
+
+// curlShim stands in for curl on the deployment server for docs/deploy.md's
+// download: it serves /opt/fetch/blobs/ID for GitHub's URL of blob ID.
+const curlShim = `#!/bin/bash
+if [[ $# != 5 || $1 != -fsSLo || $3 != -H || $4 != 'Accept: application/vnd.github.raw+json' ||
+  ! $5 =~ ^https://api\.github\.com/repos/frict-auth/frict-server/git/blobs/([0-9a-f]{40})$ ]]; then
+  echo "unexpected: curl $*" >&2; exit 2
+fi
+cp "/opt/fetch/blobs/${BASH_REMATCH[1]}" "$2" || exit 22
+`
+
+// gitBlob returns the git blob id of a file's content.
+func gitBlob(content []byte) string {
+	h := sha1.New()
+	fmt.Fprintf(h, "blob %d\x00", len(content))
+	h.Write(content)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// installer returns deploy/install.sh and its git blob id.
+func installer(t *testing.T) ([]byte, string) {
+	t.Helper()
+	src, err := os.ReadFile("../install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return src, gitBlob(src)
+}
+
+// serve makes the curl stand-in answer the installer's blob id with content.
+func (s *stack) serve(t *testing.T, content []byte) {
+	t.Helper()
+	_, blob := installer(t)
+	must(t, string(content), s.env, "docker", "compose", "exec", "-T", "server", "sh", "-c", "mkdir -p /opt/fetch/blobs && cat > /opt/fetch/blobs/"+blob)
+}
+
+// install runs docs/deploy.md's installer block on the deployment server with
+// key, through the curl stand-in.
+func (s *stack) install(t *testing.T, key string) (string, bool) {
+	t.Helper()
+	block := docBlock(t, "server, as a user with sudo, with `key` set to the line step 2 printed:")
+	if strings.Count(block, "key='<public key line>'\n") != 1 {
+		t.Fatal("docs/deploy.md's installer block has no key='<public key line>' line")
+	}
+	block = strings.Replace(block, "key='<public key line>'", "key='"+key+"'", 1)
+	return run(t, block, s.env, "docker", "compose", "exec", "-T", "-e", "PATH=/opt/fetch:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"server", "bash", "-s")
+}
+
+func (s *stack) mustInstall(t *testing.T, key string) string {
+	t.Helper()
+	out, ok := s.install(t, key)
+	t.Logf("install ok=%v\n%s", ok, out)
+	if !ok {
+		t.Fatal("docs/deploy.md's installer block failed")
+	}
+	return out
+}
+
+// workstation runs a shell script on the workstation.
+func (s *stack) workstation(t *testing.T, script string) string {
+	t.Helper()
+	return must(t, script, s.env, "docker", "compose", "exec", "-T", "client", "bash", "-s")
+}
+
+// installed is what the installer owns on the deployment server: the user,
+// its rights, and owner, mode and, for the files it replaces, content of each
+// path it makes.
+func (s *stack) installed(t *testing.T) string {
+	t.Helper()
+	return s.server(t, `getent passwd frict-deploy | cut -d: -f1,6,7
+id -nG frict-deploy
+sudo -l -U frict-deploy | sed '1,/may run the following commands/d'
+for f in /usr/local/bin/frict-deploy /etc/sudoers.d/frict-deploy /srv/frict/compose.yaml; do
+  printf '%s %s %s\n' "$f" "$(stat -c '%U:%G %a' "$f")" "$(sha256sum < "$f" | cut -d' ' -f1)"
+done
+for f in /home/frict-deploy/.ssh /home/frict-deploy/.ssh/authorized_keys /srv/frict /srv/frict/frict.env /srv/frict/data /srv/frict/secrets /srv/frict/secrets/duo-client-secret; do
+  printf '%s %s\n' "$f" "$(stat -c '%U:%G %a' "$f")"
+done`)
+}
+
+// kept is what the installer must keep when it runs again.
+func (s *stack) kept(t *testing.T) string {
+	t.Helper()
+	return s.server(t, `cd /srv/frict
+sha256sum frict.env secrets/* /home/frict-deploy/.ssh/authorized_keys`)
+}
+
+// up starts the stack and sets the deployment server up as docs/deploy.md does.
 func up(t *testing.T) *stack {
 	t.Helper()
 	certs := t.TempDir()
@@ -282,8 +384,8 @@ func up(t *testing.T) *stack {
 	s := &stack{env: []string{"CERTS=" + certs, "COMPOSE_PROGRESS=quiet"}}
 	t.Cleanup(func() {
 		if t.Failed() {
-			out, _ := run(t, "", s.env, "docker", "compose", "exec", "-T", "box", "sh", "-c", "tail -n 100 "+boxDir+"/logs/*")
-			t.Logf("box logs:\n%s", out)
+			out, _ := run(t, "", s.env, "docker", "compose", "exec", "-T", "server", "sh", "-c", "tail -n 100 "+srvDir+"/logs/*")
+			t.Logf("server logs:\n%s", out)
 		}
 		s.compose(t, "down", "--volumes", "--remove-orphans")
 		if len(s.images) > 0 {
@@ -293,29 +395,36 @@ func up(t *testing.T) *stack {
 	s.compose(t, "down", "--volumes", "--remove-orphans")
 	s.compose(t, "up", "--build", "--detach")
 	s.registry = s.compose(t, "port", "registry", "443")
+	must(t, ghShim, s.env, "docker", "compose", "exec", "-T", "client", "install", "-m", "0755", "/dev/stdin", "/usr/local/bin/gh")
+	must(t, curlShim, s.env, "docker", "compose", "exec", "-T", "server", "sh", "-c", "mkdir -p /opt/fetch && install -m 0755 /dev/stdin /opt/fetch/curl")
+	src, _ := installer(t)
+	s.serve(t, src)
 
-	s.key = s.compose(t, "exec", "-T", "client", "sh", "-c", "ssh-keygen -q -t ed25519 -N '' -f /root/key && cat /root/key")
-	pub := s.compose(t, "exec", "-T", "client", "cat", "/root/key.pub")
-	s.hosts = s.box(t, `printf 'api.frict.app %s' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)"`)
-	must(t, s.hosts+"\n", s.env, "docker", "compose", "exec", "-T", "client", "sh", "-c", "cat > /root/known_hosts")
+	out := s.workstation(t, docBlock(t, "On your workstation, make the deploy key:"))
+	pub := regexp.MustCompile(`(?m)^ssh-ed25519 \S+ frict-deploy$`).FindString(out)
+	if pub == "" || strings.Contains(out, "PRIVATE KEY") {
+		t.Fatalf("the deploy key block printed %q, want the public key line and no private key", out)
+	}
+	if left := s.workstation(t, `grep -rlF 'PRIVATE KEY' /root /tmp || true`); left != "/root/DEPLOY_SSH_KEY" {
+		t.Errorf("private key files on the workstation: %q, want only the DEPLOY_SSH_KEY secret", left)
+	}
 
-	s.box(t, `for i in $(seq 60); do docker version >/dev/null 2>&1 && break; sleep 0.5; done; docker version >/dev/null
-cd /src
-`+docBlock(t, "### 2. Box")+`
-printf %s test-client-secret > `+boxDir+`/secrets/duo-client-secret
-chown 65532:65532 `+boxDir+`/secrets/duo-client-secret
-chmod 0400 `+boxDir+`/secrets/duo-client-secret
-base64 -d > `+boxDir+`/data/frict.db <<'DB'
+	s.server(t, `for i in $(seq 60); do docker version >/dev/null 2>&1 && break; sleep 0.5; done; docker version >/dev/null`)
+	s.installOut = s.mustInstall(t, pub)
+	hostsCmd := regexp.MustCompile(`(?m)^printf .* \| gh secret set DEPLOY_KNOWN_HOSTS .*$`).FindString(s.installOut)
+	if hostsCmd == "" {
+		t.Fatalf("the installer printed no gh secret set DEPLOY_KNOWN_HOSTS command:\n%s", s.installOut)
+	}
+	s.workstation(t, hostsCmd)
+	s.key = s.workstation(t, "cat /root/DEPLOY_SSH_KEY")
+	s.hosts = s.workstation(t, "cat /root/DEPLOY_KNOWN_HOSTS")
+	s.fresh = s.installed(t)
+	s.frictEnv = s.server(t, "cat "+srvDir+"/frict.env") + "\n"
+
+	s.server(t, `base64 -d > `+srvDir+`/data/frict.db <<'DB'
 `+database(t)+`
 DB
-chown 65532:65532 `+boxDir+`/data/frict.db
-install -o root -g root -m 0600 /dev/stdin `+boxDir+`/frict.env <<'ENV'
-FRICT_API_HOSTNAME=api.frict.app
-FRICT_CLIENT_ID=DITEST00000000000000
-ENV
-install -o root -g root -m 0644 /dev/stdin ~frict-deploy/.ssh/authorized_keys <<'KEY'
-`+keyOptions(t)+` `+pub+`
-KEY`)
+chown 65532:65532 `+srvDir+`/data/frict.db`)
 	return s
 }
 
@@ -338,20 +447,6 @@ func database(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return base64.StdEncoding.EncodeToString(db)
-}
-
-// keyOptions returns docs/deploy.md's authorized_keys options.
-func keyOptions(t *testing.T) string {
-	t.Helper()
-	doc, err := os.ReadFile("../../docs/deploy.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	options := regexp.MustCompile(`printf '([^']+) %s\\n'`).FindSubmatch(doc)
-	if options == nil {
-		t.Fatal("docs/deploy.md has no authorized_keys line")
-	}
-	return string(options[1])
 }
 
 // build runs deploy.yml's build and push steps, which publish to the
@@ -405,7 +500,7 @@ func TestDeploy(t *testing.T) {
 	other := s.push(t, "frict-auth/other", unhealthyDir, "FROM scratch\n"+copyServer+"\n")
 
 	t.Run("the deploy user can't use docker, nor sudo but for the script", func(t *testing.T) {
-		check := s.box(t, docBlock(t, "Check the user's groups and sudo rights:"))
+		check := s.server(t, docBlock(t, "Check the user's groups and sudo rights:"))
 		if want := "frict-deploy\n    (root) NOPASSWD: /usr/local/bin/frict-deploy \"\""; check != want {
 			t.Errorf("docs/deploy.md's check printed\n%s\nwant\n%s", check, want)
 		}
@@ -415,10 +510,62 @@ func TestDeploy(t *testing.T) {
 			{"sudo -n docker version", "sudo: a password is required"},
 			{"sudo -n /usr/local/bin/frict-deploy " + v1, "sudo: a password is required"},
 		} {
-			out, ok := run(t, "", s.env, "docker", "compose", "exec", "-T", "box", "runuser", "-u", "frict-deploy", "--", "sh", "-c", c.cmd)
+			out, ok := run(t, "", s.env, "docker", "compose", "exec", "-T", "server", "runuser", "-u", "frict-deploy", "--", "sh", "-c", c.cmd)
 			if ok || !strings.Contains(out, c.refusal) {
 				t.Errorf("%s as frict-deploy: ok=%v, want %q: %s", c.cmd, ok, c.refusal, out)
 			}
+		}
+	})
+
+	t.Run("the installer makes the Duo credentials and prints what Authentik needs", func(t *testing.T) {
+		var settings []string
+		for line := range strings.Lines(s.frictEnv) {
+			if line != "\n" && !strings.HasPrefix(line, "#") {
+				settings = append(settings, line)
+			}
+		}
+		m := regexp.MustCompile(`^FRICT_API_HOSTNAME=api\.frict\.app\nFRICT_CLIENT_ID=(DI[0-9A-F]{18})\n$`).FindStringSubmatch(strings.Join(settings, ""))
+		if m == nil {
+			t.Fatalf("frict.env sets %q, want only the API hostname and a generated client ID", settings)
+		}
+		owned := regexp.MustCompile(`(?m)^.*FRICT_(LISTEN|DB_PATH|CLIENT_SECRET_FILE|TRUSTED_PROXIES).*$`).FindAllString(s.frictEnv, -1)
+		if len(owned) != 1 || !strings.HasPrefix(owned[0], "# compose.yaml sets FRICT_LISTEN, FRICT_DB_PATH, FRICT_CLIENT_SECRET_FILE and FRICT_TRUSTED_PROXIES;") {
+			t.Errorf("frict.env names compose.yaml's variables on %q, want one comment that compose.yaml sets them", owned)
+		}
+		described := regexp.MustCompile(`(?m)^(# .*)\n#?FRICT_\w+=`).FindAllStringSubmatch(s.frictEnv, -1)
+		for _, c := range described {
+			if !regexp.MustCompile(`^# (Needed now|Only for push, later|Optional, default \S+):`).MatchString(c[1]) {
+				t.Errorf("frict.env comment %q doesn't say whether the variable is needed now, only for push, or optional with its default", c[1])
+			}
+		}
+		if all := len(regexp.MustCompile(`(?m)^#?FRICT_\w+=`).FindAllString(s.frictEnv, -1)); all != 10 || len(described) != all {
+			t.Errorf("frict.env has %d variables, %d after their comment, want 10 and all", all, len(described))
+		}
+		secret := s.server(t, "cat "+srvDir+"/secrets/duo-client-secret")
+		if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(secret) {
+			t.Errorf("duo-client-secret = %q, want 40 random hex digits", secret)
+		}
+		for _, want := range []string{"API hostname api.frict.app, client ID " + m[1] + ",", "client secret: sudo cat " + srvDir + "/secrets/duo-client-secret"} {
+			if !strings.Contains(s.installOut, want) {
+				t.Errorf("the installer's output lacks %q", want)
+			}
+		}
+		if strings.Contains(s.installOut, secret) {
+			t.Error("the installer printed the client secret")
+		}
+	})
+
+	t.Run("running the installer again keeps the key, configuration and secrets", func(t *testing.T) {
+		kept := s.kept(t)
+		out := s.mustInstall(t, "")
+		if got := s.installed(t); got != s.fresh {
+			t.Errorf("installed:\n%s\nwant as after the first install:\n%s", got, s.fresh)
+		}
+		if got := s.kept(t); got != kept {
+			t.Errorf("changed:\n--- before\n%s\n--- after\n%s", kept, got)
+		}
+		if strings.Contains(out, "No deploy key") {
+			t.Errorf("the installer says there is no deploy key:\n%s", out)
 		}
 	})
 
@@ -436,29 +583,42 @@ func TestDeploy(t *testing.T) {
 		// The failed first deploy recorded nothing, so the older build is accepted.
 		s.mustDeploy(t, v0)
 		s.wantServing(t, v0)
-		uid := s.box(t, `awk '/^Uid:/ {print $2, $3}' /proc/$(docker inspect --format '{{.State.Pid}}' frict-frict-server-1)/status`)
+		uid := s.server(t, `awk '/^Uid:/ {print $2, $3}' /proc/$(docker inspect --format '{{.State.Pid}}' frict-frict-server-1)/status`)
 		if uid != "65532 65532" {
 			t.Errorf("server process uids = %q, want 65532", uid)
 		}
-		got := s.box(t, `docker inspect --format '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}}' frict-frict-server-1`)
+		got := s.server(t, `docker inspect --format '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}}' frict-frict-server-1`)
 		if want := "true [ALL] [no-new-privileges:true]"; got != want {
 			t.Errorf("hardening = %s, want %s", got, want)
 		}
-		listeners := s.box(t, `docker port frict-frict-server-1`)
+		listeners := s.server(t, `docker port frict-frict-server-1`)
 		if want := "8080/tcp -> 127.0.0.1:8081"; listeners != want {
 			t.Errorf("published ports = %q, want %q", listeners, want)
 		}
 		if out, ok := run(t, "", s.env, "docker", "compose", "exec", "-T", "client", "curl", "-sS", "--max-time", "5", "http://api.frict.app:8081/healthz"); ok || !strings.Contains(out, "curl: (7)") {
 			t.Errorf("from another host: ok=%v %q, want no connection", ok, out)
 		}
-		roots := s.box(t, `docker cp frict-frict-server-1:/etc/ssl/certs/ca-certificates.crt - | tar -xO`)
+		roots := s.server(t, `docker cp frict-frict-server-1:/etc/ssl/certs/ca-certificates.crt - | tar -xO`)
 		if !x509.NewCertPool().AppendCertsFromPEM([]byte(roots)) {
 			t.Errorf("the image has no CA certificates to reach FCM with")
 		}
 	})
 
-	t.Run("a proxy on the box is the pinned gateway, so its X-Forwarded-For names the client", func(t *testing.T) {
-		ipam := s.box(t, `docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}}{{end}}' frict_default`)
+	t.Run("the server runs on the installer's frict.env, unedited, and compose.yaml's settings win", func(t *testing.T) {
+		if got := s.server(t, "cat "+srvDir+"/frict.env") + "\n"; got != s.frictEnv {
+			t.Fatalf("frict.env was edited:\n%s", got)
+		}
+		env := s.server(t, `docker inspect --format '{{join .Config.Env "\n"}}' frict-frict-server-1 | grep '^FRICT_' | sort`)
+		id := regexp.MustCompile(`(?m)^FRICT_CLIENT_ID=.*$`).FindString(s.frictEnv)
+		want := "FRICT_API_HOSTNAME=api.frict.app\n" + id + "\nFRICT_CLIENT_SECRET_FILE=/secrets/duo-client-secret\nFRICT_DB_PATH=/data/frict.db\nFRICT_LISTEN=:8080\nFRICT_TRUSTED_PROXIES=10.231.0.1"
+		if env != want {
+			t.Errorf("frict-server's FRICT_ environment:\n%s\nwant\n%s", env, want)
+		}
+		s.wantServing(t, v0)
+	})
+
+	t.Run("a proxy on the deployment server is the pinned gateway, so its X-Forwarded-For names the client", func(t *testing.T) {
+		ipam := s.server(t, `docker network inspect --format '{{range .IPAM.Config}}{{.Subnet}} {{.Gateway}}{{end}}' frict_default`)
 		if want := "10.231.0.0/24 10.231.0.1"; ipam != want {
 			t.Errorf("frict_default subnet and gateway = %q, want %q", ipam, want)
 		}
@@ -466,12 +626,49 @@ func TestDeploy(t *testing.T) {
 			{"X-Probe: none", "10.231.0.1"},
 			{"X-Forwarded-For: 203.0.113.7", "203.0.113.7"},
 		} {
-			log := s.box(t, `since=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
+			log := s.server(t, `since=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
 curl -sS -o /dev/null -X POST -H '`+c.header+`' http://127.0.0.1:8081/device/v1/pending
 docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_signature_rejected`)
 			if !strings.HasSuffix(log, " client_ip="+c.clientIP) || strings.Count(log, "\n") != 0 {
 				t.Errorf("request with %q logged %q, want client_ip=%s", c.header, log, c.clientIP)
 			}
+		}
+	})
+
+	t.Run("a download that doesn't match docs/deploy.md runs nothing", func(t *testing.T) {
+		src, _ := installer(t)
+		before := s.snapshot(t) + s.installed(t) + s.kept(t)
+		s.serve(t, []byte(strings.Replace(string(src), "\n", "\ntouch /tmp/pwned\n", 1)))
+		out, ok := s.install(t, "")
+		s.serve(t, src)
+		if ok || !strings.Contains(out, "install.sh: FAILED") {
+			t.Errorf("ok=%v, want sha256sum to fail:\n%s", ok, out)
+		}
+		if after := s.snapshot(t) + s.installed(t) + s.kept(t); before != after {
+			t.Errorf("changed:\n--- before\n%s\n--- after\n%s", before, after)
+		}
+	})
+
+	t.Run("the installer refuses anything but one ed25519 key line", func(t *testing.T) {
+		before := s.snapshot(t) + s.installed(t) + s.kept(t)
+		pub := s.workstation(t, "ssh-keygen -y -f /root/DEPLOY_SSH_KEY | cut -d' ' -f1,2")
+		other := s.workstation(t, "ssh-keygen -q -t ed25519 -N '' -f /root/other && cut -d' ' -f1,2 /root/other.pub")
+		rsa := s.workstation(t, "ssh-keygen -q -t rsa -N '' -f /root/rsa && cat /root/rsa.pub")
+		for _, key := range []string{
+			pub + "\n" + other,
+			pub + "\n",
+			`command="/bin/sh" ` + pub,
+			pub[:len(pub)-1],
+			pub + "A",
+			rsa,
+		} {
+			out, ok := s.install(t, key)
+			if ok || !strings.Contains(out, "want at most one argument, one ssh-ed25519 public key line. Nothing changed.") {
+				t.Errorf("key %q: ok=%v, want a refusal:\n%s", key, ok, out)
+			}
+		}
+		if after := s.snapshot(t) + s.installed(t) + s.kept(t); before != after {
+			t.Errorf("changed:\n--- before\n%s\n--- after\n%s", before, after)
 		}
 	})
 
@@ -575,11 +772,11 @@ docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_si
 	t.Run("newer build replaces the running one, with a backup", func(t *testing.T) {
 		s.mustDeploy(t, v1)
 		s.wantServing(t, v1)
-		env := s.box(t, "cat "+boxDir+"/.env")
+		env := s.server(t, "cat "+srvDir+"/.env")
 		if want := fmt.Sprintf("FRICT_DIGEST=%s\nFRICT_MAIN_COMMIT=%d\nFRICT_PREVIOUS_DIGEST=%s", v1, s.base+2, v0); env != want {
 			t.Errorf(".env = %q, want %q", env, want)
 		}
-		tar := s.box(t, `cd `+boxDir+`/backups; tar --numeric-owner -tvf "$(ls -t | head -1)"`)
+		tar := s.server(t, `cd `+srvDir+`/backups; tar --numeric-owner -tvf "$(ls -t | head -1)"`)
 		if !regexp.MustCompile(`(?m)^-\S+ 65532/65532 +[1-9]\d* .* data/frict\.db$`).MatchString(tar) {
 			t.Errorf("newest backup has no database owned by 65532:\n%s", tar)
 		}
@@ -587,9 +784,9 @@ docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_si
 
 	t.Run("redeploying the running digest restarts nothing", func(t *testing.T) {
 		before := s.containers(t)
-		env := s.box(t, "cat "+boxDir+"/.env")
+		env := s.server(t, "cat "+srvDir+"/.env")
 		s.mustDeploy(t, v1)
-		if got := s.box(t, "cat "+boxDir+"/.env"); got != env {
+		if got := s.server(t, "cat "+srvDir+"/.env"); got != env {
 			t.Errorf(".env = %q, want %q", got, env)
 		}
 		if after := s.containers(t); before != after {
@@ -598,7 +795,7 @@ docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_si
 	})
 
 	t.Run("redeploying the digest of a stopped server starts it", func(t *testing.T) {
-		s.box(t, "docker stop frict-frict-server-1")
+		s.server(t, "docker stop frict-frict-server-1")
 		s.mustDeploy(t, v1)
 		s.wantServing(t, v1)
 	})
@@ -615,9 +812,9 @@ docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_si
 	})
 
 	t.Run("broken compose file is refused while the server keeps running", func(t *testing.T) {
-		s.box(t, "mv "+boxDir+"/frict.env "+boxDir+"/frict.env.away")
+		s.server(t, "mv "+srvDir+"/frict.env "+srvDir+"/frict.env.away")
 		out, ok := s.deploy(t, v4)
-		s.box(t, "mv "+boxDir+"/frict.env.away "+boxDir+"/frict.env")
+		s.server(t, "mv "+srvDir+"/frict.env.away "+srvDir+"/frict.env")
 		if ok || !strings.Contains(out, "REFUSED") {
 			t.Errorf("ok=%v, want a refusal", ok)
 		}
@@ -625,9 +822,9 @@ docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_si
 	})
 
 	t.Run("a healthy container of another digest fails the deploy", func(t *testing.T) {
-		s.box(t, "sed -i 's/@\\${FRICT_DIGEST.*/@"+v1+"/' "+boxDir+"/compose.yaml")
+		s.server(t, "sed -i 's/@\\${FRICT_DIGEST.*/@"+v1+"/' "+srvDir+"/compose.yaml")
 		out, ok := s.deploy(t, v4)
-		s.box(t, "install -o root -g root -m 0644 /src/deploy/compose.yaml "+boxDir+"/compose.yaml")
+		s.server(t, "install -o root -g root -m 0644 /src/deploy/compose.yaml "+srvDir+"/compose.yaml")
 		if ok || !strings.Contains(out, "the running container is not ghcr.io/"+imageRepo+"@"+v4) {
 			t.Errorf("ok=%v, want a failure that says which image isn't running", ok)
 		}
@@ -635,16 +832,16 @@ docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_si
 	})
 
 	t.Run("unhealthy build goes back and fails", func(t *testing.T) {
-		env := s.box(t, "cat "+boxDir+"/.env")
+		env := s.server(t, "cat "+srvDir+"/.env")
 		out, ok := s.deploy(t, unhealthy)
 		if ok || !strings.Contains(out, "/healthz did not answer 200") || !strings.Contains(out, "WENT BACK: ghcr.io/"+imageRepo+"@"+v1) {
 			t.Errorf("ok=%v, want a failure that says it went back to %s", ok, v1)
 		}
 		s.wantServing(t, v1)
-		if got := s.box(t, "cat "+boxDir+"/.env"); got != env {
+		if got := s.server(t, "cat "+srvDir+"/.env"); got != env {
 			t.Errorf(".env = %q, want %q", got, env)
 		}
-		if log := s.box(t, "cat "+boxDir+"/logs/*-server-"+unhealthy[7:19]+".log"); !strings.Contains(log, "store unavailable") {
+		if log := s.server(t, "cat "+srvDir+"/logs/*-server-"+unhealthy[7:19]+".log"); !strings.Contains(log, "store unavailable") {
 			t.Errorf("the failed server's log wasn't kept: %q", log)
 		}
 	})
@@ -656,14 +853,14 @@ docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_si
 		ctx, cancel := context.WithCancel(context.Background())
 		var out bytes.Buffer
 		cmd := exec.CommandContext(ctx, "docker", "compose", "exec", "-T", "-e", "LANG=from-client", "-e", "LC_PROBE=from-client", "client",
-			"ssh", "-F", "/dev/null", "-i", "/root/key", "-o", "UserKnownHostsFile=/root/known_hosts", "-o", "SendEnv=LANG LC_PROBE",
+			"ssh", "-F", "/dev/null", "-i", "/root/DEPLOY_SSH_KEY", "-o", "UserKnownHostsFile=/root/DEPLOY_KNOWN_HOSTS", "-o", "SendEnv=LANG LC_PROBE",
 			"frict-deploy@api.frict.app", v4)
 		cmd.Env, cmd.Stdout, cmd.Stderr = append(os.Environ(), s.env...), &out, &out
 		if err := cmd.Start(); err != nil {
 			t.Fatal(err)
 		}
-		s.box(t, `for i in $(seq 100); do pgrep -f 'docker pull' >/dev/null && exit 0; sleep 0.1; done; exit 1`)
-		env := s.box(t, `tr '\0' '\n' </proc/$(pgrep -o -x frict-deploy)/environ | sort`)
+		s.server(t, `for i in $(seq 100); do pgrep -f 'docker pull' >/dev/null && exit 0; sleep 0.1; done; exit 1`)
+		env := s.server(t, `tr '\0' '\n' </proc/$(pgrep -o -x frict-deploy)/environ | sort`)
 		names := regexp.MustCompile(`(?m)=.*$`).ReplaceAllString(env, "")
 		if want := "HOME LANG LOGNAME MAIL PATH SHELL SSH_ORIGINAL_COMMAND SUDO_COMMAND SUDO_GID SUDO_UID SUDO_USER TERM USER"; strings.Join(strings.Fields(names), " ") != want ||
 			!strings.Contains(env, "\nSSH_ORIGINAL_COMMAND="+v4+"\n") || strings.Contains(env, "from-client") {
@@ -675,11 +872,11 @@ docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_si
 		s.compose(t, "exec", "-T", "client", "pkill", "-9", "-x", "ssh")
 		cancel()
 		cmd.Wait()
-		s.box(t, `for i in $(seq 100); do pgrep -f 'sshd: frict-deploy' >/dev/null || exit 0; sleep 0.1; done; exit 1`)
+		s.server(t, `for i in $(seq 100); do pgrep -f 'sshd: frict-deploy' >/dev/null || exit 0; sleep 0.1; done; exit 1`)
 		s.compose(t, "unpause", "registry")
-		s.box(t, `flock -w 60 `+boxDir+`/.lock true`)
+		s.server(t, `flock -w 60 `+srvDir+`/.lock true`)
 		s.wantServing(t, v4)
-		if env := s.box(t, "cat "+boxDir+"/.env"); !strings.Contains(env, "FRICT_DIGEST="+v4+"\n") {
+		if env := s.server(t, "cat "+srvDir+"/.env"); !strings.Contains(env, "FRICT_DIGEST="+v4+"\n") {
 			t.Errorf(".env = %q, want %s", env, v4)
 		}
 	})
@@ -693,11 +890,74 @@ docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_si
 			t.Errorf("/healthz = 200 though the deploy said the server is down")
 		}
 		backup := regexp.MustCompile(`backups/\S+\.tar`).FindString(out)
-		s.box(t, restoreCommands(t, filepath.Base(backup)))
+		s.server(t, restoreCommands(t, filepath.Base(backup)))
 		s.wantServing(t, v4)
-		s.box(t, "grep -aq "+enrolled+" "+boxDir+"/data/frict.db")
+		s.server(t, "grep -aq "+enrolled+" "+srvDir+"/data/frict.db")
+	})
+
+	t.Run("the installer converges a server set up by hand and keeps it serving", func(t *testing.T) {
+		pub := s.workstation(t, "ssh-keygen -y -f /root/DEPLOY_SSH_KEY")
+		s.server(t, `cd /srv/frict
+docker compose down
+cd /
+userdel --remove frict-deploy
+for p in /srv/frict /usr/local/bin/frict-deploy /etc/sudoers.d/frict-deploy; do rm -rf "${p:?}"; done
+old=$(mktemp -d)
+mkdir "$old/deploy"
+for f in frict-deploy sudoers compose.yaml; do
+  { cat "/src/deploy/$f"; echo '# from an older main'; } > "$old/deploy/$f"
+done
+cd "$old"
+`+handSetup+`
+install -o root -g root -m 0600 /dev/stdin /srv/frict/frict.env <<'ENV'
+FRICT_API_HOSTNAME=api.frict.app
+FRICT_CLIENT_ID=DITEST00000000000000
+ENV
+printf 'restrict,command="/usr/bin/sudo -n /usr/local/bin/frict-deploy" %s\n' '`+pub+`' > /home/frict-deploy/.ssh/authorized_keys
+cd /
+rm -rf "${old:?}"`)
+		s.mustDeploy(t, v4)
+		s.wantServing(t, v4)
+		if got := s.installed(t); got == s.fresh {
+			t.Fatal("the hand setup matches a fresh install, so the installer has nothing to upgrade")
+		}
+		kept, containers := s.kept(t), s.containers(t)
+		s.mustInstall(t, "")
+		if got := s.installed(t); got != s.fresh {
+			t.Errorf("installed:\n%s\nwant as after a fresh install:\n%s", got, s.fresh)
+		}
+		if got := s.kept(t); got != kept {
+			t.Errorf("changed:\n--- before\n%s\n--- after\n%s", kept, got)
+		}
+		if got := s.containers(t); got != containers {
+			t.Errorf("containers changed:\n--- before\n%s\n--- after\n%s", containers, got)
+		}
+		if out := s.mustDeploy(t, v4); !strings.Contains(out, "is already running and healthy. Not restarted.") {
+			t.Errorf("deploy after the installer: %s", out)
+		}
+		s.wantServing(t, v4)
 	})
 }
+
+// handSetup is docs/deploy.md's server setup before deploy/install.sh, run
+// from a directory holding deploy/.
+const handSetup = `(
+set -e
+getent passwd frict-deploy >/dev/null || sudo useradd --create-home --shell /bin/sh frict-deploy
+sudo install -d -o root -g root -m 0755 /home/frict-deploy/.ssh
+sudo install -o root -g root -m 0755 deploy/frict-deploy /usr/local/bin/frict-deploy
+sudo visudo -cqf deploy/sudoers
+sudo install -o root -g root -m 0440 deploy/sudoers /etc/sudoers.d/frict-deploy
+sudo visudo -cq
+sudo install -d -o root -g root -m 0755 /srv/frict
+sudo install -o root -g root -m 0644 deploy/compose.yaml /srv/frict/compose.yaml
+sudo install -d -o 65532 -g 65532 -m 0700 /srv/frict/data /srv/frict/secrets
+)
+(
+set -e
+f=/srv/frict/secrets/duo-client-secret
+sudo test -e "$f" || openssl rand -hex 20 | sudo install -o 65532 -g 65532 -m 0400 /dev/stdin "$f"
+)`
 
 // docBlock returns the first bash block of docs/deploy.md after a line.
 func docBlock(t *testing.T, after string) string {

@@ -2,43 +2,46 @@
 
 A merge to `main` that changes what the image is built from runs
 `.github/workflows/deploy.yml`: it publishes the image, then the `deploy` job
-waits for Geoffrey's approval. The build job's summary shows the digest and the
+waits for the approver. The build job's summary shows the digest and the
 commits since the last successful deploy. To run it by hand: Actions → deploy →
 Run workflow, on `main`.
 
-Approving sends the digest over SSH to the box's `frict-deploy` user, whose key
-can only run `/usr/local/bin/frict-deploy` as root through sudo. The user is not
-in the `docker` group and may run nothing else as root. The script refuses
-anything that isn't a digest of this image and any build older than the deployed
-one, backs up `data/`, starts the new version, and goes back to the previous one
-if the new one isn't healthy. To go back on
-purpose, revert on `main`.
+Approving sends the digest over SSH to the deployment server's `frict-deploy`
+user, whose key can only run `/usr/local/bin/frict-deploy` as root through
+sudo. The user is not in the `docker` group and may run nothing else as root.
+The script refuses anything that isn't a digest of this image and any build
+older than the deployed one, backs up `data/`, starts the new version, and goes
+back to the previous one if the new one isn't healthy. To go back on purpose,
+revert on `main`.
 
 ## Setup
 
-Run the `gh` blocks on a machine logged in as `gfree76`, and the rest where the
-step says. Blocks are in `( … )` so pasting one is safe.
+Run the `gh` blocks on your workstation, logged in as a repository admin, and
+the rest where the step says. Blocks are in `( … )` so pasting one is safe.
 
 ### 1. `production` environment
 
 Do this before the workflow first runs on `main`: GitHub creates a missing
-environment without protection.
+environment without protection. Set `approver` to the GitHub login of the one
+person who approves deploys.
 
 ```bash
 (
 set -e
+approver=<login>
+id=$(gh api "users/$approver" --jq .id)
 repo=repos/frict-auth/frict-server/environments/production
-gh api --method PUT "$repo" --input - <<'JSON'
+gh api --method PUT "$repo" --input - <<JSON
 {"prevent_self_review": false,
- "reviewers": [{"type": "User", "id": 48987931}],
+ "reviewers": [{"type": "User", "id": $id}],
  "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}
 JSON
 gh api --method POST "$repo/deployment-branch-policies" -f name=main -f type=branch
 )
 ```
 
-`48987931` is `gfree76`. Prevent-self-review is off because Geoffrey is the only
-reviewer: with it on he couldn't approve a run he started.
+Prevent-self-review is off because the approver is the only reviewer: with it
+on they couldn't approve a run they started.
 
 Then, in the repo's Settings → Environments → production, clear **Allow
 administrators to bypass configured protection rules** and save; the REST API
@@ -52,34 +55,69 @@ gh api repos/frict-auth/frict-server/environments/production/deployment-branch-p
 )
 ```
 
-Expect `can_admins_bypass` false, one `required_reviewers` rule with `gfree76`
-and `prevent_self_review` false, `custom_branch_policies` true, and one policy:
-`main`, `branch`.
+Expect `can_admins_bypass` false, one `required_reviewers` rule naming the
+approver with `prevent_self_review` false, `custom_branch_policies` true, and
+one policy: `main`, `branch`.
 
-### 2. Box
+### 2. Deploy key
 
-Needs Docker with Compose, `curl` and sudo. From a checkout of frict-server's
-`main`, as a user with sudo:
+On your workstation, make the deploy key:
 
 ```bash
 (
 set -e
-getent passwd frict-deploy >/dev/null || sudo useradd --create-home --shell /bin/sh frict-deploy
-sudo install -d -o root -g root -m 0755 /home/frict-deploy/.ssh
-sudo install -o root -g root -m 0755 deploy/frict-deploy /usr/local/bin/frict-deploy
-sudo visudo -cqf deploy/sudoers
-sudo install -o root -g root -m 0440 deploy/sudoers /etc/sudoers.d/frict-deploy
-sudo visudo -cq
-sudo install -d -o root -g root -m 0755 /srv/frict
-sudo install -o root -g root -m 0644 deploy/compose.yaml /srv/frict/compose.yaml
-sudo install -d -o 65532 -g 65532 -m 0700 /srv/frict/data /srv/frict/secrets
+dir=$(mktemp -d)
+trap 'rm -rf "${dir:?}"' EXIT
+ssh-keygen -q -t ed25519 -N '' -C frict-deploy -f "$dir/key"
+gh secret set DEPLOY_SSH_KEY --repo frict-auth/frict-server --env production < "$dir/key"
+cat "$dir/key.pub"
 )
 ```
 
-Repeat it when `deploy/` changes; the workflow doesn't. `frict-deploy` gets no
-password, so it can't log in other than with the deploy key.
+The private key goes to the environment's secret and nowhere else; the block
+prints the public key line for step 3. To change the key, repeat steps 2 and 3.
 
-`deploy/sudoers` lets `frict-deploy` run the script, without arguments, and
+### 3. Deployment server
+
+Needs Docker with Compose, `curl`, `openssl` and sudo. On the deployment
+server, as a user with sudo, with `key` set to the line step 2 printed:
+
+```bash
+(
+set -e
+key='<public key line>'
+dir=$(mktemp -d)
+trap 'rm -rf "${dir:?}"' EXIT
+cd "$dir"
+curl -fsSLo install.sh -H 'Accept: application/vnd.github.raw+json' \
+  https://api.github.com/repos/frict-auth/frict-server/git/blobs/24dbc1030ad3581c049a24b9791019fada7fb3b5
+echo '62adbf765039989125c66e94f403164bebff2af157978216eca976ad5a3718c0  install.sh' | sha256sum --check --strict
+sudo bash install.sh "$key"
+)
+```
+
+The URL names `deploy/install.sh` by its git blob id, so it is the installer
+this page describes, and `sha256sum` checks it before anything runs as root.
+It carries `deploy/setup.sh` and the files that installs:
+
+- user `frict-deploy`, without a password or the `docker` group, so the deploy
+  key is its only way in;
+- `/usr/local/bin/frict-deploy`, `/etc/sudoers.d/frict-deploy` and
+  `/srv/frict/compose.yaml`, owned by root;
+- the key as the only line of `~frict-deploy/.ssh/authorized_keys`, limited to
+  `sudo -n /usr/local/bin/frict-deploy`;
+- `/srv/frict/data` and `/srv/frict/secrets`;
+- `/srv/frict/frict.env` and the Duo client secret, when missing.
+
+It prints a `gh secret set DEPLOY_KNOWN_HOSTS` command, with this server's host
+key: run it on your workstation. It also prints the API hostname, client ID and
+where the client secret is, for Authentik's Duo stage.
+
+Run the block again whenever `deploy/` changes; the workflow doesn't. With
+`key` empty it keeps the installed key. It replaces the root-owned files and
+keeps `frict.env`, the secrets and the data.
+
+The sudoers rule lets `frict-deploy` run the script, without arguments, and
 passes it `SSH_ORIGINAL_COMMAND` and no other variable from the SSH session.
 
 Check the user's groups and sudo rights:
@@ -94,77 +132,28 @@ sudo -l -U frict-deploy | sed '1,/may run the following commands/d'
 Expect `frict-deploy` alone, then `(root) NOPASSWD: /usr/local/bin/frict-deploy ""`.
 `docker` among the groups means the user can become root without the script.
 
-**Configuration**: `/srv/frict/frict.env`, `root:root`, mode 0600.
-`cmd/frict-server/main.go` documents each variable.
+### What you have to fill in
 
-| Variable | Value | Set in |
-|---|---|---|
-| `FRICT_API_HOSTNAME` | `api.frict.app` | `frict.env`, required |
-| `FRICT_CLIENT_ID` | Duo stage client ID | `frict.env`, required |
-| `FRICT_FCM_PROJECT_ID` | prod Firebase project | `frict.env`, both or neither |
-| `FRICT_FCM_CREDENTIALS_FILE` | `/secrets/fcm-sa.json` | `frict.env`, both or neither |
-| `FRICT_CHALLENGE_TTL`, `FRICT_PUSH_CAP`, `FRICT_PUSH_COOLDOWN`, `FRICT_NOT_ME_COUNT`, `FRICT_NOT_ME_WINDOW`, `FRICT_PAUSE` | default if unset | `frict.env`, optional |
-| `FRICT_LISTEN`, `FRICT_DB_PATH`, `FRICT_CLIENT_SECRET_FILE` | fixed | `compose.yaml` |
-| `FRICT_TRUSTED_PROXIES` | `10.231.0.1`, the gateway of the network `compose.yaml` pins | `compose.yaml` |
+Nothing, for the first deploy. The installer writes `/srv/frict/frict.env`
+(`root:root`, mode 0600; edit it with `sudoedit`), which says what each
+variable is for and its default. The client ID there and
+`/srv/frict/secrets/duo-client-secret` are the pair you type into Authentik's
+Duo stage; the installer generates both.
 
-No variable is itself secret. The secrets are two files in
-`/srv/frict/secrets/`, `65532:65532`, mode 0400: `duo-client-secret`
-(the Duo stage's client secret) and, for push, `fcm-sa.json` (the FCM sender
-key). Generate the first on the box:
+To turn push on, uncomment and set both:
 
-```bash
-(
-set -e
-f=/srv/frict/secrets/duo-client-secret
-sudo test -e "$f" || openssl rand -hex 20 | sudo install -o 65532 -g 65532 -m 0400 /dev/stdin "$f"
-)
-```
+| Variable | Value |
+|---|---|
+| `FRICT_FCM_PROJECT_ID` | prod Firebase project |
+| `FRICT_FCM_CREDENTIALS_FILE` | `/secrets/fcm-sa.json` |
 
-### 3. Deploy key
+and save the FCM sender key as that file, `65532:65532`, mode 0400:
+`sudo install -o 65532 -g 65532 -m 0400 fcm-sa.json /srv/frict/secrets/`.
 
-On the desktop:
+### 4. Package visibility
 
-```bash
-(
-set -e
-umask 077
-mkdir -p ~/keystores
-test -e ~/keystores/frict-deploy || ssh-keygen -q -t ed25519 -N '' -C frict-deploy -f ~/keystores/frict-deploy
-printf 'restrict,command="/usr/bin/sudo -n /usr/local/bin/frict-deploy" %s\n' "$(cat ~/keystores/frict-deploy.pub)"
-)
-```
-
-On the box, make the line it prints the only line of
-`/home/frict-deploy/.ssh/authorized_keys` (`sudo nano /home/frict-deploy/.ssh/authorized_keys`).
-
-### 4. Host key and secrets
-
-On the box, print its host key as a known_hosts line:
-
-```bash
-printf 'api.frict.app %s\n' "$(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)"
-```
-
-On the desktop, save that line as `~/keystores/frict-known-hosts`, then:
-
-```bash
-(
-set -e
-gh secret set DEPLOY_SSH_KEY --repo frict-auth/frict-server --env production < ~/keystores/frict-deploy
-gh secret set DEPLOY_KNOWN_HOSTS --repo frict-auth/frict-server --env production < ~/keystores/frict-known-hosts
-)
-```
-
-Check the key from the desktop. `REFUSED` and nothing else means it works:
-
-```bash
-ssh -i ~/keystores/frict-deploy -o IdentitiesOnly=yes -o UserKnownHostsFile=~/keystores/frict-known-hosts frict-deploy@api.frict.app nothing
-```
-
-### 5. Package visibility
-
-The box pulls without credentials, which GHCR allows for public packages only,
-and a package starts private. Until it is public the deploy job fails with
+The deployment server pulls without credentials, which GHCR allows for public
+packages only, and a package starts private. Until it is public the deploy job fails with
 `REFUSED: cannot pull`, changing nothing. After the first build job:
 
 1. Organization settings → Packages → Package creation: allow **Public**.
@@ -184,7 +173,7 @@ The job's log ends with one of these:
 | `WENT BACK` | The previous version is running. |
 | `SERVER IS DOWN` | Nothing is serving. |
 
-frict-server's own log is on the box in `/srv/frict/logs/` (readable with sudo),
+frict-server's own log is on the deployment server in `/srv/frict/logs/` (readable with sudo),
 not in the job's log, which is public.
 
 frict-server refuses a database newer than it knows. If the failed version
@@ -194,7 +183,7 @@ restored.
 ## Restore
 
 `/srv/frict/.env` names the version that starts; it changes only when a
-deploy succeeds. Restoring loses what was written after the backup. On the box:
+deploy succeeds. Restoring loses what was written after the backup. On the deployment server:
 
 ```bash
 (
