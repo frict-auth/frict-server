@@ -1,5 +1,5 @@
 # The deployment server: Ubuntu with sshd, sudo and a Docker daemon.
-FROM docker.io/library/docker:29.3.1-dind@sha256:686d2c5464787b0ca42420e0aa03a94fc9781ff9bf8b5ff947614b9fa4c3c3e0 AS docker
+FROM docker.io/library/docker:29.10.0-dind@sha256:4bbc7223f81db790097c6dea42fb93e05b8fead4f0431fbe6ccaba6e8473201c AS docker
 
 FROM docker.io/library/ubuntu:noble-20261024.1@sha256:fe81560990fae86dc4743202b2cb4d3df98d0bcf949173cecef15ce1127ef852
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl iptables openssh-server sudo
