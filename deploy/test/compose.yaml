@@ -1,7 +1,7 @@
 name: frict-deploy-test
 
 services:
-  # Stands in for GHCR, with a certificate from a throwaway CA the box trusts.
+  # Stands in for GHCR, with a certificate from a throwaway CA the server trusts.
   registry:
     image: docker.io/library/registry:3.1.2@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
     environment:
@@ -17,7 +17,7 @@ services:
       default:
         aliases: [ghcr.io]
 
-  box:
+  server:
     build: .
     privileged: true
     volumes:
@@ -29,7 +29,7 @@ services:
       default:
         aliases: [api.frict.app]
 
-  # Where the workflow's deploy step runs.
+  # Your workstation, and where the workflow's deploy step runs.
   client:
     build: .
     command: sleep infinity

@@ -1,7 +1,8 @@
 #!/bin/bash
-# Deploys one digest of the frict-server image on the box. Runs as root through
-# sudo from the forced command of GitHub's deploy key, so SSH_ORIGINAL_COMMAND is
-# the client's input: one sha256 digest and nothing else. docs/deploy.md.
+# Deploys one digest of the frict-server image on the deployment server. Runs as
+# root through sudo from the forced command of GitHub's deploy key, so
+# SSH_ORIGINAL_COMMAND is the client's input: one sha256 digest and nothing
+# else. docs/deploy.md.
 #
 # Output reaches a public Actions log; frict-server's own logs stay in logs/.
 set -euo pipefail
@@ -91,7 +92,7 @@ save_logs() {
 go_back() {
   echo "DEPLOY FAILED: $image@$digest"
   save_logs "$digest" || echo "could not save frict-server's log"
-  echo "frict-server's log is in $dir/logs on the box."
+  echo "frict-server's log is in $dir/logs on the deployment server."
   if [[ -z $current || $current == "$digest" ]]; then
     dc "$digest" stop frict-server || echo "could not stop frict-server"
     echo "SERVER IS DOWN: there is no previous version to go back to."

@@ -1,4 +1,4 @@
-# frict-server on the box: /srv/frict/compose.yaml. docs/deploy.md.
+# frict-server on the deployment server: /srv/frict/compose.yaml. docs/deploy.md.
 name: frict
 
 services:
