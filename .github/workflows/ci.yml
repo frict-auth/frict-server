@@ -46,7 +46,7 @@ jobs:
           lint --entrypoint shellcheck "$image" "${scripts[@]}"
       - name: go test -race
         run: go test -race -count=1 -v ./...
-      - name: Build, publish and deploy against a local registry and box
+      - name: Build, publish and deploy against a local registry and deployment server
         run: go test -tags deploy -count=1 -v ./deploy/test
       - name: govulncheck
         run: |

@@ -173,8 +173,9 @@ The job's log ends with one of these:
 | `WENT BACK` | The previous version is running. |
 | `SERVER IS DOWN` | Nothing is serving. |
 
-frict-server's own log is on the deployment server in `/srv/frict/logs/` (readable with sudo),
-not in the job's log, which is public.
+frict-server's own log is not in the job's log, which is public. On the
+deployment server, `sudo docker compose logs frict-server` in `/srv/frict`
+shows the live log; `/srv/frict/logs/` holds copies saved at deploy time.
 
 frict-server refuses a database newer than it knows. If the failed version
 migrated it, going back can't work: the log says so, and the backup has to be
