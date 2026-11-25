@@ -242,7 +242,7 @@ const copyServer = "COPY frict-server /frict-server"
 
 var (
 	unhealthyEdit = [3]string{"internal/server/server.go", "\tif err := s.store.Ping(ctx); err != nil {", "\tif err := s.store.Ping(ctx); err == nil {"}
-	migrationEdit = [3]string{"internal/store/store.go", "\tALTER TABLE users DROP COLUMN failed_attempts;`,", "\tALTER TABLE users DROP COLUMN failed_attempts;`,\n\t`CREATE TABLE newer (id INTEGER) STRICT;`,"}
+	migrationEdit = [3]string{"internal/store/store.go", "`,\n}\n\ntype Store struct {", "`,\n\t`CREATE TABLE newer (id INTEGER) STRICT;`,\n}\n\ntype Store struct {"}
 )
 
 // writeCerts makes a throwaway CA and a certificate for ghcr.io.
@@ -538,8 +538,8 @@ func TestDeploy(t *testing.T) {
 				t.Errorf("frict.env comment %q doesn't say whether the variable is needed now, to enroll phones, only for push, or optional with its default", c[1])
 			}
 		}
-		if all := len(regexp.MustCompile(`(?m)^#?FRICT_\w+=`).FindAllString(s.frictEnv, -1)); all != 11 || len(described) != all {
-			t.Errorf("frict.env has %d variables, %d after their comment, want 11 and all", all, len(described))
+		if all := len(regexp.MustCompile(`(?m)^#?FRICT_\w+=`).FindAllString(s.frictEnv, -1)); all != 12 || len(described) != all {
+			t.Errorf("frict.env has %d variables, %d after their comment, want 12 and all", all, len(described))
 		}
 		secret := s.server(t, "cat "+srvDir+"/secrets/duo-client-secret")
 		if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(secret) {

@@ -72,6 +72,11 @@ func newFixtureWith(t *testing.T, challengeTTL time.Duration, sg Safeguards) *fi
 
 func newFixtureSender(t *testing.T, challengeTTL time.Duration, sg Safeguards, sender push.Sender, log *slog.Logger) *fixture {
 	t.Helper()
+	return newFixtureFull(t, challengeTTL, sg, sender, 0, log)
+}
+
+func newFixtureFull(t *testing.T, challengeTTL time.Duration, sg Safeguards, sender push.Sender, minAppVersion int, log *slog.Logger) *fixture {
+	t.Helper()
 	f := &fixture{t: t, dbPath: filepath.Join(t.TempDir(), "frict.db"), clock: t0, revocation: &fakeRevocation{entries: map[string]string{}}}
 	st, err := store.Open(f.dbPath)
 	if err != nil {
@@ -79,7 +84,7 @@ func newFixtureSender(t *testing.T, challengeTTL time.Duration, sg Safeguards, s
 	}
 	t.Cleanup(func() { st.Close() })
 	f.st = st
-	f.srv = New(f.verifier(), st, challengeTTL, sg, LoopbackProxies, sender, testAttestation(t, f.revocation), log)
+	f.srv = New(f.verifier(), st, challengeTTL, sg, LoopbackProxies, sender, testAttestation(t, f.revocation), minAppVersion, log)
 	t.Cleanup(f.srv.Close)
 	f.h = f.srv.Handler()
 	return f
@@ -233,7 +238,7 @@ func TestDuoSignedPassesBodyThrough(t *testing.T) {
 	const body = `{"username":"élodie"}`
 	f := newFixture(t)
 	var got string
-	h := New(f.verifier(), f.st, time.Minute, testSafeguards, LoopbackProxies, nil, testAttestation(t, f.revocation), slog.New(slog.DiscardHandler)).duoSigned(func(w http.ResponseWriter, r *http.Request) {
+	h := New(f.verifier(), f.st, time.Minute, testSafeguards, LoopbackProxies, nil, testAttestation(t, f.revocation), 0, slog.New(slog.DiscardHandler)).duoSigned(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read body: %v", err)
@@ -512,7 +517,7 @@ func TestHealthz(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			New(f.verifier(), tc.store, time.Minute, testSafeguards, LoopbackProxies, nil, testAttestation(t, f.revocation), slog.New(slog.DiscardHandler)).Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			New(f.verifier(), tc.store, time.Minute, testSafeguards, LoopbackProxies, nil, testAttestation(t, f.revocation), 0, slog.New(slog.DiscardHandler)).Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 			if w.Code != tc.want {
 				t.Fatalf("status = %d, want %d", w.Code, tc.want)
 			}

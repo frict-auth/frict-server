@@ -90,8 +90,8 @@ dir=$(mktemp -d)
 trap 'rm -rf "${dir:?}"' EXIT
 cd "$dir"
 curl -fsSLo install.sh -H 'Accept: application/vnd.github.raw+json' \
-  https://api.github.com/repos/frict-auth/frict-server/git/blobs/5226ff01db84fca17653c5b6097f2d375d4e7387
-echo '87423133bda45a165dc96e7656c6cf8d79c17b80bddb10dc015441d1374c33c9  install.sh' | sha256sum --check --strict
+  https://api.github.com/repos/frict-auth/frict-server/git/blobs/f05173e9a63c58e2278f7a7ea69523e3b7079c20
+echo '6325bfd4a8b7207c8a766c320b0d2d4de0f21425e158a7863fe5ff352fb30b87  install.sh' | sha256sum --check --strict
 sudo bash install.sh "$key"
 )
 ```

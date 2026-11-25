@@ -20,6 +20,7 @@
 //	FRICT_APP_SIGNING_CERTS   comma-separated SHA-256 digests of the app's signing certificates, hex, colons optional; empty refuses every enrollment
 //	FRICT_APP_PACKAGES        comma-separated application IDs the app may have (default app.frict.android)
 //	FRICT_ATTESTATION         "strict" (default) or "emulator"; any other value is strict
+//	FRICT_MIN_APP_VERSION     least app versionCode served, from 0 to 2100000000; 0 (default) serves any
 //
 // Strict attestation requires each key's chain to end in a Google root, every
 // certificate below the root valid, none on Google's revocation list, and
@@ -28,6 +29,9 @@
 //
 // Durations are Go durations in whole seconds. docs/PLAN.md Safeguards
 // gives the reason for each default.
+//
+// A phone below FRICT_MIN_APP_VERSION, or sending no version, is answered
+// 426 and gets no pushes (docs/device-protocol.md).
 //
 // Push is on only when both FRICT_FCM_* are set; with neither, the server
 // sends no pushes and devices find challenges by polling.
@@ -104,6 +108,7 @@ type config struct {
 	TrustedProxies   []netip.Prefix
 	FCM              fcmConfig
 	Attestation      attestConfig
+	MinAppVersion    int
 }
 
 type attestConfig struct {
@@ -147,6 +152,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 	}{
 		{"FRICT_PUSH_CAP", &c.Safeguards.PushCap, 1, math.MaxInt32},
 		{"FRICT_NOT_ME_COUNT", &c.Safeguards.NotMeCount, 1, math.MaxInt32},
+		{"FRICT_MIN_APP_VERSION", &c.MinAppVersion, 0, server.MaxAppVersion},
 	} {
 		if v := getenv(n.name); v != "" {
 			i, err := strconv.Atoi(v)
@@ -336,7 +342,7 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 	}()
 
 	att := attestVerifier(cfg.Attestation)
-	h := server.New(v, st, cfg.ChallengeTTL, cfg.Safeguards, cfg.TrustedProxies, sender, att, log)
+	h := server.New(v, st, cfg.ChallengeTTL, cfg.Safeguards, cfg.TrustedProxies, sender, att, cfg.MinAppVersion, log)
 	defer h.Close()
 	srv := &http.Server{
 		Handler:           h.Handler(),
@@ -348,7 +354,8 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 	log.Info("listening", "addr", ln.Addr().String(), "api_hostname", cfg.APIHostname, "challenge_ttl", cfg.ChallengeTTL.String(),
 		"push_cap", cfg.Safeguards.PushCap, "push_cooldown", cfg.Safeguards.PushCooldown.String(),
 		"not_me_count", cfg.Safeguards.NotMeCount, "not_me_window", cfg.Safeguards.NotMeWindow.String(),
-		"pause", cfg.Safeguards.Pause.String(), "trusted_proxies", fmt.Sprint(cfg.TrustedProxies))
+		"pause", cfg.Safeguards.Pause.String(), "trusted_proxies", fmt.Sprint(cfg.TrustedProxies),
+		"min_app_version", cfg.MinAppVersion)
 	logAttestation(cfg.Attestation, log)
 	if sender == nil {
 		log.Warn("push disabled: FRICT_FCM_PROJECT_ID and FRICT_FCM_CREDENTIALS_FILE are unset; devices find challenges only by polling")

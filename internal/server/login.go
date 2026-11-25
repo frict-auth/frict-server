@@ -55,7 +55,7 @@ func (s *Server) duoAuth(w http.ResponseWriter, r *http.Request) {
 	// CloseChallenge below, or it stays pending for the device until it
 	// expires.
 	lock, err := s.store.StartPush(context.WithoutCancel(r.Context()), c, store.Limits{
-		PushCap: s.safeguards.PushCap, Cooldown: s.safeguards.PushCooldown,
+		PushCap: s.safeguards.PushCap, Cooldown: s.safeguards.PushCooldown, MinAppVersion: s.minAppVersion,
 	})
 	switch {
 	case errors.Is(err, store.ErrNoDevice):
@@ -64,6 +64,10 @@ func (s *Server) duoAuth(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		s.log.Error("auth: store", "err", err)
 		duoFail(w, http.StatusInternalServerError, 50000, "Internal error")
+		return
+	case lock == store.LockOutdated:
+		s.log.Warn("push refused", "user_id", userID, "lock", string(lock), "min_app_version", s.minAppVersion)
+		duoOK(w, updateRequired)
 		return
 	case lock != store.Unlocked:
 		s.log.Warn("push refused", "user_id", userID, "lock", string(lock))
@@ -123,6 +127,12 @@ func duoResult(o store.Outcome) map[string]string {
 	}
 }
 
+// updateRequired is the /auth response for a device whose app is below the
+// minimum version. Authentik shows the user only "Duo denied access" and
+// logs status_msg in its login_failed event.
+var updateRequired = map[string]string{"result": "deny", "status": "deny",
+	"status_msg": "Frict on the phone is out of date: update it from Google Play, open it, then sign in again."}
+
 // lockedOut is the /auth response when a safeguard refuses to push. Duo's
 // Auth API documents status locked_out, "The user has been disabled due to
 // authentication failures", with result deny (duo.com/docs/authapi, /auth
@@ -168,9 +178,10 @@ func decodeID(s string) ([]byte, bool) {
 	return id, err == nil && len(id) == 16
 }
 
-// deviceSigned reads a device request's body and verifies its signature
-// against the header user's stored key that keyOf picks. On failure it has
-// already answered the request.
+// deviceSigned reads a device request's body, verifies its signature against
+// the header user's stored key that keyOf picks, records the app version the
+// request carries, and requires it to be at least the minimum. On failure it
+// has already answered the request.
 func (s *Server) deviceSigned(w http.ResponseWriter, r *http.Request, keyOf func(store.Device) []byte) (userID string, body []byte, ok bool) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -178,17 +189,30 @@ func (s *Server) deviceSigned(w http.ResponseWriter, r *http.Request, keyOf func
 		deviceFail(w, http.StatusBadRequest, "bad_request")
 		return "", nil, false
 	}
+	var dev store.Device
 	userID, err = devicesig.Verify(r, body, s.verifier.Now(), func(userID string) (*ecdsa.PublicKey, error) {
 		d, err := s.store.DeviceOf(r.Context(), userID)
 		if err != nil {
 			return nil, err
 		}
+		dev = d
 		return p256FromDER(keyOf(d))
 	})
 	if err != nil {
 		event, reason := deviceRejection(err)
 		s.security(r, event, reason, devicesig.ClaimedUserID(r.Header.Get("Authorization")))
 		deviceFail(w, http.StatusUnauthorized, "unauthorized")
+		return "", nil, false
+	}
+	version, reason := appVersion(r)
+	if version != dev.AppVersion {
+		if err := s.store.SetAppVersion(r.Context(), userID, version); err != nil {
+			s.log.Error("app version: store", "err", err)
+			deviceFail(w, http.StatusInternalServerError, "internal")
+			return "", nil, false
+		}
+	}
+	if !s.appCurrent(w, r, userID, version, reason) {
 		return "", nil, false
 	}
 	return userID, body, true

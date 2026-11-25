@@ -428,6 +428,15 @@ stored chains are not re-checked. Enrolling again puts a phone under it.
 Tests: generated chains from `internal/fakephone`, and genuine Pixel chains
 under both roots from Google's `android/keyattestation` test data.
 
+Minimum app version: **done.** The app sends its `versionCode` in an
+unsigned `Frict-App-Version` header on every request. With
+`FRICT_MIN_APP_VERSION` set, a verified request without it or below it gets
+`426 app_update_required` with the minimum, and `/auth` denies without a
+push to a device whose last request was below it
+(docs/device-protocol.md, App version). An upgrade nudge, not a security
+control. Raise the minimum only once the new app is on Play: until a phone
+updates, its user can't sign in with Frict.
+
 **M5 — LDAP / Linux login.** Only if M0 said yes.
 
 **M6 — iOS.** Deferred. Needs Apple Developer Program, APNs key, and macOS CI

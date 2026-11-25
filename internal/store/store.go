@@ -61,6 +61,7 @@ var migrations = []string{
 	CREATE INDEX alerts_by_recipient ON alerts (recipient_user_id, created_at);`,
 	`DROP TABLE alerts;
 	ALTER TABLE users DROP COLUMN failed_attempts;`,
+	`ALTER TABLE devices ADD COLUMN app_version INTEGER NOT NULL DEFAULT 0 CHECK (app_version >= 0);`,
 }
 
 type Store struct {
@@ -131,13 +132,15 @@ var (
 )
 
 // Device is what a phone registers at enrollment. Keys are SPKI DER;
-// Attestation is the request's attestation JSON as sent.
+// Attestation is the request's attestation JSON as sent. AppVersion is the
+// app's versionCode on its latest verified request, 0 when it sent none.
 type Device struct {
 	DeviceKey   []byte
 	ApprovalKey []byte
 	Attestation []byte
 	FID         string
 	EnrolledAt  time.Time
+	AppVersion  int
 }
 
 // activationHash is what the store keeps of an activation code. Codes carry
@@ -208,9 +211,9 @@ func (s *Store) Enroll(ctx context.Context, code, claimedUserID string, d Device
 		return ErrUserMismatch
 	}
 	res, err := tx.ExecContext(ctx,
-		`INSERT INTO devices (user_id, device_key, approval_key, attestation, fid, enrolled_at)
-		 VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (user_id) DO NOTHING`,
-		userID, d.DeviceKey, d.ApprovalKey, d.Attestation, d.FID, d.EnrolledAt.Unix())
+		`INSERT INTO devices (user_id, device_key, approval_key, attestation, fid, enrolled_at, app_version)
+		 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (user_id) DO NOTHING`,
+		userID, d.DeviceKey, d.ApprovalKey, d.Attestation, d.FID, d.EnrolledAt.Unix(), d.AppVersion)
 	if err != nil {
 		return err
 	}
@@ -228,8 +231,8 @@ func (s *Store) DeviceOf(ctx context.Context, userID string) (Device, error) {
 	var fid sql.NullString
 	var enrolled int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT device_key, approval_key, attestation, fid, enrolled_at FROM devices WHERE user_id = ?`,
-		userID).Scan(&d.DeviceKey, &d.ApprovalKey, &d.Attestation, &fid, &enrolled)
+		`SELECT device_key, approval_key, attestation, fid, enrolled_at, app_version FROM devices WHERE user_id = ?`,
+		userID).Scan(&d.DeviceKey, &d.ApprovalKey, &d.Attestation, &fid, &enrolled, &d.AppVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Device{}, ErrNoDevice
 	}
@@ -253,6 +256,12 @@ func (s *Store) SetFID(ctx context.Context, userID, fid string) error {
 		return ErrNoDevice
 	}
 	return nil
+}
+
+// SetAppVersion records the app version userID's device last sent.
+func (s *Store) SetAppVersion(ctx context.Context, userID string, version int) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE devices SET app_version = ? WHERE user_id = ?`, version, userID)
+	return err
 }
 
 // ClearFID forgets userID's FID if it is still fid, leaving the device
@@ -296,25 +305,31 @@ type Outcome struct {
 	Reason string
 }
 
-// Limits gate pushes for a user since that user's last successful login.
+// Limits gate pushes for a user.
 type Limits struct {
-	// PushCap is how many pushes a user gets before Cooldown applies.
+	// PushCap is how many pushes a user gets since the last successful
+	// login before Cooldown applies.
 	PushCap int
 	// Cooldown is the least time between pushes once PushCap is reached.
 	Cooldown time.Duration
+	// MinAppVersion, when not 0, refuses pushes to a device whose last
+	// app version is below it.
+	MinAppVersion int
 }
 
 // Lock is why StartPush refused a push; empty when it created one.
 type Lock string
 
 const (
-	Unlocked   Lock = ""
-	LockPaused Lock = "paused"
-	LockCapped Lock = "capped"
+	Unlocked     Lock = ""
+	LockOutdated Lock = "outdated"
+	LockPaused   Lock = "paused"
+	LockCapped   Lock = "capped"
 )
 
 // StartPush stores c as a pending challenge and counts it as a push for
-// c.UserID, unless lim or a pause refuses it at c.CreatedAt. A refused push
+// c.UserID, unless lim or a pause refuses it at c.CreatedAt, checked in the
+// order of the Lock constants. A refused push
 // stores nothing and changes no counter. It returns ErrNoDevice if the user
 // has no enrolled device.
 func (s *Store) StartPush(ctx context.Context, c Challenge, lim Limits) (Lock, error) {
@@ -324,12 +339,12 @@ func (s *Store) StartPush(ctx context.Context, c Challenge, lim Limits) (Lock, e
 	}
 	defer tx.Rollback()
 
-	var pushes int
+	var pushes, appVersion int
 	var pausedUntil, lastPush sql.NullInt64
 	err = tx.QueryRowContext(ctx,
-		`SELECT u.pushes_since_success, u.paused_until, u.last_push_at
+		`SELECT u.pushes_since_success, u.paused_until, u.last_push_at, d.app_version
 		 FROM users u JOIN devices d ON d.user_id = u.user_id WHERE u.user_id = ?`,
-		c.UserID).Scan(&pushes, &pausedUntil, &lastPush)
+		c.UserID).Scan(&pushes, &pausedUntil, &lastPush, &appVersion)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNoDevice
 	}
@@ -338,6 +353,8 @@ func (s *Store) StartPush(ctx context.Context, c Challenge, lim Limits) (Lock, e
 	}
 	now := c.CreatedAt.Unix()
 	switch {
+	case appVersion < lim.MinAppVersion:
+		return LockOutdated, nil
 	case pausedUntil.Valid && now < pausedUntil.Int64:
 		return LockPaused, nil
 	case pushes >= lim.PushCap && lastPush.Valid && now < lastPush.Int64+int64(lim.Cooldown/time.Second):

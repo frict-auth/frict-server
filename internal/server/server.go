@@ -47,6 +47,7 @@ type Store interface {
 	Enroll(ctx context.Context, code, claimedUserID string, d store.Device) error
 	DeviceOf(ctx context.Context, userID string) (store.Device, error)
 	SetFID(ctx context.Context, userID, fid string) error
+	SetAppVersion(ctx context.Context, userID string, version int) error
 	ClearFID(ctx context.Context, userID, fid string) error
 	StartPush(ctx context.Context, c store.Challenge, lim store.Limits) (store.Lock, error)
 	PendingChallenges(ctx context.Context, userID string, now time.Time) ([]store.Challenge, error)
@@ -80,7 +81,9 @@ type Server struct {
 	trusted      []netip.Prefix
 	sender       push.Sender
 	attest       *attest.Verifier
-	log          *slog.Logger
+	// minAppVersion is the least app versionCode served; 0 serves any.
+	minAppVersion int
+	log           *slog.Logger
 
 	pushes sync.WaitGroup
 
@@ -92,9 +95,10 @@ type Server struct {
 // creates them. challengeTTL is whole seconds, since the store keeps
 // timestamps in seconds. Forwarding headers name the client only on
 // requests from a trusted proxy. A nil sender sends no pushes: devices poll.
-// att checks each enrollment's key attestations.
-func New(v duosig.Verifier, st Store, challengeTTL time.Duration, sg Safeguards, trusted []netip.Prefix, sender push.Sender, att *attest.Verifier, log *slog.Logger) *Server {
-	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, safeguards: sg, trusted: trusted, sender: sender, attest: att, log: log, answered: map[string]chan struct{}{}}
+// att checks each enrollment's key attestations. Devices whose app is older
+// than minAppVersion are asked to update; 0 asks none.
+func New(v duosig.Verifier, st Store, challengeTTL time.Duration, sg Safeguards, trusted []netip.Prefix, sender push.Sender, att *attest.Verifier, minAppVersion int, log *slog.Logger) *Server {
+	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, safeguards: sg, trusted: trusted, sender: sender, attest: att, minAppVersion: minAppVersion, log: log, answered: map[string]chan struct{}{}}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -235,8 +239,8 @@ type enrollRequest struct {
 
 // deviceEnroll registers a phone's keys for the user its activation code was
 // issued to. The signature is checked against the body's device_key, then
-// both keys' attestations, before the code is spent; the header's user_id
-// must be the code's user.
+// both keys' attestations, then the app version, before the code is spent;
+// the header's user_id must be the code's user.
 func (s *Server) deviceEnroll(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -274,7 +278,12 @@ func (s *Server) deviceEnroll(w http.ResponseWriter, r *http.Request) {
 		deviceFail(w, http.StatusServiceUnavailable, "unavailable")
 		return
 	}
+	version, reason := appVersion(r)
+	if !s.appCurrent(w, r, userID, version, reason) {
+		return
+	}
 	dev.EnrolledAt = now
+	dev.AppVersion = version
 	err = s.store.Enroll(r.Context(), req.ActivationCode, userID, dev)
 	switch {
 	case errors.Is(err, store.ErrActivationInvalid), errors.Is(err, store.ErrActivationUsed), errors.Is(err, store.ErrUserMismatch):

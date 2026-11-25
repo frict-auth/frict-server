@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -183,6 +184,7 @@ func TestReplayedAnswerRejected(t *testing.T) {
 			t.Error(err)
 			return
 		}
+		req.Header.Set("Frict-App-Version", strconv.Itoa(d.phone.AppVersion))
 		replay = replayable(req, body)
 		if status, resp := send(req); status != http.StatusOK {
 			t.Errorf("approve: %d %s", status, resp)
