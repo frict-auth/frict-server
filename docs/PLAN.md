@@ -6,7 +6,7 @@ Greek chain of fire-beacon towers that relayed signals across the land.
 GitHub org `frict-auth`: `frict-server`, `frict-android`, later `frict-ios`.
 Domain `frict.app`; Android application ID `app.frict.android`.
 
-Plan v1 — 2026-10-30. Status: M0 done (GO); M1 in progress.
+Plan v1 — 2026-10-30. Status: M0–M3 done.
 
 ---
 
@@ -120,16 +120,8 @@ an answer (alerts, who must use MFA, flows) is the Authentik admin's job.
   refused at once (below), so a push bomber gets nothing to tap.
 - **Alerting is Authentik's.** Its `login_failed` event records
   `duo_response.status` `fraud` for "I didn't start this" and `deny` for
-  "cancel" (`e2e/login_test.go`). A notification rule bound to this
-  expression policy alerts on fraud only:
-  ```python
-  event = request.context.get("event")
-  if not event or event.action != "login_failed":
-      return False
-  args = event.context.get("auth_method_args") or {}
-  return (args.get("duo_response") or {}).get("status") == "fraud"
-  ```
-  Measured on Authentik 2026.8.6: one notification per fraud answer, none
+  "cancel" (`e2e/login_test.go`). A notification rule bound to the expression
+  policy in `docs/authentik.md` alerts on fraud only. Measured on Authentik 2026.8.6: one notification per fraud answer, none
   for deny, timeout, wrong password, `locked_out` or approve. Don't alert on
   `locked_out`: Authentik's login page resubmits by itself, dozens of times
   a minute while a pause lasts.
@@ -236,8 +228,8 @@ no CA option, so the bundle is always used.
   system trust store with verification still on, and Authentik `main`
   already pins 5.7.0. The ask is a per-stage Duo option that passes it
   through; it would make the mount unnecessary. Open an issue first: the
-  heavier PR #25041 was closed without explanation. Filed under Geoffrey's
-  name; an agent drafts the text.
+  heavier PR #25041 was closed without explanation. The operator files it; an
+  agent drafts the text.
 
 ---
 
@@ -258,10 +250,10 @@ Carried over from chat-relay / chat-android.
     different-vendor review passes. This stops an implementer stamping its own
     PR; it is a process guard, not a defence against the orchestrator.
   - A merge to frict-server's `main` that changes what the image is built from
-    publishes the image. Deploying it waits for Geoffrey's approval in the
-    GitHub environment `production`; agents have Write, so they can neither
+    publishes the image. Deploying it waits for the approver in the GitHub
+    environment `production`; agents have Write, so they can neither
     approve nor configure it (`docs/deploy.md`).
-- Changes to **prod Authentik** stay manual, by Geoffrey.
+- Changes to **prod Authentik** stay manual, by the Authentik administrator.
 - **The bar for blocking a PR is set at dispatch**, in the review brief, not
   discovered in round 6 (lesson from chat-android #3).
 - Reviewer availability: Codex out until 2026-11-25. Until then Pi on
@@ -287,7 +279,7 @@ Carried over from chat-relay / chat-android.
 
 ### Secrets
 
-- Secrets live only on the box. Refer to them by path in plain words — a bare
+- Secrets live only on the deployment server. Refer to them by path in plain words — a bare
   path at the end of a message can get attached as a file.
 - `.gitignore` covers `secrets/` from the first commit.
 - Secret scanning push protection on.
@@ -315,16 +307,16 @@ Carried over from chat-relay / chat-android.
   - Fork PR workflows: "Require approval for all external contributors".
   - Secret scanning: repo-level push protection is a paid feature; the free
     user-level push protection (on by default) covers pushes by accounts
-    that have it on; agent pushes come from `gfree76-claude-agent`, so it
-    must stay on for that account.
+    that have it on; agent pushes come from the agent's GitHub account, so
+    it must stay on for that account.
 - Release pipeline (Android): semantic-release → signed AAB → Play internal
   track, keyless WIF. Same as chat-android.
 - Deploy (server): `deploy.yml` builds and publishes the image, waits for
-  Geoffrey's approval, and hands exactly that digest to `frict-deploy` on the
-  Hetzner box over an SSH key that can run nothing else. `frict-deploy` backs up
+  the approver, and hands exactly that digest to `frict-deploy` on the
+  deployment server over an SSH key that can run nothing else. `frict-deploy` backs up
   the database, checks the running digest and `/healthz`, and goes back to the
   previous digest if either fails (`docs/deploy.md`). The `duo_client` check runs
-  on the box from a timer (appendix).
+  on the deployment server from a timer (appendix).
 
 ---
 
@@ -389,8 +381,16 @@ rate limits, auto-pause. Proven by compose e2e with the fake phone.
 biometric approve, poll fallback, removal. Proven by emulator e2e, then a
 real phone.
 
-**M3 — Deploy.** Server on the Hetzner box. In prod Authentik, a dedicated
-test user and flow get a Duo stage pointing at Frict. Then Geoffrey.
+**M3 — Deploy.** Server on the Hetzner deployment server; prod Authentik's
+Duo stage points at Frict.
+
+Result: **done.** Acceptance ran in prod on the operator's own account
+through Authentik's `default-authentication-mfa-validation` stage, not a
+separate test user and flow. Passed: enroll by QR, push wake via FCM,
+approve, deny, timeout, "Not me" (2 within 60 min pause pushes for 30 min;
+Authentik logs `locked_out` with the `status_msg`), and "Remove this phone"
+(the server deletes the enrollment; Authentik's next `/auth` gets 40002 and
+logs `configuration_error`).
 
 **M4 — Hardening.** Attestation verified against Google's root; re-enrollment
 after key invalidation; pinned minimum app version.
@@ -400,6 +400,12 @@ after key invalidation; pinned minimum app version.
 **M6 — iOS.** Deferred. Needs Apple Developer Program, APNs key, and macOS CI
 (free on public repos).
 
+**V1.0.** The Android app holds several enrollments (sign-in keys) at once,
+e.g. a personal account and a separate Authentik admin account. The server is
+unchanged: each enrollment is a separate Duo device in Authentik. The app
+shows which account each request is for. Also before V1.0: the block vs mute
+review (Open).
+
 **Later.** UnifiedPush + ntfy for de-Googled phones. Forked stage if number
 matching is ever needed.
 
@@ -408,7 +414,7 @@ issue → PR.
 
 ---
 
-## Scaffolding (Geoffrey only)
+## Scaffolding (operator only)
 
 **Before M0**
 - SSSD: nothing to do. No host currently has LDAP login configured (the
@@ -423,8 +429,8 @@ issue → PR.
   all external contributors" for fork PR workflows.
 - ~~Ruleset on `main` of `frict-server`~~ (done): require PR (0 approvals),
   block force-push and deletion, empty bypass list.
-- Agent identity: `gfree76-claude-agent`, org member with Write on all repos
-  (org base permission). Agents run in the agent VM (`gfree76/zart-agent-setup`),
+- Agent identity: a dedicated agent GitHub account, org member with Write on
+  all repos (org base permission). Agents run in the agent VM (`zart-agent-setup`),
   where `gh` is logged in as that account over OAuth; no PAT. GitHub CLI is
   approved under the org's third-party access.
 
@@ -432,7 +438,7 @@ issue → PR.
 - ~~Register the `frict-cross-review` GitHub App~~ (done: App 5557312,
   Commit statuses write only, installed on the org). Its private key is in
   the agent VM at `~/.config/frict/cross-review.pem` (mode 600). The poster
-  is `tools/cross-review-status` in `gfree76/zart-agent-setup`.
+  is `tools/cross-review-status` in `zart-agent-setup`.
 - ~~Rulesets~~ (done on both repos, per zart-agent-setup `docs/new-repo.md`):
   required CI checks plus `cross-review` with source App 5557312, squash
   only, auto-merge on.
@@ -451,18 +457,19 @@ issue → PR.
 - Prod project: hosts the Play release service account `frict-play-release`
   behind its own WIF pool, admitting only frict-android's `release`
   environment (frict-android `docs/release.md`). The release app
-  `app.frict.android` and the box's sender key (`frict-fcm-sender`) come at M3.
+  `app.frict.android` and the deployment server's sender key (`frict-fcm-sender`) come at M3.
 - Play Console: create the app with its package name and grant the release
   service account per-app permission.
 
-**Before M3** — see "Production setup" below for the detail.
+**Before M3** (done) — see "Production setup" below for the detail.
 - Cloudflare DNS for `api.frict.app`.
 - nginx vhost, Let's Encrypt certificate and Authentik CA mount on the
-  Hetzner box (appendix).
-- `data/` and `secrets/` on the box, owned by uid 65532.
+  deployment server (appendix).
+- `data/` and `secrets/` on the deployment server, owned by uid 65532.
 - The `production` environment, its secrets, and the deploy key
   (`docs/deploy.md`).
-- Prod Authentik: Duo setup stage, validation stage, test user, test flow.
+- Prod Authentik: Duo setup stage, used through
+  `default-authentication-mfa-validation`.
 - ~~Upgrade prod Authentik to 2026.8.5~~ (done).
 
 **Before M5**
@@ -480,7 +487,7 @@ issue → PR.
 Server hostname: **`api.frict.app`**. This is the "API hostname" typed into
 Authentik's Duo stage and the host the app talks to.
 
-Frict runs on the same Hetzner box as Authentik (`91.99.109.112`, nginx in
+Frict runs on the same Hetzner deployment server as Authentik (`91.99.109.112`, nginx in
 front). Authentik's worker reaches Frict through the public hostname, so
 traffic leaves the container and comes back in through nginx on the same
 host.
@@ -511,7 +518,7 @@ host.
   HTTPS. Nothing else is needed for `api.`.
 - Nothing at the apex or `www` yet.
 
-### Hetzner box
+### Deployment server (Hetzner)
 
 - nginx vhost `api.frict.app` → `127.0.0.1:8081`, setting
   `X-Forwarded-For` to `$remote_addr`. Container bound to loopback only.
@@ -529,7 +536,7 @@ host.
 
 ### Authentik (`auth.itsalwaysreefreemas.org`)
 
-All clicks by Geoffrey; agents don't change prod Authentik. Based on notes from
+All clicks by the Authentik administrator; agents don't change prod Authentik. Based on notes from
 2026-04-06 — re-check the current flows before starting:
 LDAP provider (pk 5, `mfa_support: true`) had no authentication flow of its
 own and fell through to `default-authentication-flow` (Identification →
@@ -537,35 +544,20 @@ Password → Login, no MFA); `default-authentication-mfa-validation` existed but
 was unbound; an old experiment `default-emailauthentication-flowtest` was
 waiting to be cleaned up.
 
-**M3 — browser login, test user only.** Production flows untouched.
+**M3 — browser login.**
 1. **Duo Authenticator Setup stage** `frict-setup`:
    - API hostname `api.frict.app`
    - Client ID / secret: generated by `frict-server` (stored as a secret on
-     the box, typed into Authentik once)
+     the deployment server, typed into Authentik once)
    - Admin integration key / secret: blank (Frict doesn't implement the
      Duo Admin API)
-2. **Authenticator Validation stage** `frict-validate`: device classes
-   Duo + TOTP; configuration stage `frict-setup`; "not configured" action =
-   configure.
-3. **Flow** `frict-test-authentication` (designation: authentication):
-   Identification → Password → `frict-validate` → Login.
-4. **Test user** `frict-test`, enrolled through
-   `https://auth.itsalwaysreefreemas.org/if/flow/frict-test-authentication/`.
-   Executing the flow by its slug means no brand or default flow changes.
-5. Notification rule on the fraud expression policy (Safeguards), sent to
-   the admins' group.
-6. Acceptance: approve, deny, "I didn't start this" twice (Authentik's alert
-   arrives, pushes pause), timeout, "Remove this phone" (next login is a
-   configuration error).
-
-**M3 → real use.** Once you've lived with it on the test user: enroll your
-own account, then put `frict-validate` into `default-authentication-flow`.
-Known side effect: a user with a Duo device is always offered it over TOTP
-(#22816).
+2. **Validation:** Authentik's `default-authentication-mfa-validation`
+   stage, on the operator's own account.
+3. Alerting and configuration-error emails: `docs/authentik.md`.
 
 **M5 — LDAP.** Only if M0 proved push over LDAP binds.
-1. Flow `ldap-authentication`: Identification → Password → `frict-validate`
-   → Login.
+1. Flow `ldap-authentication`: Identification → Password → a validation
+   stage offering Duo → Login.
 2. Set the LDAP provider's authentication flow to it.
 3. Reconfigure SSSD LDAP login on the laptop from the config M0 proved in the
    container (timeouts included), then confirm a real login with a push
@@ -597,7 +589,7 @@ upload. Keep the name in one constant per codebase.
 - Number matching: out of scope; non-compliance documented.
 - Repos public.
 - Human not a merge blocker; auto-merge gated by CI + cross-review status.
-- Production deploys of frict-server wait for Geoffrey's approval.
+- Production deploys of frict-server wait for the approver.
 - Frict stays thin: it answers the Duo API accurately and protects the
   phone; Authentik's notification rules do the alerting.
 - Live FCM tests in CI on every PR except fork PRs.
@@ -649,19 +641,18 @@ any TLS or connection error; any HTTP status is a pass.
 scripts/duo-tls-check.sh <server container> https://api.frict.app
 scripts/duo-tls-check.sh <worker container> https://api.frict.app
 ```
-At M3 the same two checks go on the box, run from a systemd timer and after
+At M3 the same two checks go on the deployment server, run from a systemd timer and after
 every Authentik container start. A pass pings healthchecks.io; a failure
 pings its `/fail` URL. healthchecks.io also alerts when pings stop, and its
 alerts don't go through Authentik.
 
 **4. Authentik versions.** Prod runs only Authentik versions that
 frict-server's `main` already tests, upgraded one release at a time to the
-latest patch of each (`gfree76/hetzner-setup` `docs/authentik-upgrade.md`).
+latest patch of each (`hetzner-setup` `docs/authentik-upgrade.md`).
 
 **5. Way back in.** A broken Duo stage locks out every user whose login uses
-it, the admin included. Before M3 points a real login at Frict, confirm an
-admin recovery link can be created over SSH on the box (`ak
-create_recovery_key`, unverified).
+it, the admin included. The way back in is SSH to the deployment server and
+direct access to Authentik's database.
 
 **Fallback B (AWS ACM via ACME):** create an ACM ACME endpoint, add its
 validation CNAME in Cloudflare, add an `amazon.com` CAA record, register
