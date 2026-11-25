@@ -189,7 +189,7 @@ The app reads `host`, `user_id` and `code` from the activation link, sends
 |---|---|
 | `activation_code` | Proves the device scanned this user's QR. Single use; it expires with Duo's `valid_secs`. |
 | `device_key`, `approval_key` | See Keys. |
-| `attestation` | Each key's Android Keystore attestation chain, leaf first, stored as sent. Each key is generated with the activation code as its attestation challenge, so M4 can check the chain is about this enrollment. Each chain must be a non-empty list of base64url strings; the certificates are not verified until M4. |
+| `attestation` | Each key's Android Keystore attestation chain, leaf first, as base64url DER, stored as sent. Each key is generated with the activation code as its attestation challenge, binding the chain to this enrollment. The server verifies both chains before spending the code (PLAN M4). |
 | `fid` | Where to push. |
 
 The user is the one `/auth/v2/enroll` issued this activation code for; the
@@ -202,8 +202,10 @@ After this, Authentik's `enroll_status` for the user reports `success`.
 
 Every failure is `401 {"error": "unauthorized"}`: a bad header, timestamp or
 signature, a body with unknown or missing fields or a key that is not
-P-256, and an activation code that is unknown, expired, already used or
-issued for another user.
+P-256, an attestation that doesn't hold, and an activation code that is
+unknown, expired, already used or issued for another user. When the server
+can't get Google's revocation list it answers `503 {"error": "unavailable"}`
+and the code stays unspent: retry.
 
 ### Login (Duo side)
 

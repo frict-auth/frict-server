@@ -90,8 +90,8 @@ dir=$(mktemp -d)
 trap 'rm -rf "${dir:?}"' EXIT
 cd "$dir"
 curl -fsSLo install.sh -H 'Accept: application/vnd.github.raw+json' \
-  https://api.github.com/repos/frict-auth/frict-server/git/blobs/24dbc1030ad3581c049a24b9791019fada7fb3b5
-echo '62adbf765039989125c66e94f403164bebff2af157978216eca976ad5a3718c0  install.sh' | sha256sum --check --strict
+  https://api.github.com/repos/frict-auth/frict-server/git/blobs/5226ff01db84fca17653c5b6097f2d375d4e7387
+echo '87423133bda45a165dc96e7656c6cf8d79c17b80bddb10dc015441d1374c33c9  install.sh' | sha256sum --check --strict
 sudo bash install.sh "$key"
 )
 ```
@@ -139,6 +139,28 @@ Nothing, for the first deploy. The installer writes `/srv/frict/frict.env`
 variable is for and its default. The client ID there and
 `/srv/frict/secrets/duo-client-secret` are the pair you type into Authentik's
 Duo stage; the installer generates both.
+
+To enroll phones, uncomment and set:
+
+| Variable | Value |
+|---|---|
+| `FRICT_APP_SIGNING_CERTS` | the release app's signing certificate SHA-256 digests, comma-separated |
+
+In Play Console, for the release app (`app.frict.android`): Protected with
+Play → Play Store distribution → Play app signing (older consoles: Test and
+release → App integrity → App signing). Copy the **SHA-256 certificate
+fingerprint** of the **App signing key certificate**, and of the **Upload key
+certificate** only if phones run builds installed straight from the release
+workflow rather than from Play. Paste them as shown (`AB:CD:…`, 32 pairs);
+bare hex works too. SHA-1 fingerprints are refused. Restart to apply:
+`sudo docker compose up --detach --force-recreate` in `/srv/frict`; the log
+line `msg=attestation` counts the digests.
+
+Until it is set, frict-server starts and serves logins, warns
+`FRICT_APP_SIGNING_CERTS is empty`, and refuses every enrollment with an
+`attestation_rejected` / `signing_cert` security line.
+`compose.yaml` pins `FRICT_ATTESTATION` to `strict`; `frict.env` can't change
+it.
 
 To turn push on, uncomment and set both:
 

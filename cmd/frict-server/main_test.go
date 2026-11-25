@@ -13,11 +13,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/frict-auth/frict-server/internal/attest"
 	"github.com/frict-auth/frict-server/internal/duosig"
 	"github.com/frict-auth/frict-server/internal/server"
 	"github.com/frict-auth/frict-server/internal/store"
@@ -53,8 +55,16 @@ func TestLoadConfig(t *testing.T) {
 	}
 	defaults := sg(func(*server.Safeguards) {})
 	want := func(listen string, ttl time.Duration, s server.Safeguards) config {
-		return config{listen, "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", ttl, s, server.LoopbackProxies, fcmConfig{}}
+		return config{listen, "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", ttl, s, server.LoopbackProxies, fcmConfig{}, strictAttestation}
 	}
+	withAttestation := func(edit func(*attestConfig)) config {
+		c := want(":8080", 60*time.Second, defaults)
+		c.Attestation.Packages = slices.Clone(c.Attestation.Packages)
+		edit(&c.Attestation)
+		return c
+	}
+	debugCert, _ := attest.Digests("216dcf50a300a0406a2ca01484d299701c70bffa3c2c666c6c60443cf1e859bb")
+	otherCert, _ := attest.Digests("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
 	withProxies := func(c config, ps ...string) config {
 		c.TrustedProxies = nil
 		for _, p := range ps {
@@ -109,6 +119,17 @@ func TestLoadConfig(t *testing.T) {
 		{"no client id", without("FRICT_CLIENT_ID"), config{}, "FRICT_CLIENT_ID"},
 		{"no secret file", without("FRICT_CLIENT_SECRET_FILE"), config{}, "FRICT_CLIENT_SECRET_FILE"},
 		{"no db path", without("FRICT_DB_PATH"), config{}, "FRICT_DB_PATH"},
+		{"attestation strict", with("FRICT_ATTESTATION", "strict"), want(":8080", 60*time.Second, defaults), ""},
+		{"attestation emulator", with("FRICT_ATTESTATION", "emulator"), withAttestation(func(a *attestConfig) { a.Mode = attest.Emulator }), ""},
+		{"attestation garbled is strict", with("FRICT_ATTESTATION", "off"), withAttestation(func(a *attestConfig) { a.Unknown = "off" }), ""},
+		{"app packages", with("FRICT_APP_PACKAGES", "app.frict.android.dev, app.frict.android"),
+			withAttestation(func(a *attestConfig) { a.Packages = []string{"app.frict.android.dev", "app.frict.android"} }), ""},
+		{"app packages empty item", with("FRICT_APP_PACKAGES", "app.frict.android,"), config{}, "FRICT_APP_PACKAGES"},
+		{"signing certs as Play Console shows them, and bare hex", with("FRICT_APP_SIGNING_CERTS",
+			"21:6D:CF:50:A3:00:A0:40:6A:2C:A0:14:84:D2:99:70:1C:70:BF:FA:3C:2C:66:6C:6C:60:44:3C:F1:E8:59:BB, 00112233445566778899AABBCCDDEEFF00112233445566778899aabbccddeeff"),
+			withAttestation(func(a *attestConfig) { a.SigningCerts = append(debugCert, otherCert...) }), ""},
+		{"signing cert SHA-1", with("FRICT_APP_SIGNING_CERTS", "39:A8:54:E1:B2:D8:39:B5:96:0C:4D:95:52:B2:7E:9A:18:C0:50:5E"), config{}, "FRICT_APP_SIGNING_CERTS"},
+		{"signing cert not hex", with("FRICT_APP_SIGNING_CERTS", strings.Repeat("zz", 32)), config{}, "FRICT_APP_SIGNING_CERTS"},
 		{"all missing named", map[string]string{}, config{}, "FRICT_API_HOSTNAME, FRICT_CLIENT_ID, FRICT_CLIENT_SECRET_FILE, FRICT_DB_PATH"},
 	}
 	for _, tc := range tests {
@@ -140,8 +161,11 @@ func testConfig(t *testing.T, secret string) config {
 	if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return config{APIHostname: "api.frict.test", ClientID: "DIXXXX", ClientSecretFile: secretFile, DBPath: filepath.Join(dir, "frict.db"), ChallengeTTL: 60 * time.Second, Safeguards: defaultSafeguards, TrustedProxies: server.LoopbackProxies}
+	return config{APIHostname: "api.frict.test", ClientID: "DIXXXX", ClientSecretFile: secretFile, DBPath: filepath.Join(dir, "frict.db"), ChallengeTTL: 60 * time.Second, Safeguards: defaultSafeguards, TrustedProxies: server.LoopbackProxies, Attestation: strictAttestation}
 }
+
+// strictAttestation is the attestation config an empty environment gives.
+var strictAttestation = attestConfig{Mode: attest.Strict, Packages: []string{"app.frict.android"}}
 
 type running struct {
 	url    string
@@ -349,6 +373,67 @@ func TestRunWithoutFCMSaysPollOnly(t *testing.T) {
 	cancel()
 	if err := <-done; err != nil {
 		t.Fatalf("run = %v", err)
+	}
+}
+
+// startupLog runs cfg until its log has a line containing until and returns
+// the log.
+func startupLog(t *testing.T, cfg config, until string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	logs := &syncBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, cfg, ln, slog.New(slog.NewTextHandler(logs, nil))) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), until) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no %q at startup; logs:\n%s", until, logs)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("run = %v", err)
+	}
+	return logs.String()
+}
+
+func TestRunLogsAttestationMode(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		env   string
+		want  []string
+		never []string
+	}{
+		{"unset", "", []string{`msg=attestation mode=strict packages=app.frict.android signing_certs=0`, `level=WARN msg="FRICT_APP_SIGNING_CERTS is empty: every enrollment is refused"`}, []string{"not strict", "names no mode"}},
+		{"garbled", "relaxed", []string{`level=WARN msg="FRICT_ATTESTATION names no mode: using strict" value=relaxed`, `msg=attestation mode=strict`}, []string{"not strict"}},
+		{"emulator", "emulator", []string{`msg=attestation mode=emulator`, `level=WARN msg="attestation is not strict: software keys under any root can enroll"`}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := testConfig(t, "s3cret")
+			env, err := loadConfig(func(k string) string {
+				return map[string]string{"FRICT_API_HOSTNAME": "h", "FRICT_CLIENT_ID": "c", "FRICT_CLIENT_SECRET_FILE": "f", "FRICT_DB_PATH": "d", "FRICT_ATTESTATION": c.env}[k]
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Attestation = env.Attestation
+			log := startupLog(t, cfg, "msg=listening")
+			for _, w := range c.want {
+				if !strings.Contains(log, w) {
+					t.Errorf("startup log lacks %q:\n%s", w, log)
+				}
+			}
+			for _, n := range c.never {
+				if strings.Contains(log, n) {
+					t.Errorf("startup log has %q:\n%s", n, log)
+				}
+			}
+		})
 	}
 }
 

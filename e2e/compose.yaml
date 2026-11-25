@@ -54,6 +54,10 @@ services:
       FRICT_CLIENT_SECRET_FILE: /secrets/duo-client-secret
       FRICT_DB_PATH: /data/frict.db
       FRICT_CHALLENGE_TTL: ${FRICT_CHALLENGE_TTL:-90s}
+      # The fake phone's chains: debug build, test root.
+      FRICT_ATTESTATION: emulator
+      FRICT_APP_PACKAGES: app.frict.android.dev
+      FRICT_APP_SIGNING_CERTS: 21:6D:CF:50:A3:00:A0:40:6A:2C:A0:14:84:D2:99:70:1C:70:BF:FA:3C:2C:66:6C:6C:60:44:3C:F1:E8:59:BB
     tmpfs:
       - /data:uid=65532,gid=65532,mode=0700
     volumes:

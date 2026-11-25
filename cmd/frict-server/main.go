@@ -17,6 +17,14 @@
 //	FRICT_TRUSTED_PROXIES     comma-separated addresses or CIDR prefixes whose X-Forwarded-For and X-Real-IP name the client (default 127.0.0.0/8,::1)
 //	FRICT_FCM_PROJECT_ID      Firebase project to push through
 //	FRICT_FCM_CREDENTIALS_FILE  that project's FCM sender service-account key (JSON)
+//	FRICT_APP_SIGNING_CERTS   comma-separated SHA-256 digests of the app's signing certificates, hex, colons optional; empty refuses every enrollment
+//	FRICT_APP_PACKAGES        comma-separated application IDs the app may have (default app.frict.android)
+//	FRICT_ATTESTATION         "strict" (default) or "emulator"; any other value is strict
+//
+// Strict attestation requires each key's chain to end in a Google root, every
+// certificate below the root valid, none on Google's revocation list, and
+// the keys in TEE or StrongBox. "emulator" accepts any root and software keys
+// and skips validity and revocation, for emulators in e2e tests only.
 //
 // Durations are Go durations in whole seconds. docs/PLAN.md Safeguards
 // gives the reason for each default.
@@ -47,6 +55,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/frict-auth/frict-server/internal/attest"
 	"github.com/frict-auth/frict-server/internal/duosig"
 	"github.com/frict-auth/frict-server/internal/push"
 	"github.com/frict-auth/frict-server/internal/server"
@@ -68,6 +77,12 @@ const (
 
 	// fcmTimeout bounds each HTTP request to FCM or its token endpoint.
 	fcmTimeout = 10 * time.Second
+
+	// statusTimeout bounds a fetch of the attestation revocation list.
+	statusTimeout = 10 * time.Second
+	statusTTL     = time.Hour
+
+	defaultAppPackage = "app.frict.android"
 )
 
 var defaultSafeguards = server.Safeguards{
@@ -88,6 +103,15 @@ type config struct {
 	Safeguards       server.Safeguards
 	TrustedProxies   []netip.Prefix
 	FCM              fcmConfig
+	Attestation      attestConfig
+}
+
+type attestConfig struct {
+	Mode attest.Mode
+	// Unknown is FRICT_ATTESTATION when it named no mode.
+	Unknown      string
+	Packages     []string
+	SigningCerts [][32]byte
 }
 
 // fcmConfig is empty when push is off.
@@ -163,6 +187,28 @@ func loadConfig(getenv func(string) string) (config, error) {
 	if (c.FCM.ProjectID == "") != (c.FCM.CredentialsFile == "") {
 		return config{}, errors.New("FRICT_FCM_PROJECT_ID and FRICT_FCM_CREDENTIALS_FILE: set both to push through FCM, or neither to have devices poll")
 	}
+	c.Attestation.Mode, c.Attestation.Unknown = parseAttestationMode(getenv("FRICT_ATTESTATION"))
+	c.Attestation.Packages = []string{defaultAppPackage}
+	if v := getenv("FRICT_APP_PACKAGES"); v != "" {
+		c.Attestation.Packages = nil
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p == "" {
+				return config{}, fmt.Errorf("FRICT_APP_PACKAGES=%q: empty application ID", v)
+			}
+			c.Attestation.Packages = append(c.Attestation.Packages, p)
+		}
+	}
+	if v := getenv("FRICT_APP_SIGNING_CERTS"); v != "" {
+		var hexes []string
+		for _, d := range strings.Split(v, ",") {
+			hexes = append(hexes, strings.ToLower(strings.ReplaceAll(strings.TrimSpace(d), ":", "")))
+		}
+		certs, err := attest.Digests(hexes...)
+		if err != nil {
+			return config{}, fmt.Errorf("FRICT_APP_SIGNING_CERTS: %w: want SHA-256 digests as Play Console shows them, comma-separated", err)
+		}
+		c.Attestation.SigningCerts = certs
+	}
 	var missing []string
 	for _, req := range []struct{ name, value string }{
 		{"FRICT_API_HOSTNAME", c.APIHostname},
@@ -178,6 +224,14 @@ func loadConfig(getenv func(string) string) (config, error) {
 		return config{}, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
 	}
 	return c, nil
+}
+
+func parseAttestationMode(v string) (attest.Mode, string) {
+	m, known := attest.ParseMode(v)
+	if !known {
+		return m, v
+	}
+	return m, ""
 }
 
 // parsePrefix reads an address as the prefix holding just it, or a CIDR
@@ -281,7 +335,8 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 		<-pruned
 	}()
 
-	h := server.New(v, st, cfg.ChallengeTTL, cfg.Safeguards, cfg.TrustedProxies, sender, log)
+	att := attestVerifier(cfg.Attestation)
+	h := server.New(v, st, cfg.ChallengeTTL, cfg.Safeguards, cfg.TrustedProxies, sender, att, log)
 	defer h.Close()
 	srv := &http.Server{
 		Handler:           h.Handler(),
@@ -294,6 +349,7 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 		"push_cap", cfg.Safeguards.PushCap, "push_cooldown", cfg.Safeguards.PushCooldown.String(),
 		"not_me_count", cfg.Safeguards.NotMeCount, "not_me_window", cfg.Safeguards.NotMeWindow.String(),
 		"pause", cfg.Safeguards.Pause.String(), "trusted_proxies", fmt.Sprint(cfg.TrustedProxies))
+	logAttestation(cfg.Attestation, log)
 	if sender == nil {
 		log.Warn("push disabled: FRICT_FCM_PROJECT_ID and FRICT_FCM_CREDENTIALS_FILE are unset; devices find challenges only by polling")
 	} else {
@@ -315,6 +371,38 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 		return err
 	}
 	return nil
+}
+
+func attestVerifier(cfg attestConfig) *attest.Verifier {
+	roots, err := attest.Digests(attest.GoogleRoots...)
+	if err != nil {
+		panic(err)
+	}
+	return &attest.Verifier{
+		Mode:         cfg.Mode,
+		Roots:        roots,
+		Packages:     cfg.Packages,
+		SigningCerts: cfg.SigningCerts,
+		Status: &attest.StatusList{
+			URL:    attest.GoogleStatusURL,
+			Client: &http.Client{Timeout: statusTimeout},
+			TTL:    statusTTL,
+			Now:    time.Now,
+		},
+	}
+}
+
+func logAttestation(cfg attestConfig, log *slog.Logger) {
+	if cfg.Unknown != "" {
+		log.Warn("FRICT_ATTESTATION names no mode: using strict", "value", cfg.Unknown)
+	}
+	log.Info("attestation", "mode", string(cfg.Mode), "packages", strings.Join(cfg.Packages, ","), "signing_certs", len(cfg.SigningCerts))
+	if cfg.Mode != attest.Strict {
+		log.Warn("attestation is not strict: software keys under any root can enroll")
+	}
+	if len(cfg.SigningCerts) == 0 {
+		log.Warn("FRICT_APP_SIGNING_CERTS is empty: every enrollment is refused")
+	}
 }
 
 // newSender returns the FCM sender cfg describes, or nil when push is off.
