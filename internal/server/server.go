@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/frict-auth/frict-server/internal/attest"
 	"github.com/frict-auth/frict-server/internal/devicesig"
 	"github.com/frict-auth/frict-server/internal/duosig"
 	"github.com/frict-auth/frict-server/internal/push"
@@ -78,6 +79,7 @@ type Server struct {
 	safeguards   Safeguards
 	trusted      []netip.Prefix
 	sender       push.Sender
+	attest       *attest.Verifier
 	log          *slog.Logger
 
 	pushes sync.WaitGroup
@@ -90,8 +92,9 @@ type Server struct {
 // creates them. challengeTTL is whole seconds, since the store keeps
 // timestamps in seconds. Forwarding headers name the client only on
 // requests from a trusted proxy. A nil sender sends no pushes: devices poll.
-func New(v duosig.Verifier, st Store, challengeTTL time.Duration, sg Safeguards, trusted []netip.Prefix, sender push.Sender, log *slog.Logger) *Server {
-	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, safeguards: sg, trusted: trusted, sender: sender, log: log, answered: map[string]chan struct{}{}}
+// att checks each enrollment's key attestations.
+func New(v duosig.Verifier, st Store, challengeTTL time.Duration, sg Safeguards, trusted []netip.Prefix, sender push.Sender, att *attest.Verifier, log *slog.Logger) *Server {
+	return &Server{verifier: v, store: st, challengeTTL: challengeTTL, safeguards: sg, trusted: trusted, sender: sender, attest: att, log: log, answered: map[string]chan struct{}{}}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -231,8 +234,9 @@ type enrollRequest struct {
 }
 
 // deviceEnroll registers a phone's keys for the user its activation code was
-// issued to. The signature is checked against the body's device_key; the
-// header's user_id must be the code's user.
+// issued to. The signature is checked against the body's device_key, then
+// both keys' attestations, before the code is spent; the header's user_id
+// must be the code's user.
 func (s *Server) deviceEnroll(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
 	if err != nil {
@@ -243,16 +247,31 @@ func (s *Server) deviceEnroll(w http.ResponseWriter, r *http.Request) {
 	now := s.verifier.Now()
 	var req enrollRequest
 	var dev store.Device
+	var chains attestationChains
 	userID, err := devicesig.Verify(r, body, now, func(string) (*ecdsa.PublicKey, error) {
 		var key *ecdsa.PublicKey
 		var perr error
-		req, dev, key, perr = parseEnroll(body)
+		req, dev, chains, key, perr = parseEnroll(body)
 		return key, perr
 	})
 	if err != nil {
 		event, reason := deviceRejection(err)
 		s.security(r, event, reason, devicesig.ClaimedUserID(r.Header.Get("Authorization")))
 		deviceFail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	err = s.attest.Verify(r.Context(), now, []byte(req.ActivationCode),
+		attest.Key{Name: "device_key", SPKI: dev.DeviceKey, Chain: chains.DeviceKey},
+		attest.Key{Name: "approval_key", SPKI: dev.ApprovalKey, Chain: chains.ApprovalKey, UserAuth: true})
+	var rejected *attest.Rejection
+	switch {
+	case errors.As(err, &rejected):
+		s.security(r, evAttestation, rejected.Reason, userID, "key", rejected.Key)
+		deviceFail(w, http.StatusUnauthorized, "unauthorized")
+		return
+	case err != nil:
+		s.log.Error("device enroll: attestation", "err", err)
+		deviceFail(w, http.StatusServiceUnavailable, "unavailable")
 		return
 	}
 	dev.EnrolledAt = now
@@ -274,29 +293,34 @@ func (s *Server) deviceEnroll(w http.ResponseWriter, r *http.Request) {
 
 var errBadEnroll = errors.New("malformed enroll body")
 
-// parseEnroll decodes an enroll body and returns the device it describes and
-// its device_key, which must have signed the request.
-func parseEnroll(body []byte) (enrollRequest, store.Device, *ecdsa.PublicKey, error) {
+// parseEnroll decodes an enroll body and returns the device it describes,
+// its keys' attestation chains, and its device_key, which must have signed
+// the request.
+func parseEnroll(body []byte) (enrollRequest, store.Device, attestationChains, *ecdsa.PublicKey, error) {
 	var req enrollRequest
+	var chains attestationChains
+	fail := func(format string, a ...any) (enrollRequest, store.Device, attestationChains, *ecdsa.PublicKey, error) {
+		return req, store.Device{}, chains, nil, fmt.Errorf("%w: %s", errBadEnroll, fmt.Sprintf(format, a...))
+	}
 	if err := decodeStrict(body, &req); err != nil {
-		return req, store.Device{}, nil, fmt.Errorf("%w: %v", errBadEnroll, err)
+		return fail("%v", err)
 	}
 	if req.ActivationCode == "" || req.FID == "" {
-		return req, store.Device{}, nil, fmt.Errorf("%w: activation_code and fid are required", errBadEnroll)
+		return fail("activation_code and fid are required")
 	}
 	deviceDER, deviceKey, err := parseP256(req.DeviceKey)
 	if err != nil {
-		return req, store.Device{}, nil, fmt.Errorf("%w: device_key: %v", errBadEnroll, err)
+		return fail("device_key: %v", err)
 	}
 	approvalDER, _, err := parseP256(req.ApprovalKey)
 	if err != nil {
-		return req, store.Device{}, nil, fmt.Errorf("%w: approval_key: %v", errBadEnroll, err)
+		return fail("approval_key: %v", err)
 	}
-	if err := checkAttestation(req.Attestation); err != nil {
-		return req, store.Device{}, nil, fmt.Errorf("%w: attestation: %v", errBadEnroll, err)
+	if chains, err = parseAttestation(req.Attestation); err != nil {
+		return fail("attestation: %v", err)
 	}
 	dev := store.Device{DeviceKey: deviceDER, ApprovalKey: approvalDER, Attestation: req.Attestation, FID: req.FID}
-	return req, dev, deviceKey, nil
+	return req, dev, chains, deviceKey, nil
 }
 
 // parseP256 decodes a base64url SPKI P-256 public key.
@@ -329,9 +353,14 @@ func decodeStrict(body []byte, v any) error {
 	return dec.Decode(v)
 }
 
-// checkAttestation requires a chain of base64url certificates for each key.
-// The certificates themselves are not verified.
-func checkAttestation(raw json.RawMessage) error {
+// attestationChains are each key's certificates, DER, leaf first.
+type attestationChains struct {
+	DeviceKey, ApprovalKey [][]byte
+}
+
+// parseAttestation decodes a non-empty chain of base64url certificates for
+// each key. attest.Verifier checks the certificates.
+func parseAttestation(raw json.RawMessage) (attestationChains, error) {
 	var a struct {
 		DeviceKey   []string `json:"device_key"`
 		ApprovalKey []string `json:"approval_key"`
@@ -339,19 +368,29 @@ func checkAttestation(raw json.RawMessage) error {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&a); err != nil {
-		return err
+		return attestationChains{}, err
 	}
-	for name, chain := range map[string][]string{"device_key": a.DeviceKey, "approval_key": a.ApprovalKey} {
+	decode := func(name string, chain []string) ([][]byte, error) {
 		if len(chain) == 0 {
-			return fmt.Errorf("no chain for %s", name)
+			return nil, fmt.Errorf("no chain for %s", name)
 		}
-		for _, c := range chain {
-			if _, err := base64.RawURLEncoding.Strict().DecodeString(c); err != nil || c == "" {
-				return fmt.Errorf("%s chain entry is not base64url", name)
+		ders := make([][]byte, len(chain))
+		for i, c := range chain {
+			der, err := base64.RawURLEncoding.Strict().DecodeString(c)
+			if err != nil || c == "" {
+				return nil, fmt.Errorf("%s chain entry is not base64url", name)
 			}
+			ders[i] = der
 		}
+		return ders, nil
 	}
-	return nil
+	var c attestationChains
+	var err error
+	if c.DeviceKey, err = decode("device_key", a.DeviceKey); err != nil {
+		return c, err
+	}
+	c.ApprovalKey, err = decode("approval_key", a.ApprovalKey)
+	return c, err
 }
 
 // deviceFail writes a device API error.

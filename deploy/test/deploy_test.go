@@ -528,18 +528,18 @@ func TestDeploy(t *testing.T) {
 		if m == nil {
 			t.Fatalf("frict.env sets %q, want only the API hostname and a generated client ID", settings)
 		}
-		owned := regexp.MustCompile(`(?m)^.*FRICT_(LISTEN|DB_PATH|CLIENT_SECRET_FILE|TRUSTED_PROXIES).*$`).FindAllString(s.frictEnv, -1)
-		if len(owned) != 1 || !strings.HasPrefix(owned[0], "# compose.yaml sets FRICT_LISTEN, FRICT_DB_PATH, FRICT_CLIENT_SECRET_FILE and FRICT_TRUSTED_PROXIES;") {
+		owned := regexp.MustCompile(`(?m)^.*FRICT_(LISTEN|DB_PATH|CLIENT_SECRET_FILE|TRUSTED_PROXIES|ATTESTATION).*$`).FindAllString(s.frictEnv, -1)
+		if len(owned) != 1 || !strings.HasPrefix(owned[0], "# compose.yaml sets FRICT_LISTEN, FRICT_DB_PATH, FRICT_CLIENT_SECRET_FILE, FRICT_TRUSTED_PROXIES and FRICT_ATTESTATION;") {
 			t.Errorf("frict.env names compose.yaml's variables on %q, want one comment that compose.yaml sets them", owned)
 		}
 		described := regexp.MustCompile(`(?m)^(# .*)\n#?FRICT_\w+=`).FindAllStringSubmatch(s.frictEnv, -1)
 		for _, c := range described {
-			if !regexp.MustCompile(`^# (Needed now|Only for push, later|Optional, default \S+):`).MatchString(c[1]) {
-				t.Errorf("frict.env comment %q doesn't say whether the variable is needed now, only for push, or optional with its default", c[1])
+			if !regexp.MustCompile(`^# (Needed now|Needed to enroll phones|Only for push, later|Optional, default \S+):`).MatchString(c[1]) {
+				t.Errorf("frict.env comment %q doesn't say whether the variable is needed now, to enroll phones, only for push, or optional with its default", c[1])
 			}
 		}
-		if all := len(regexp.MustCompile(`(?m)^#?FRICT_\w+=`).FindAllString(s.frictEnv, -1)); all != 10 || len(described) != all {
-			t.Errorf("frict.env has %d variables, %d after their comment, want 10 and all", all, len(described))
+		if all := len(regexp.MustCompile(`(?m)^#?FRICT_\w+=`).FindAllString(s.frictEnv, -1)); all != 11 || len(described) != all {
+			t.Errorf("frict.env has %d variables, %d after their comment, want 11 and all", all, len(described))
 		}
 		secret := s.server(t, "cat "+srvDir+"/secrets/duo-client-secret")
 		if !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(secret) {
@@ -604,15 +604,26 @@ func TestDeploy(t *testing.T) {
 		}
 	})
 
-	t.Run("the server runs on the installer's frict.env, unedited, and compose.yaml's settings win", func(t *testing.T) {
+	t.Run("the server runs on the installer's frict.env, unedited, and compose.yaml's settings win, attestation strict among them", func(t *testing.T) {
 		if got := s.server(t, "cat "+srvDir+"/frict.env") + "\n"; got != s.frictEnv {
 			t.Fatalf("frict.env was edited:\n%s", got)
 		}
 		env := s.server(t, `docker inspect --format '{{join .Config.Env "\n"}}' frict-frict-server-1 | grep '^FRICT_' | sort`)
 		id := regexp.MustCompile(`(?m)^FRICT_CLIENT_ID=.*$`).FindString(s.frictEnv)
-		want := "FRICT_API_HOSTNAME=api.frict.app\n" + id + "\nFRICT_CLIENT_SECRET_FILE=/secrets/duo-client-secret\nFRICT_DB_PATH=/data/frict.db\nFRICT_LISTEN=:8080\nFRICT_TRUSTED_PROXIES=10.231.0.1"
+		want := "FRICT_API_HOSTNAME=api.frict.app\nFRICT_ATTESTATION=strict\n" + id + "\nFRICT_CLIENT_SECRET_FILE=/secrets/duo-client-secret\nFRICT_DB_PATH=/data/frict.db\nFRICT_LISTEN=:8080\nFRICT_TRUSTED_PROXIES=10.231.0.1"
 		if env != want {
 			t.Errorf("frict-server's FRICT_ environment:\n%s\nwant\n%s", env, want)
+		}
+		if log := s.server(t, "docker logs frict-frict-server-1 2>&1 | grep -F msg=attestation"); !strings.Contains(log, "msg=attestation mode=strict ") {
+			t.Errorf("the server logged %q, want attestation mode=strict", log)
+		}
+		resolved := s.server(t, `cd `+srvDir+`
+cp -p frict.env frict.env.keep
+echo FRICT_ATTESTATION=emulator >> frict.env
+FRICT_DIGEST=`+v0+` docker compose config | grep FRICT_ATTESTATION
+mv frict.env.keep frict.env`)
+		if resolved != "FRICT_ATTESTATION: strict" {
+			t.Errorf("with FRICT_ATTESTATION=emulator in frict.env, compose resolves %q, want strict", resolved)
 		}
 		s.wantServing(t, v0)
 	})

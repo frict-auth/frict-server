@@ -52,12 +52,15 @@ secret=$dir/secrets/duo-client-secret
 env=$dir/frict.env
 [[ -e $env ]] || install -o root -g root -m 0600 /dev/stdin "$env" <<ENV
 # frict-server's configuration. cmd/frict-server/main.go documents each variable.
-# compose.yaml sets FRICT_LISTEN, FRICT_DB_PATH, FRICT_CLIENT_SECRET_FILE and FRICT_TRUSTED_PROXIES; its values win over this file.
+# compose.yaml sets FRICT_LISTEN, FRICT_DB_PATH, FRICT_CLIENT_SECRET_FILE, FRICT_TRUSTED_PROXIES and FRICT_ATTESTATION; its values win over this file.
 
 # Needed now: the API hostname typed into Authentik's Duo stage.
 FRICT_API_HOSTNAME=$host
 # Needed now: the client ID typed into Authentik's Duo stage, with the secret in $secret.
 FRICT_CLIENT_ID=DI$(openssl rand -hex 9 | tr a-f A-F)
+
+# Needed to enroll phones: the app's signing certificate SHA-256 digests from Play Console, comma-separated (docs/deploy.md). Empty refuses every enrollment.
+#FRICT_APP_SIGNING_CERTS=
 
 # Only for push, later: the Firebase project to push through. Set both FCM lines or neither.
 #FRICT_FCM_PROJECT_ID=
@@ -279,6 +282,8 @@ services:
       FRICT_CLIENT_SECRET_FILE: /secrets/duo-client-secret
       # nginx reaches the published port through this network's gateway.
       FRICT_TRUSTED_PROXIES: 10.231.0.1
+      # Only Google-rooted hardware keys enroll; frict.env can't relax it.
+      FRICT_ATTESTATION: strict
     ports:
       - 127.0.0.1:8081:8080
     volumes:

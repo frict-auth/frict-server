@@ -32,6 +32,8 @@ type Phone struct {
 	DeviceKey   *ecdsa.PrivateKey
 	ApprovalKey *ecdsa.PrivateKey
 	FID         string
+	// Attestation is what the keys' attestation chains claim.
+	Attestation Attestation
 }
 
 func New() (*Phone, error) {
@@ -43,7 +45,11 @@ func New() (*Phone, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Phone{DeviceKey: dk, ApprovalKey: ak, FID: "fake-fid-" + rand.Text()}, nil
+	att, err := DefaultAttestation()
+	if err != nil {
+		return nil, err
+	}
+	return &Phone{DeviceKey: dk, ApprovalKey: ak, FID: "fake-fid-" + rand.Text(), Attestation: att}, nil
 }
 
 // Activation is what the app reads from an enrollment QR code or link.
@@ -70,8 +76,8 @@ func ParseActivation(link string) (Activation, error) {
 	return a, nil
 }
 
-// EnrollBody is the JSON body of an enroll request for code. The attestation
-// chains are placeholders: the server stores them unverified.
+// EnrollBody is the JSON body of an enroll request for code, with each
+// key's attestation chain made fresh from p.Attestation.
 func (p *Phone) EnrollBody(code string) ([]byte, error) {
 	dk, err := spki(&p.DeviceKey.PublicKey)
 	if err != nil {
@@ -81,13 +87,25 @@ func (p *Phone) EnrollBody(code string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	challenge := []byte(code)
+	if p.Attestation.Challenge != "" {
+		challenge = []byte(p.Attestation.Challenge)
+	}
+	dkChain, err := p.Attestation.Chain(&p.DeviceKey.PublicKey, challenge, 0)
+	if err != nil {
+		return nil, err
+	}
+	akChain, err := p.Attestation.Chain(&p.ApprovalKey.PublicKey, challenge, p.Attestation.ApprovalAuth)
+	if err != nil {
+		return nil, err
+	}
 	return json.Marshal(map[string]any{
 		"activation_code": code,
 		"device_key":      dk,
 		"approval_key":    ak,
 		"attestation": map[string][]string{
-			"device_key":   {b64("fake device_key attestation leaf"), b64("fake root")},
-			"approval_key": {b64("fake approval_key attestation leaf"), b64("fake root")},
+			"device_key":   b64s(dkChain),
+			"approval_key": b64s(akChain),
 		},
 		"fid": p.FID,
 	})
@@ -212,3 +230,11 @@ func spki(pub *ecdsa.PublicKey) (string, error) {
 }
 
 func b64(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
+
+func b64s(ders [][]byte) []string {
+	out := make([]string, len(ders))
+	for i, d := range ders {
+		out[i] = b64(string(d))
+	}
+	return out
+}

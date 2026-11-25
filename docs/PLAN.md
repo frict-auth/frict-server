@@ -172,9 +172,10 @@ enrollment is stored with the user; nothing uses it.
 
 Every rejected request is one `WARN` line in the service log with message
 `security`, for alerting to be built on later. Fields: `time`, `event`,
-`endpoint` (the request path), `reason`, `user_id` (only when the request
+`endpoint` (the request path), `reason`, `key` (`attestation_rejected`
+only: `device_key` or `approval_key`), `user_id` (only when the request
 names one of the form Frict issues; not verified), `client_ip`. Signatures,
-keys, secrets, activation codes and FIDs are never logged.
+keys, certificates, secrets, activation codes and FIDs are never logged.
 
 | `event` | `reason` |
 |---|---|
@@ -182,6 +183,7 @@ keys, secrets, activation codes and FIDs are never logged.
 | `duo_request_rejected` | `unreadable_body`, `bad_params`, `unknown_user` (also a malformed or removed user ID) |
 | `device_signature_rejected` | `missing_credentials`, `malformed_header`, `malformed_user_id`, `stale_timestamp`, `bad_signature`, `wrong_endpoint` (valid for another device endpoint: a replay), `unknown_device`, `internal_error` |
 | `device_request_rejected` | `unreadable_body`, `bad_request`, `bad_enroll_body`, `activation_invalid`, `activation_used` (a replayed enrollment), `user_mismatch`, `challenge_not_found`, `challenge_not_pending` (a replayed answer) |
+| `attestation_rejected` | `malformed`, `chain_signature`, `untrusted_root`, `outside_validity`, `revoked`, `key_mismatch`, `challenge_mismatch`, `security_level`, `key_properties`, `user_auth`, `package`, `signing_cert` (also when `FRICT_APP_SIGNING_CERTS` is empty) |
 
 `client_ip` is the TCP peer, unless the peer is in `FRICT_TRUSTED_PROXIES`
 (default loopback): then it is the last `X-Forwarded-For` hop that is not
@@ -394,6 +396,37 @@ logs `configuration_error`).
 
 **M4 — Hardening.** Attestation verified against Google's root; re-enrollment
 after key invalidation; pinned minimum app version.
+
+Attestation: **done** (`internal/attest`). At enrollment, before the
+activation code is spent, each key's chain must:
+
+- end in a root whose public key is one of Google's two hardware
+  attestation roots, pinned by SPKI SHA-256 (`attest.GoogleRoots`, from
+  developer.android.com's key attestation page and
+  `android.googleapis.com/attestation/root`): the RSA-4096 key
+  `f92009e853b6b045`, which four root certificates share, and the P-384
+  Key Attestation CA1, signing since 2026-02-01. Per Google's guidance the
+  root certificate's own validity period is not checked; every certificate
+  below it must be valid now;
+- have no certificate on Google's revocation list
+  (`android.googleapis.com/attestation/status`), fetched only once every
+  other check has passed and kept for an hour. Without it the enrollment
+  answers `503` and the code stays unspent;
+- certify the submitted key, carry the activation code as its attestation
+  challenge, and be in TEE or StrongBox at both security levels;
+- be a P-256 key for SIGN (VERIFY allowed beside it); the `device_key` with
+  `noAuthRequired`, the `approval_key` needing a fingerprint, alone or with
+  the screen lock, on every use (no `authTimeout`);
+- come from an app whose every package is in `FRICT_APP_PACKAGES` and one of
+  whose signing certificates is in `FRICT_APP_SIGNING_CERTS`.
+
+`FRICT_ATTESTATION=emulator` accepts any root and software keys and skips
+validity and revocation, for emulator and fake-phone e2e only; any other
+value is strict, and `deploy/compose.yaml` pins strict over `frict.env`.
+Devices enrolled before this check stay enrolled and keep working; their
+stored chains are not re-checked. Enrolling again puts a phone under it.
+Tests: generated chains from `internal/fakephone`, and genuine Pixel chains
+under both roots from Google's `android/keyattestation` test data.
 
 **M5 — LDAP / Linux login.** Only if M0 said yes.
 

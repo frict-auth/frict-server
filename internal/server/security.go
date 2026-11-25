@@ -20,15 +20,17 @@ const (
 	evDuoRequest      = "duo_request_rejected"
 	evDeviceSignature = "device_signature_rejected"
 	evDeviceRequest   = "device_request_rejected"
+	evAttestation     = "attestation_rejected"
 )
 
 // LoopbackProxies trusts forwarding headers only from the host itself.
 var LoopbackProxies = []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8"), netip.MustParsePrefix("::1/128")}
 
 // security logs a rejected request. userID is what the request claims, and
-// is logged only if it has the form Frict issues.
-func (s *Server) security(r *http.Request, event, reason, userID string) {
-	attrs := []any{"event", event, "endpoint", r.URL.Path, "reason", reason}
+// is logged only if it has the form Frict issues. extra are more attributes,
+// after the reason.
+func (s *Server) security(r *http.Request, event, reason, userID string, extra ...any) {
+	attrs := append([]any{"event", event, "endpoint", r.URL.Path, "reason", reason}, extra...)
 	if devicesig.ValidUserID(userID) {
 		attrs = append(attrs, "user_id", userID)
 	}

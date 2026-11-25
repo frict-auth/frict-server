@@ -41,6 +41,8 @@ type fixture struct {
 	st     *store.Store
 	srv    *Server
 	h      http.Handler
+	// revocation is the attestation revocation list the server sees.
+	revocation *fakeRevocation
 
 	mu    sync.Mutex
 	clock time.Time
@@ -70,14 +72,14 @@ func newFixtureWith(t *testing.T, challengeTTL time.Duration, sg Safeguards) *fi
 
 func newFixtureSender(t *testing.T, challengeTTL time.Duration, sg Safeguards, sender push.Sender, log *slog.Logger) *fixture {
 	t.Helper()
-	f := &fixture{t: t, dbPath: filepath.Join(t.TempDir(), "frict.db"), clock: t0}
+	f := &fixture{t: t, dbPath: filepath.Join(t.TempDir(), "frict.db"), clock: t0, revocation: &fakeRevocation{entries: map[string]string{}}}
 	st, err := store.Open(f.dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
 	f.st = st
-	f.srv = New(f.verifier(), st, challengeTTL, sg, LoopbackProxies, sender, log)
+	f.srv = New(f.verifier(), st, challengeTTL, sg, LoopbackProxies, sender, testAttestation(t, f.revocation), log)
 	t.Cleanup(f.srv.Close)
 	f.h = f.srv.Handler()
 	return f
@@ -231,7 +233,7 @@ func TestDuoSignedPassesBodyThrough(t *testing.T) {
 	const body = `{"username":"élodie"}`
 	f := newFixture(t)
 	var got string
-	h := New(f.verifier(), f.st, time.Minute, testSafeguards, LoopbackProxies, nil, slog.New(slog.DiscardHandler)).duoSigned(func(w http.ResponseWriter, r *http.Request) {
+	h := New(f.verifier(), f.st, time.Minute, testSafeguards, LoopbackProxies, nil, testAttestation(t, f.revocation), slog.New(slog.DiscardHandler)).duoSigned(func(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read body: %v", err)
@@ -323,7 +325,10 @@ func TestDeviceEnrollThenStatusSuccess(t *testing.T) {
 	}
 	phone := newPhone(t)
 	f.setClock(t0.Add(time.Minute))
-	w := f.serve(must[*http.Request](t)(phone.EnrollRequest(a, f.now())))
+	r := must[*http.Request](t)(phone.EnrollRequest(a, f.now()))
+	body := must[[]byte](t)(io.ReadAll(r.Body))
+	r.Body = io.NopCloser(strings.NewReader(string(body)))
+	w := f.serve(r)
 	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "{}" {
 		t.Fatalf("enroll: %d %s, want 200 {}", w.Code, w.Body)
 	}
@@ -336,7 +341,7 @@ func TestDeviceEnrollThenStatusSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	var sent struct{ Attestation json.RawMessage }
-	if err := json.Unmarshal(must[[]byte](t)(phone.EnrollBody(a.Code)), &sent); err != nil {
+	if err := json.Unmarshal(body, &sent); err != nil {
 		t.Fatal(err)
 	}
 	if string(dev.DeviceKey) != string(spki(t, &phone.DeviceKey.PublicKey)) ||
@@ -507,7 +512,7 @@ func TestHealthz(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			New(f.verifier(), tc.store, time.Minute, testSafeguards, LoopbackProxies, nil, slog.New(slog.DiscardHandler)).Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+			New(f.verifier(), tc.store, time.Minute, testSafeguards, LoopbackProxies, nil, testAttestation(t, f.revocation), slog.New(slog.DiscardHandler)).Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 			if w.Code != tc.want {
 				t.Fatalf("status = %d, want %d", w.Code, tc.want)
 			}
