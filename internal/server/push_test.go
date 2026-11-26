@@ -7,8 +7,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -115,9 +117,10 @@ func TestRefusedAuthSendsNoPush(t *testing.T) {
 	}
 }
 
-// TestPushPayloadHasNoChallengeDetails: a push carries one opaque ID and
-// nothing Authentik sent. A not_me deny pushes nothing to anyone, an
-// enrolled "admin" included.
+// TestPushPayloadHasNoChallengeDetails: a push carries exactly two opaque
+// IDs, the challenge's and the recipient's user ID, and nothing Authentik
+// sent. A not_me deny pushes nothing to anyone, an enrolled "admin"
+// included.
 func TestPushPayloadHasNoChallengeDetails(t *testing.T) {
 	fake := push.NewFake()
 	f, _ := newPushFixture(t, testSafeguards, fake)
@@ -129,15 +132,24 @@ func TestPushPayloadHasNoChallengeDetails(t *testing.T) {
 		t.Fatalf("pushes %+v, want only alice's challenge", got)
 	}
 	m := got[0]
-	if m.FID != phone.FID || len(m.Data) != 1 || m.Data["challenge_id"] == "" {
-		t.Fatalf("push %+v, want only challenge_id to %s", m, phone.FID)
+	if m.FID != phone.FID {
+		t.Fatalf("pushed to %q, want alice's FID %q", m.FID, phone.FID)
+	}
+	keys := slices.Sorted(maps.Keys(m.Data))
+	if want := []string{"challenge_id", "user_id"}; !slices.Equal(keys, want) {
+		t.Fatalf("push data keys %v, want exactly %v: %+v", keys, want, m.Data)
 	}
 	if _, ok := decodeID(m.Data["challenge_id"]); !ok {
 		t.Fatalf("challenge_id %q is not a 16-byte ID", m.Data["challenge_id"])
 	}
-	for _, detail := range []string{"élodie", "203.0.113.7", "Grafana", "auth.example", "Login request", a.UserID, admin.UserID} {
-		if strings.Contains(m.Data["challenge_id"], detail) {
-			t.Fatalf("push carries %q: %+v", detail, m)
+	if m.Data["user_id"] != a.UserID {
+		t.Fatalf("user_id %q, want alice's %q", m.Data["user_id"], a.UserID)
+	}
+	for _, v := range m.Data {
+		for _, detail := range []string{"élodie", "203.0.113.7", "Grafana", "auth.example", "Login request", admin.UserID} {
+			if strings.Contains(v, detail) {
+				t.Fatalf("push carries %q: %+v", detail, m)
+			}
 		}
 	}
 }
