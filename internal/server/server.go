@@ -44,7 +44,7 @@ type Store interface {
 	Ping(ctx context.Context) error
 	CreateEnrollment(ctx context.Context, userID, username, code string, now, expires time.Time) error
 	EnrollmentStatusOf(ctx context.Context, userID, code string, now time.Time) (store.EnrollmentStatus, error)
-	Enroll(ctx context.Context, code, claimedUserID string, d store.Device) error
+	Enroll(ctx context.Context, code, claimedUserID string, d store.Device) (string, error)
 	DeviceOf(ctx context.Context, userID string) (store.Device, error)
 	SetFID(ctx context.Context, userID, fid string) error
 	SetAppVersion(ctx context.Context, userID string, version int) error
@@ -237,6 +237,11 @@ type enrollRequest struct {
 	FID            string          `json:"fid"`
 }
 
+// enrollReply's username is for the app to show; nothing server-side keys on it.
+type enrollReply struct {
+	Username string `json:"username"`
+}
+
 // deviceEnroll registers a phone's keys for the user its activation code was
 // issued to. The signature is checked against the body's device_key, then
 // both keys' attestations, then the app version, before the code is spent;
@@ -284,7 +289,7 @@ func (s *Server) deviceEnroll(w http.ResponseWriter, r *http.Request) {
 	}
 	dev.EnrolledAt = now
 	dev.AppVersion = version
-	err = s.store.Enroll(r.Context(), req.ActivationCode, userID, dev)
+	username, err := s.store.Enroll(r.Context(), req.ActivationCode, userID, dev)
 	switch {
 	case errors.Is(err, store.ErrActivationInvalid), errors.Is(err, store.ErrActivationUsed), errors.Is(err, store.ErrUserMismatch):
 		event, reason := deviceRejection(err)
@@ -297,7 +302,7 @@ func (s *Server) deviceEnroll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("device enrolled", "user_id", userID)
-	writeJSON(w, http.StatusOK, struct{}{})
+	writeJSON(w, http.StatusOK, enrollReply{Username: username})
 }
 
 var errBadEnroll = errors.New("malformed enroll body")

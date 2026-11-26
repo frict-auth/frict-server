@@ -260,8 +260,12 @@ func TestEnrollThenStatus(t *testing.T) {
 		t.Fatalf("before enroll: %q, want waiting", got)
 	}
 	want := device("alice", t0.Add(time.Minute))
-	if err := s.Enroll(ctx, aliceCode, aliceID, want); err != nil {
+	username, err := s.Enroll(ctx, aliceCode, aliceID, want)
+	if err != nil {
 		t.Fatalf("Enroll: %v", err)
+	}
+	if username != "alice" {
+		t.Fatalf("Enroll username = %q, want alice", username)
 	}
 	for _, tc := range []struct {
 		name, user, code string
@@ -295,10 +299,10 @@ func TestEnrollThenStatus(t *testing.T) {
 func TestEnrollRejectsReusedCode(t *testing.T) {
 	s := enrolling(t)
 	ctx := context.Background()
-	if err := s.Enroll(ctx, aliceCode, aliceID, device("first", t0)); err != nil {
+	if _, err := s.Enroll(ctx, aliceCode, aliceID, device("first", t0)); err != nil {
 		t.Fatalf("first Enroll: %v", err)
 	}
-	if err := s.Enroll(ctx, aliceCode, aliceID, device("second", t0.Add(time.Second))); !errors.Is(err, ErrActivationUsed) {
+	if _, err := s.Enroll(ctx, aliceCode, aliceID, device("second", t0.Add(time.Second))); !errors.Is(err, ErrActivationUsed) {
 		t.Fatalf("second Enroll = %v, want ErrActivationUsed", err)
 	}
 	got, err := s.DeviceOf(ctx, aliceID)
@@ -313,10 +317,10 @@ func TestEnrollRejectsReusedCode(t *testing.T) {
 func TestEnrollRejectsExpiredCode(t *testing.T) {
 	s := enrolling(t)
 	ctx := context.Background()
-	if err := s.Enroll(ctx, aliceCode, aliceID, device("late", t0.Add(10*time.Minute))); !errors.Is(err, ErrActivationInvalid) {
+	if _, err := s.Enroll(ctx, aliceCode, aliceID, device("late", t0.Add(10*time.Minute))); !errors.Is(err, ErrActivationInvalid) {
 		t.Fatalf("Enroll at expiry = %v, want ErrActivationInvalid", err)
 	}
-	if err := s.Enroll(ctx, aliceCode, aliceID, device("in time", t0.Add(10*time.Minute-time.Second))); err != nil {
+	if _, err := s.Enroll(ctx, aliceCode, aliceID, device("in time", t0.Add(10*time.Minute-time.Second))); err != nil {
 		t.Fatalf("Enroll a second before expiry: %v", err)
 	}
 }
@@ -324,7 +328,7 @@ func TestEnrollRejectsExpiredCode(t *testing.T) {
 func TestEnrollTakesUserFromCode(t *testing.T) {
 	s := enrolling(t)
 	ctx := context.Background()
-	if err := s.Enroll(ctx, aliceCode, bobID, device("mallory", t0)); !errors.Is(err, ErrUserMismatch) {
+	if _, err := s.Enroll(ctx, aliceCode, bobID, device("mallory", t0)); !errors.Is(err, ErrUserMismatch) {
 		t.Fatalf("Enroll alice's code claiming bob = %v, want ErrUserMismatch", err)
 	}
 	for _, id := range []string{aliceID, bobID} {
@@ -336,7 +340,7 @@ func TestEnrollTakesUserFromCode(t *testing.T) {
 
 func TestEnrollRejectsUnknownCode(t *testing.T) {
 	s := enrolling(t)
-	if err := s.Enroll(context.Background(), "NOSUCHCODE", aliceID, device("x", t0)); !errors.Is(err, ErrActivationInvalid) {
+	if _, err := s.Enroll(context.Background(), "NOSUCHCODE", aliceID, device("x", t0)); !errors.Is(err, ErrActivationInvalid) {
 		t.Fatalf("Enroll unknown code = %v, want ErrActivationInvalid", err)
 	}
 }
@@ -346,7 +350,7 @@ func enrolled(t *testing.T) *Store {
 	t.Helper()
 	s := enrolling(t)
 	for _, u := range []struct{ id, code string }{{aliceID, aliceCode}, {bobID, bobCode}} {
-		if err := s.Enroll(context.Background(), u.code, u.id, device(u.id, t0)); err != nil {
+		if _, err := s.Enroll(context.Background(), u.code, u.id, device(u.id, t0)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -506,7 +510,8 @@ func TestEnrollConcurrentSameCode(t *testing.T) {
 	for i := range racers {
 		go func() {
 			<-start
-			errs <- s.Enroll(context.Background(), aliceCode, aliceID, device(fmt.Sprint(i), t0))
+			_, err := s.Enroll(context.Background(), aliceCode, aliceID, device(fmt.Sprint(i), t0))
+			errs <- err
 		}()
 	}
 	close(start)
@@ -738,7 +743,7 @@ func TestAppVersion(t *testing.T) {
 	ctx := context.Background()
 	d := device(aliceID, t0)
 	d.AppVersion = 1000
-	if err := s.Enroll(ctx, aliceCode, aliceID, d); err != nil {
+	if _, err := s.Enroll(ctx, aliceCode, aliceID, d); err != nil {
 		t.Fatal(err)
 	}
 	versionOf := func() int {
@@ -793,7 +798,7 @@ func TestAppVersion(t *testing.T) {
 func TestDeleteUnclaimedEnrollmentsBefore(t *testing.T) {
 	s := enrolling(t) // alice and bob, codes expiring at t0+10m
 	ctx := context.Background()
-	if err := s.Enroll(ctx, aliceCode, aliceID, device(aliceID, t0)); err != nil {
+	if _, err := s.Enroll(ctx, aliceCode, aliceID, device(aliceID, t0)); err != nil {
 		t.Fatal(err)
 	}
 	pushTo(t, s, challengeID(1), aliceID, t0)
@@ -818,7 +823,7 @@ func TestDeleteUnclaimedEnrollmentsBefore(t *testing.T) {
 	if got, err := s.EnrollmentStatusOf(ctx, bobID, bobCode, t0); err != nil || got != EnrollmentInvalid {
 		t.Errorf("bob's code after the prune: %q %v, want invalid", got, err)
 	}
-	if err := s.Enroll(ctx, bobCode, bobID, device(bobID, t0)); !errors.Is(err, ErrActivationInvalid) {
+	if _, err := s.Enroll(ctx, bobCode, bobID, device(bobID, t0)); !errors.Is(err, ErrActivationInvalid) {
 		t.Errorf("enroll with bob's pruned code: %v, want ErrActivationInvalid", err)
 	}
 }

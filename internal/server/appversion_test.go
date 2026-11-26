@@ -210,7 +210,7 @@ func TestEnrollOutdatedAppKeepsCodeUnspent(t *testing.T) {
 	}
 
 	phone.AppVersion = minVersion
-	wantStatus(t, "enroll after update", f.serve(must[*http.Request](t)(phone.EnrollRequest(a, f.now()))), http.StatusOK, "{}")
+	wantStatus(t, "enroll after update", f.serve(must[*http.Request](t)(phone.EnrollRequest(a, f.now()))), http.StatusOK, `{"username":"alice"}`)
 	if got := f.appVersionOf(a.UserID); got != minVersion {
 		t.Fatalf("stored app version = %d, want %d", got, minVersion)
 	}

@@ -231,8 +231,10 @@ server looks it up by the code and never takes it from the header. If the
 header's `user_id` differs from that user, the request is rejected `401`.
 Because `user_id` is also signed, a device holding its own valid code can't
 enroll its keys under another user. The signature is checked against the
-`device_key` in the body: proof that the device holds it. Answer: `200 {}`.
-After this, Authentik's `enroll_status` for the user reports `success`.
+`device_key` in the body: proof that the device holds it. Answer:
+`200 {"username": "…"}`, the username Authentik enrolled the user with, for
+the app to label the account. Nothing else uses it: the server knows the
+user only by `user_id`. After this, Authentik's `enroll_status` for the user reports `success`.
 
 Every failure is `401 {"error": "unauthorized"}`: a bad header, timestamp or
 signature, a body with unknown or missing fields or a key that is not

@@ -29,8 +29,8 @@ func enrolledUser(t *testing.T, prefix string) (string, device) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status, body := enrollPhone(phone, act); status != http.StatusOK {
-		t.Fatalf("phone enroll: %d %s", status, body)
+	if status, body := enrollPhone(phone, act); status != http.StatusOK || body != `{"username":"`+username+`"}` {
+		t.Fatalf("phone enroll: %d %s, want 200 with username %s", status, body, username)
 	}
 	b.expect(b.do("POST", map[string]any{"component": "ak-stage-authenticator-duo"}), "xak-flow-redirect")
 	return username, device{phone: phone, act: act}

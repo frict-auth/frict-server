@@ -183,46 +183,47 @@ func (s *Store) EnrollmentStatusOf(ctx context.Context, userID, code string, now
 	return EnrollmentWaiting, nil
 }
 
-// Enroll registers d for the user code was issued to. claimedUserID is the
-// user the device's request names; it must be that same user. A code enrolls
-// at most one device, and only before it expires.
-func (s *Store) Enroll(ctx context.Context, code, claimedUserID string, d Device) error {
+// Enroll registers d for the user code was issued to and returns that
+// user's username. claimedUserID is the user the device's request names; it
+// must be that same user. A code enrolls at most one device, and only before
+// it expires.
+func (s *Store) Enroll(ctx context.Context, code, claimedUserID string, d Device) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer tx.Rollback()
 
-	var userID string
+	var userID, username string
 	var expires int64
 	err = tx.QueryRowContext(ctx,
-		`SELECT user_id, activation_expires_at FROM users WHERE activation_hash = ?`,
-		activationHash(code)).Scan(&userID, &expires)
+		`SELECT user_id, username, activation_expires_at FROM users WHERE activation_hash = ?`,
+		activationHash(code)).Scan(&userID, &username, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ErrActivationInvalid
+		return "", ErrActivationInvalid
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	if d.EnrolledAt.Unix() >= expires {
-		return ErrActivationInvalid
+		return "", ErrActivationInvalid
 	}
 	if userID != claimedUserID {
-		return ErrUserMismatch
+		return "", ErrUserMismatch
 	}
 	res, err := tx.ExecContext(ctx,
 		`INSERT INTO devices (user_id, device_key, approval_key, attestation, fid, enrolled_at, app_version)
 		 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (user_id) DO NOTHING`,
 		userID, d.DeviceKey, d.ApprovalKey, d.Attestation, d.FID, d.EnrolledAt.Unix(), d.AppVersion)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if n, err := res.RowsAffected(); err != nil {
-		return err
+		return "", err
 	} else if n == 0 {
-		return ErrActivationUsed
+		return "", ErrActivationUsed
 	}
-	return tx.Commit()
+	return username, tx.Commit()
 }
 
 // DeviceOf returns userID's enrolled device.

@@ -334,8 +334,8 @@ func TestDeviceEnrollThenStatusSuccess(t *testing.T) {
 	body := must[[]byte](t)(io.ReadAll(r.Body))
 	r.Body = io.NopCloser(strings.NewReader(string(body)))
 	w := f.serve(r)
-	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "{}" {
-		t.Fatalf("enroll: %d %s, want 200 {}", w.Code, w.Body)
+	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != `{"username":"alice"}` {
+		t.Fatalf("enroll: %d %s, want 200 {\"username\":\"alice\"}", w.Code, w.Body)
 	}
 	if got := f.status(a); got != "success" {
 		t.Fatalf("after enroll: %q, want success", got)
