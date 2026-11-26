@@ -147,7 +147,8 @@ may enroll.
 With `FRICT_MIN_APP_VERSION` set (unset or `0`: no minimum), a request whose
 header is missing, malformed, repeated or below the minimum is answered
 `426 {"error": "app_update_required", "min_version": <minimum>}` and does
-nothing else. The check comes after verification: a request that fails it
+nothing else. `remove` is exempt: an outdated app can always remove its
+enrollment. The check comes after verification: a request that fails it
 gets `401` as before and learns nothing from it.
 Enroll checks it after both attestations and before spending the activation
 code: attestation is what shows the request comes from the Frict app, and
@@ -172,7 +173,7 @@ All under `https://<api host>/device/v1/`. Responses are JSON. Errors are
 | 401 | `unauthorized` | Any verification failure, including a user with no enrolled device (never enrolled or removed). |
 | 404 | `not_found` | See each endpoint. |
 | 409 | `not_pending` | `answer` only. |
-| 426 | `app_update_required` | The app is older than the server's minimum (App version); the body also carries `min_version`. |
+| 426 | `app_update_required` | The app is older than the server's minimum (App version); the body also carries `min_version`. Never from `remove`. |
 
 The signature is checked before the app version and the body, so an
 unsigned or badly signed request gets `401` whatever its version and body.
@@ -347,7 +348,8 @@ and gets pushes again once it sends a FID.
 
 Request `{}`: an object with no fields. Deletes the user's enrollment and
 everything stored for it: the device, its keys and FID, and every challenge
-with what Authentik sent for it. Answer: `200 {}`.
+with what Authentik sent for it. Answer: `200 {}`, whatever the app version
+(App version).
 
 After it, the device's keys verify nothing, and `/auth/v2/auth` for the user
 ID gets `400`, code `40002` (Login above); Frict does not tell Authentik.

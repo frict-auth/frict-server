@@ -45,7 +45,8 @@ func signedRequests(t *testing.T, a fakephone.Activation, phone *fakephone.Phone
 	}
 }
 
-var endpoints = []string{"pending", "challenge", "answer", "fid", "remove"}
+// endpoints are those the minimum app version applies to: all but remove.
+var endpoints = []string{"pending", "challenge", "answer", "fid"}
 
 func (f *fixture) appVersionOf(userID string) int {
 	f.t.Helper()
@@ -75,7 +76,7 @@ func updateLines(t *testing.T, logs *syncBuffer) []map[string]any {
 
 // TestOutdatedAppRefusedOnEverySignedEndpoint: with a minimum set, a request
 // whose version is below it, missing or malformed gets 426 with the minimum
-// and does nothing, on every endpoint; the device's stored version becomes
+// and does nothing, on every endpoint but remove; the device's stored version becomes
 // what the request carried. The refusal logs one line saying why.
 func TestOutdatedAppRefusedOnEverySignedEndpoint(t *testing.T) {
 	for _, tc := range []struct {
@@ -143,17 +144,14 @@ func TestCurrentAppServed(t *testing.T) {
 		f, _, logs := newMinVersionFixture(t)
 		a, phone := f.enrolledPhone("alice")
 		phone.AppVersion = version
-		want := map[string]int{"pending": http.StatusOK, "challenge": http.StatusNotFound, "answer": http.StatusNotFound,
-			"fid": http.StatusOK, "remove": http.StatusOK}
+		want := map[string]int{"pending": http.StatusOK, "challenge": http.StatusNotFound, "answer": http.StatusNotFound, "fid": http.StatusOK}
 		for _, endpoint := range endpoints {
-			if endpoint == "remove" {
-				if got := f.appVersionOf(a.UserID); got != version {
-					t.Errorf("stored app version = %d, want %d", got, version)
-				}
-			}
 			if w := f.serve(signedRequests(t, a, phone, f.now())[endpoint]); w.Code != want[endpoint] {
 				t.Errorf("version %d %s: %d %s, want %d", version, endpoint, w.Code, w.Body, want[endpoint])
 			}
+		}
+		if got := f.appVersionOf(a.UserID); got != version {
+			t.Errorf("stored app version = %d, want %d", got, version)
 		}
 		if lines := updateLines(t, logs); len(lines) != 0 {
 			t.Errorf("version %d logged %v", version, lines)
@@ -267,4 +265,37 @@ func TestNoMinimumServesAnyVersion(t *testing.T) {
 		t.Fatalf("stored app version = %d, want 1", got)
 	}
 	f.wantPushed(a, phone)
+}
+
+// TestOutdatedAppCanRemove: removal answers whatever the app version, once
+// the signature holds: an outdated app removes itself, and logs no update
+// line; an outdated request signed by another key still gets 401 and
+// removes nothing.
+func TestOutdatedAppCanRemove(t *testing.T) {
+	for _, header := range []string{"", "999", "garbage"} {
+		t.Run("version "+header, func(t *testing.T) {
+			f, _, logs := newMinVersionFixture(t)
+			a, phone := f.enrolledPhone("alice")
+			thief := newPhone(t)
+			for _, p := range []*fakephone.Phone{thief, phone} {
+				r := f.remove(a, p)
+				r.Header.Del(AppVersionHeader)
+				if header != "" {
+					r.Header.Set(AppVersionHeader, header)
+				}
+				if p == thief {
+					wantStatus(t, "remove signed by another key", f.serve(r), http.StatusUnauthorized, `{"error":"unauthorized"}`)
+					if _, err := f.st.DeviceOf(context.Background(), a.UserID); err != nil {
+						t.Fatalf("device after a refused removal: %v", err)
+					}
+					continue
+				}
+				wantStatus(t, "remove", f.serve(r), http.StatusOK, "{}")
+			}
+			f.wantUnknownUser(a.UserID)
+			if lines := updateLines(t, logs); len(lines) != 0 {
+				t.Fatalf("removal logged %v", lines)
+			}
+		})
+	}
 }

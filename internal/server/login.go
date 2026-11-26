@@ -178,30 +178,11 @@ func decodeID(s string) ([]byte, bool) {
 	return id, err == nil && len(id) == 16
 }
 
-// deviceSigned reads a device request's body, verifies its signature against
-// the header user's stored key that keyOf picks, records the app version the
-// request carries, and requires it to be at least the minimum. On failure it
-// has already answered the request.
+// deviceSigned is deviceVerified, then records the app version the request
+// carries and requires it to be at least the minimum.
 func (s *Server) deviceSigned(w http.ResponseWriter, r *http.Request, keyOf func(store.Device) []byte) (userID string, body []byte, ok bool) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
-	if err != nil {
-		s.security(r, evDeviceRequest, "unreadable_body", devicesig.ClaimedUserID(r.Header.Get("Authorization")))
-		deviceFail(w, http.StatusBadRequest, "bad_request")
-		return "", nil, false
-	}
-	var dev store.Device
-	userID, err = devicesig.Verify(r, body, s.verifier.Now(), func(userID string) (*ecdsa.PublicKey, error) {
-		d, err := s.store.DeviceOf(r.Context(), userID)
-		if err != nil {
-			return nil, err
-		}
-		dev = d
-		return p256FromDER(keyOf(d))
-	})
-	if err != nil {
-		event, reason := deviceRejection(err)
-		s.security(r, event, reason, devicesig.ClaimedUserID(r.Header.Get("Authorization")))
-		deviceFail(w, http.StatusUnauthorized, "unauthorized")
+	userID, body, dev, ok := s.deviceVerified(w, r, keyOf)
+	if !ok {
 		return "", nil, false
 	}
 	version, reason := appVersion(r)
@@ -216,6 +197,33 @@ func (s *Server) deviceSigned(w http.ResponseWriter, r *http.Request, keyOf func
 		return "", nil, false
 	}
 	return userID, body, true
+}
+
+// deviceVerified reads a device request's body and verifies its signature
+// against the header user's stored key that keyOf picks. On failure it has
+// already answered the request.
+func (s *Server) deviceVerified(w http.ResponseWriter, r *http.Request, keyOf func(store.Device) []byte) (userID string, body []byte, dev store.Device, ok bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	if err != nil {
+		s.security(r, evDeviceRequest, "unreadable_body", devicesig.ClaimedUserID(r.Header.Get("Authorization")))
+		deviceFail(w, http.StatusBadRequest, "bad_request")
+		return "", nil, dev, false
+	}
+	userID, err = devicesig.Verify(r, body, s.verifier.Now(), func(userID string) (*ecdsa.PublicKey, error) {
+		d, err := s.store.DeviceOf(r.Context(), userID)
+		if err != nil {
+			return nil, err
+		}
+		dev = d
+		return p256FromDER(keyOf(d))
+	})
+	if err != nil {
+		event, reason := deviceRejection(err)
+		s.security(r, event, reason, devicesig.ClaimedUserID(r.Header.Get("Authorization")))
+		deviceFail(w, http.StatusUnauthorized, "unauthorized")
+		return "", nil, dev, false
+	}
+	return userID, body, dev, true
 }
 
 func deviceKey(d store.Device) []byte   { return d.DeviceKey }
