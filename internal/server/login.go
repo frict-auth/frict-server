@@ -75,7 +75,7 @@ func (s *Server) duoAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.log.Info("challenge created", "user_id", userID, "challenge_id", encodeID(id), "expires_in", s.challengeTTL.String())
-	s.wake(userID, map[string]string{"challenge_id": encodeID(id)})
+	s.wake(userID, map[string]string{"challenge_id": encodeID(id), "user_id": userID})
 
 	timer := time.NewTimer(s.challengeTTL)
 	defer timer.Stop()
