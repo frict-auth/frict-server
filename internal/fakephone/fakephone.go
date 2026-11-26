@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -26,6 +27,9 @@ const (
 	AnswerPath    = "/device/v1/answer"
 	FIDPath       = "/device/v1/fid"
 	RemovePath    = "/device/v1/remove"
+
+	// AppVersion is the versionCode a new Phone sends.
+	AppVersion = 1000
 )
 
 type Phone struct {
@@ -34,6 +38,9 @@ type Phone struct {
 	FID         string
 	// Attestation is what the keys' attestation chains claim.
 	Attestation Attestation
+	// AppVersion goes in each request's Frict-App-Version header; 0 sends
+	// none.
+	AppVersion int
 }
 
 func New() (*Phone, error) {
@@ -49,7 +56,7 @@ func New() (*Phone, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Phone{DeviceKey: dk, ApprovalKey: ak, FID: "fake-fid-" + rand.Text(), Attestation: att}, nil
+	return &Phone{DeviceKey: dk, ApprovalKey: ak, FID: "fake-fid-" + rand.Text(), Attestation: att, AppVersion: AppVersion}, nil
 }
 
 // Activation is what the app reads from an enrollment QR code or link.
@@ -118,13 +125,13 @@ func (p *Phone) EnrollRequest(a Activation, now time.Time) (*http.Request, error
 	if err != nil {
 		return nil, err
 	}
-	return SignedRequest("https://"+a.Host, EnrollPath, a.UserID, now.Unix(), body, p.DeviceKey)
+	return p.signed("https://"+a.Host, EnrollPath, a.UserID, now.Unix(), body, p.DeviceKey)
 }
 
 // PendingRequest asks for a's pending challenges, signed with the
 // device_key.
 func (p *Phone) PendingRequest(a Activation, now time.Time) (*http.Request, error) {
-	return SignedRequest("https://"+a.Host, PendingPath, a.UserID, now.Unix(), []byte("{}"), p.DeviceKey)
+	return p.signed("https://"+a.Host, PendingPath, a.UserID, now.Unix(), []byte("{}"), p.DeviceKey)
 }
 
 // Pending is the answer to a PendingRequest.
@@ -140,7 +147,7 @@ func (p *Phone) ChallengeRequest(a Activation, id string, now time.Time) (*http.
 	if err != nil {
 		return nil, err
 	}
-	return SignedRequest("https://"+a.Host, ChallengePath, a.UserID, now.Unix(), body, p.DeviceKey)
+	return p.signed("https://"+a.Host, ChallengePath, a.UserID, now.Unix(), body, p.DeviceKey)
 }
 
 // Challenge is the answer to a ChallengeRequest: what the app shows the
@@ -171,7 +178,7 @@ func (p *Phone) AnswerRequest(a Activation, id, decision, reason string, now tim
 	if err != nil {
 		return nil, err
 	}
-	return SignedRequest("https://"+a.Host, AnswerPath, a.UserID, now.Unix(), body, p.ApprovalKey)
+	return p.signed("https://"+a.Host, AnswerPath, a.UserID, now.Unix(), body, p.ApprovalKey)
 }
 
 // FIDRequest tells the server to push to fid from now on, signed with the
@@ -181,13 +188,22 @@ func (p *Phone) FIDRequest(a Activation, fid string, now time.Time) (*http.Reque
 	if err != nil {
 		return nil, err
 	}
-	return SignedRequest("https://"+a.Host, FIDPath, a.UserID, now.Unix(), body, p.DeviceKey)
+	return p.signed("https://"+a.Host, FIDPath, a.UserID, now.Unix(), body, p.DeviceKey)
 }
 
 // RemoveRequest deletes a's enrollment from the server, signed with the
 // device_key.
 func (p *Phone) RemoveRequest(a Activation, now time.Time) (*http.Request, error) {
-	return SignedRequest("https://"+a.Host, RemovePath, a.UserID, now.Unix(), []byte("{}"), p.DeviceKey)
+	return p.signed("https://"+a.Host, RemovePath, a.UserID, now.Unix(), []byte("{}"), p.DeviceKey)
+}
+
+// signed is SignedRequest with p's app version header.
+func (p *Phone) signed(base, path, userID string, unix int64, body []byte, key *ecdsa.PrivateKey) (*http.Request, error) {
+	r, err := SignedRequest(base, path, userID, unix, body, key)
+	if err == nil && p.AppVersion != 0 {
+		r.Header.Set("Frict-App-Version", strconv.Itoa(p.AppVersion))
+	}
+	return r, err
 }
 
 // SignedRequest builds a POST to base+path whose Authorization header claims

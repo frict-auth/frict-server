@@ -54,6 +54,8 @@ services:
       FRICT_CLIENT_SECRET_FILE: /secrets/duo-client-secret
       FRICT_DB_PATH: /data/frict.db
       FRICT_CHALLENGE_TTL: ${FRICT_CHALLENGE_TTL:-90s}
+      # fakephone.AppVersion, so fake phones are current unless a test says otherwise.
+      FRICT_MIN_APP_VERSION: "1000"
       # The fake phone's chains: debug build, test root.
       FRICT_ATTESTATION: emulator
       FRICT_APP_PACKAGES: app.frict.android.dev

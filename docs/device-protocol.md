@@ -129,6 +129,39 @@ captured request (a proxy log, a debug dump) is worth:
 A server-issued nonce would close the last two, at the cost of a round trip
 and server state on every request. Not worth it for a read and an FID.
 
+### App version
+
+Every request, enroll included, also carries the app's Android
+`versionCode`, a decimal integer from 1 to 2100000000 with no sign or
+leading zero:
+
+```
+Frict-App-Version: 1000
+```
+
+It is not part of the signed bytes. It asks an outdated app to update; it
+is not a security control: a client that lies about it gains nothing a
+current app doesn't have. Attestation, not this header, decides which app
+may enroll.
+
+With `FRICT_MIN_APP_VERSION` set (unset or `0`: no minimum), a request whose
+header is missing, malformed, repeated or below the minimum is answered
+`426 {"error": "app_update_required", "min_version": <minimum>}` and does
+nothing else. `remove` is exempt: an outdated app can always remove its
+enrollment. The check comes after verification: a request that fails it
+gets `401` as before and learns nothing from it.
+Enroll checks it after both attestations and before spending the activation
+code: attestation is what shows the request comes from the Frict app, and
+the unspent code lets the user update and enroll with the same QR within its
+`valid_secs`. The app shows the user that it needs an update.
+
+The server stores the version from each verified request (`0` when there is
+none) as the device's last seen version, and `/auth` refuses to push to a
+device whose last seen version is below the minimum (Login below). Each
+refused request logs a `WARN` line `app update required` with `endpoint`,
+`reason` (`missing`, `malformed` or `below_minimum`), `app_version`,
+`min_app_version` and `user_id`. It is not a security event.
+
 ## Endpoints
 
 All under `https://<api host>/device/v1/`. Responses are JSON. Errors are
@@ -140,9 +173,10 @@ All under `https://<api host>/device/v1/`. Responses are JSON. Errors are
 | 401 | `unauthorized` | Any verification failure, including a user with no enrolled device (never enrolled or removed). |
 | 404 | `not_found` | See each endpoint. |
 | 409 | `not_pending` | `answer` only. |
+| 426 | `app_update_required` | The app is older than the server's minimum (App version); the body also carries `min_version`. Never from `remove`. |
 
-The signature is checked before the body is parsed, so an unsigned or
-badly signed request gets `401` whatever its body.
+The signature is checked before the app version and the body, so an
+unsigned or badly signed request gets `401` whatever its version and body.
 
 ### Activation (Duo side)
 
@@ -205,7 +239,8 @@ signature, a body with unknown or missing fields or a key that is not
 P-256, an attestation that doesn't hold, and an activation code that is
 unknown, expired, already used or issued for another user. When the server
 can't get Google's revocation list it answers `503 {"error": "unavailable"}`
-and the code stays unspent: retry.
+and the code stays unspent: retry. An app below the minimum version gets
+`426` once both attestations hold, also with the code unspent (App version).
 
 ### Login (Duo side)
 
@@ -237,7 +272,16 @@ own (duo.com/docs/authapi, `/auth` status values):
 | deny, `cancel` | `deny` | `deny` | `Login request denied.` |
 | deny, `not_me` | `deny` | `fraud` | `Login request reported as fraudulent.` |
 | expired | `deny` | `timeout` | `Login timed out.` |
+| app below the minimum version | `deny` | `deny` | `Frict on the phone is out of date: update it from Google Play, open it, then sign in again.` |
 | refused by a safeguard | `deny` | `locked_out` | Which safeguard: pushes are paused, or the push cap is reached. |
+
+A device whose last seen app version is below `FRICT_MIN_APP_VERSION` gets
+no push: `/auth` denies at once, before the safeguards, and logs
+`push refused` with `lock=outdated`. Authentik shows the user only "Duo
+denied access"; the `status_msg` is in its `login_failed` event. Devices
+enrolled before the server stored versions have last seen version `0` until
+their next request. The app sends a request at every start, so opening the
+updated app is enough.
 
 A safeguard (PLAN Safeguards) can refuse `/auth` before any challenge
 exists: it answers at once with `locked_out`, which Duo documents as "The
@@ -304,7 +348,8 @@ and gets pushes again once it sends a FID.
 
 Request `{}`: an object with no fields. Deletes the user's enrollment and
 everything stored for it: the device, its keys and FID, and every challenge
-with what Authentik sent for it. Answer: `200 {}`.
+with what Authentik sent for it. Answer: `200 {}`, whatever the app version
+(App version).
 
 After it, the device's keys verify nothing, and `/auth/v2/auth` for the user
 ID gets `400`, code `40002` (Login above); Frict does not tell Authentik.

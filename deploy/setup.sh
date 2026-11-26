@@ -71,6 +71,8 @@ FRICT_CLIENT_ID=DI$(openssl rand -hex 9 | tr a-f A-F)
 #FRICT_NOT_ME_WINDOW=60m
 # Optional, default 30m: how long the pause lasts.
 #FRICT_PAUSE=30m
+# Optional, default 0: the least app versionCode served; older apps are asked to update. Raise it only once that version is on Play.
+#FRICT_MIN_APP_VERSION=0
 ENV
 
 echo "Installed $user and $dir."

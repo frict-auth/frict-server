@@ -8,11 +8,11 @@ import (
 )
 
 // deviceRemove deletes the user's enrollment and everything stored for it,
-// signed with the device_key. From then on /auth/v2/auth for that user_id
+// signed with the device_key, whatever the app's version. From then on /auth/v2/auth for that user_id
 // gets Duo's answer for an unknown user, and the device's key verifies
 // nothing.
 func (s *Server) deviceRemove(w http.ResponseWriter, r *http.Request) {
-	userID, body, ok := s.deviceSigned(w, r, deviceKey)
+	userID, body, _, ok := s.deviceVerified(w, r, deviceKey)
 	if !ok {
 		return
 	}

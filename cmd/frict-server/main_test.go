@@ -55,7 +55,7 @@ func TestLoadConfig(t *testing.T) {
 	}
 	defaults := sg(func(*server.Safeguards) {})
 	want := func(listen string, ttl time.Duration, s server.Safeguards) config {
-		return config{listen, "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", ttl, s, server.LoopbackProxies, fcmConfig{}, strictAttestation}
+		return config{listen, "api.frict.app", "DIXXXX", "/secrets/duo-client-secret", "/data/frict.db", ttl, s, server.LoopbackProxies, fcmConfig{}, strictAttestation, 0}
 	}
 	withAttestation := func(edit func(*attestConfig)) config {
 		c := want(":8080", 60*time.Second, defaults)
@@ -130,6 +130,13 @@ func TestLoadConfig(t *testing.T) {
 			withAttestation(func(a *attestConfig) { a.SigningCerts = append(debugCert, otherCert...) }), ""},
 		{"signing cert SHA-1", with("FRICT_APP_SIGNING_CERTS", "39:A8:54:E1:B2:D8:39:B5:96:0C:4D:95:52:B2:7E:9A:18:C0:50:5E"), config{}, "FRICT_APP_SIGNING_CERTS"},
 		{"signing cert not hex", with("FRICT_APP_SIGNING_CERTS", strings.Repeat("zz", 32)), config{}, "FRICT_APP_SIGNING_CERTS"},
+		{"min app version", with("FRICT_MIN_APP_VERSION", "1000"), func() config { c := want(":8080", 60*time.Second, defaults); c.MinAppVersion = 1000; return c }(), ""},
+		{"min app version 0 is none", with("FRICT_MIN_APP_VERSION", "0"), want(":8080", 60*time.Second, defaults), ""},
+		{"min app version largest", with("FRICT_MIN_APP_VERSION", "2100000000"), func() config { c := want(":8080", 60*time.Second, defaults); c.MinAppVersion = 2100000000; return c }(), ""},
+		{"min app version above Play's largest", with("FRICT_MIN_APP_VERSION", "2100000001"), config{}, "FRICT_MIN_APP_VERSION"},
+		{"min app version negative", with("FRICT_MIN_APP_VERSION", "-1"), config{}, "FRICT_MIN_APP_VERSION"},
+		{"min app version not a number", with("FRICT_MIN_APP_VERSION", "1.2.0"), config{}, "FRICT_MIN_APP_VERSION"},
+		{"min app version with space", with("FRICT_MIN_APP_VERSION", " 1000"), config{}, "FRICT_MIN_APP_VERSION"},
 		{"all missing named", map[string]string{}, config{}, "FRICT_API_HOSTNAME, FRICT_CLIENT_ID, FRICT_CLIENT_SECRET_FILE, FRICT_DB_PATH"},
 	}
 	for _, tc := range tests {

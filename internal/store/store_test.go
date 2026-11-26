@@ -176,6 +176,7 @@ func TestSchemaConstraints(t *testing.T) {
 		{"challenge for unknown user", challenge + `(` + id + `, 'DU404', '', '', 'pending', 100, 160, NULL, NULL)`, false},
 		{"device for known user", `INSERT INTO devices (user_id, device_key, approval_key, attestation, fid, enrolled_at) VALUES ('DU1', x'01', x'02', x'03', 'fid', 1)`, true},
 		{"device for unknown user", `INSERT INTO devices (user_id, device_key, approval_key, attestation, fid, enrolled_at) VALUES ('DU404', x'01', x'02', x'03', 'fid', 1)`, false},
+		{"negative app_version", `INSERT INTO devices (user_id, device_key, approval_key, attestation, fid, enrolled_at, app_version) VALUES ('DU1', x'01', x'02', x'03', 'fid', 1, -1)`, false},
 		{"negative pushes_since_success", `UPDATE users SET pushes_since_success = -1 WHERE user_id = 'DU1'`, false},
 	}
 	for _, tc := range tests {
@@ -725,5 +726,63 @@ func TestApprovalDoesNotResetNotMeCount(t *testing.T) {
 	}
 	if !pausedAt(t, s, 5, at.Add(30*time.Minute-time.Second)) || pausedAt(t, s, 6, at.Add(30*time.Minute)) {
 		t.Fatal("pause does not last exactly Pause")
+	}
+}
+
+// TestAppVersion: enrollment stores the version the phone sent, the latest
+// one replaces it, and a device below MinAppVersion gets no push: nothing is
+// stored and no counter moves. A device at the minimum, or any device with
+// no minimum, is pushed.
+func TestAppVersion(t *testing.T) {
+	s := enrolling(t)
+	ctx := context.Background()
+	d := device(aliceID, t0)
+	d.AppVersion = 1000
+	if err := s.Enroll(ctx, aliceCode, aliceID, d); err != nil {
+		t.Fatal(err)
+	}
+	versionOf := func() int {
+		t.Helper()
+		d, err := s.DeviceOf(ctx, aliceID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d.AppVersion
+	}
+	if got := versionOf(); got != 1000 {
+		t.Fatalf("app version after enroll = %d, want 1000", got)
+	}
+	if err := s.SetAppVersion(ctx, aliceID, 999); err != nil {
+		t.Fatal(err)
+	}
+	if got := versionOf(); got != 999 {
+		t.Fatalf("app version after SetAppVersion = %d, want 999", got)
+	}
+
+	push := func(b byte, min int) Lock {
+		t.Helper()
+		lim := noLimits
+		lim.MinAppVersion = min
+		lock, err := s.StartPush(ctx, Challenge{ID: challengeID(b), UserID: aliceID, CreatedAt: t0, ExpiresAt: t0.Add(time.Minute)}, lim)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return lock
+	}
+	if lock := push(1, 1000); lock != LockOutdated {
+		t.Fatalf("push to version 999 with minimum 1000: %q, want outdated", lock)
+	}
+	var pushes int
+	if err := s.db.QueryRow(`SELECT pushes_since_success FROM users WHERE user_id = ?`, aliceID).Scan(&pushes); err != nil {
+		t.Fatal(err)
+	}
+	if n := rowsOf(t, s, "challenges", aliceID); n != 0 || pushes != 0 {
+		t.Fatalf("refused push left %d challenges and %d pushes counted", n, pushes)
+	}
+	if lock := push(2, 999); lock != Unlocked {
+		t.Fatalf("push to version 999 with minimum 999: %q, want unlocked", lock)
+	}
+	if lock := push(3, 0); lock != Unlocked {
+		t.Fatalf("push with no minimum: %q, want unlocked", lock)
 	}
 }
