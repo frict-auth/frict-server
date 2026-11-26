@@ -166,7 +166,11 @@ domain and application Authentik sent) until it expired more than
 max(24 h, `FRICT_NOT_ME_WINDOW`) ago, so every answer the pause counts is
 still there. It deletes older records at startup and every hour. A
 removal deletes the user's records at once. The username Authentik sends at
-enrollment is stored with the user; nothing uses it.
+enrollment is stored with the user; nothing uses it. A user whose
+activation code expired without enrolling a phone is deleted 24 h after the
+expiry, in the same hourly run: an expired code already gets the same
+answers as an unknown one, so the day only lets the operator match a failed
+enrollment in the logs to its username.
 
 ### Security log
 

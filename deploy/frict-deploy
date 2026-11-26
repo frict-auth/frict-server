@@ -13,6 +13,8 @@ image=ghcr.io/frict-auth/frict-server
 dir=/srv/frict
 url=http://127.0.0.1:8081/healthz
 health_wait=20
+# Deploys whose backup and logs a successful deploy keeps, its own included.
+keep=5
 
 digest=${SSH_ORIGINAL_COMMAND-}
 if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
@@ -155,6 +157,28 @@ fi
 
 if ! printf '%s\n' "FRICT_DIGEST=$digest" "FRICT_MAIN_COMMIT=$commit" "FRICT_PREVIOUS_DIGEST=$previous" >.env.new || ! mv .env.new .env; then
   echo "DEPLOY FAILED: $image@$digest is running and healthy, but $dir/.env doesn't record it. Fix that and deploy again."
+  exit 1
+fi
+
+# prune DIR: deletes the files of all but the newest $keep deploys in DIR,
+# never this one's. A deploy's files start with its stamp.
+prune() {
+  local names name i
+  local -A seen=()
+  local -a old
+  names=$(find "$1" -maxdepth 1 -type f -regextype posix-extended -regex '.*/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}[^/]*' -printf '%f\n')
+  for name in $names; do
+    [[ ${name:0:29} == "$stamp" ]] || seen[${name:0:29}]=1
+  done
+  ((${#seen[@]} >= keep)) || return 0
+  mapfile -t old < <(printf '%s\n' "${!seen[@]}" | sort)
+  for ((i = 0; i <= ${#old[@]} - keep; i++)); do
+    echo "Deleting old $1/${old[i]}*"
+    rm -f -- "$1/${old[i]:?}"*
+  done
+}
+if ! prune backups || ! prune logs; then
+  echo "DEPLOY FAILED: $image@$digest is running and healthy, but deleting old backups and logs in $dir failed."
   exit 1
 fi
 echo "OK: $image@$digest is running and healthy. Previous: ${previous:-none}"

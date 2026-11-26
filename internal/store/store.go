@@ -521,6 +521,19 @@ func (s *Store) RemoveUser(ctx context.Context, userID string) error {
 	return nil
 }
 
+// DeleteUnclaimedEnrollmentsBefore deletes every user whose activation code
+// expired before t without enrolling a device, and returns how many it
+// deleted.
+func (s *Store) DeleteUnclaimedEnrollmentsBefore(ctx context.Context, t time.Time) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM users WHERE activation_expires_at < ?
+		 AND NOT EXISTS (SELECT 1 FROM devices WHERE devices.user_id = users.user_id)`, t.Unix())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // DeleteChallengesBefore deletes every challenge that expired before t,
 // with what Authentik sent for it, and returns how many it deleted.
 func (s *Store) DeleteChallengesBefore(ctx context.Context, t time.Time) (int64, error) {

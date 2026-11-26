@@ -36,8 +36,9 @@
 // Push is on only when both FRICT_FCM_* are set; with neither, the server
 // sends no pushes and devices find challenges by polling.
 //
-// Login records are deleted once they expired more than
-// max(24h, FRICT_NOT_ME_WINDOW) ago: at startup and every hour.
+// At startup and every hour, the server deletes login records that expired
+// more than max(24h, FRICT_NOT_ME_WINDOW) ago, and users whose activation
+// code expired more than 24h ago without enrolling a device.
 //
 // SIGINT or SIGTERM stops accepting connections and waits up to 15 s for
 // in-flight requests.
@@ -76,8 +77,12 @@ const (
 	maxChallengeTTL = 120 * time.Second
 
 	// minRetention is the least time a finished login record is kept.
-	minRetention  = 24 * time.Hour
-	pruneInterval = time.Hour
+	minRetention = 24 * time.Hour
+	// unclaimedGrace is how long a user whose activation code expired
+	// unused is kept. Deleting it changes no answer, so this is only for an
+	// operator matching a failed enrollment in the logs to its username.
+	unclaimedGrace = 24 * time.Hour
+	pruneInterval  = time.Hour
 
 	// fcmTimeout bounds each HTTP request to FCM or its token endpoint.
 	fcmTimeout = 10 * time.Second
@@ -258,17 +263,24 @@ func parsePrefix(s string) (netip.Prefix, error) {
 // count its not_me deny.
 func retention(sg server.Safeguards) time.Duration { return max(minRetention, sg.NotMeWindow) }
 
-// pruneLoginRecords deletes login records past retention now, then every
-// pruneInterval until ctx is done.
-func pruneLoginRecords(ctx context.Context, st *store.Store, keep time.Duration, log *slog.Logger) {
+// prune deletes login records past retention and users unclaimed past
+// unclaimedGrace now, then every pruneInterval until ctx is done.
+func prune(ctx context.Context, st *store.Store, keep time.Duration, log *slog.Logger) {
 	ticker := time.NewTicker(pruneInterval)
 	defer ticker.Stop()
 	for {
-		n, err := st.DeleteChallengesBefore(ctx, time.Now().Add(-keep))
+		now := time.Now()
+		n, err := st.DeleteChallengesBefore(ctx, now.Add(-keep))
 		if err != nil {
 			log.Error("prune login records", "err", err)
 		} else {
 			log.Info("pruned login records", "deleted", n, "retention", keep.String())
+		}
+		n, err = st.DeleteUnclaimedEnrollmentsBefore(ctx, now.Add(-unclaimedGrace))
+		if err != nil {
+			log.Error("prune unclaimed enrollments", "err", err)
+		} else {
+			log.Info("pruned unclaimed enrollments", "deleted", n, "grace", unclaimedGrace.String())
 		}
 		select {
 		case <-ctx.Done():
@@ -334,7 +346,7 @@ func run(ctx context.Context, cfg config, ln net.Listener, log *slog.Logger) err
 	pruned := make(chan struct{})
 	go func() {
 		defer close(pruned)
-		pruneLoginRecords(pruneCtx, st, retention(cfg.Safeguards), log)
+		prune(pruneCtx, st, retention(cfg.Safeguards), log)
 	}()
 	defer func() {
 		stopPrune()

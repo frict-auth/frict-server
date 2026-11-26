@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -857,6 +858,66 @@ docker logs --since "$since" frict-frict-server-1 2>&1 | grep -F event=device_si
 		}
 	})
 
+	t.Run("a successful deploy keeps the newest 5 deploys' backups and logs, its own always; a failed one deletes nothing", func(t *testing.T) {
+		// 3 stamps from the past and 5 from the future, so the new deploy's
+		// own stamp is not among the newest 5 by name.
+		var seeded []string
+		for _, y := range []string{"2020", "2021", "2022", "2099", "2099", "2099", "2099", "2099"} {
+			stamp := fmt.Sprintf("%s0101T00000%dZ-%012x", y, len(seeded), len(seeded))
+			seeded = append(seeded, stamp)
+		}
+		var seed strings.Builder
+		for _, st := range seeded {
+			fmt.Fprintf(&seed, "touch backups/%[1]s.tar logs/%[1]s.log logs/%[1]s-server-%012x.log\n", st, 0)
+		}
+		s.server(t, "cd "+srvDir+"\n"+seed.String()+"touch backups/kept-by-hand.tar logs/notes.txt")
+		files := func() []string {
+			return strings.Fields(s.server(t, "cd "+srvDir+" && find backups logs -type f | sort"))
+		}
+		stampOf := func(f string) string {
+			return regexp.MustCompile(`^(backups|logs)/(\d{8}T\d{6}Z-[0-9a-f]{12})`).FindStringSubmatch(f)[2]
+		}
+
+		before := files()
+		if out, ok := s.deploy(t, unhealthy); ok || !strings.Contains(out, "WENT BACK") {
+			t.Fatalf("ok=%v, want the unhealthy build to fail and go back", ok)
+		}
+		failed := files()
+		if !isSubset(before, failed) {
+			t.Fatalf("a failed deploy deleted files:\n--- before\n%s\n--- after\n%s", strings.Join(before, "\n"), strings.Join(failed, "\n"))
+		}
+
+		out := s.mustDeploy(t, v4)
+		own := regexp.MustCompile(`backups/(\S+)\.tar`).FindStringSubmatch(out)
+		if own == nil {
+			t.Fatalf("deploy took no backup:\n%s", out)
+		}
+		keep := map[string]bool{own[1]: true}
+		for _, st := range seeded[len(seeded)-4:] {
+			keep[st] = true
+		}
+		var want []string
+		for _, f := range failed {
+			if strings.HasSuffix(f, "kept-by-hand.tar") || strings.HasSuffix(f, "notes.txt") || keep[stampOf(f)] {
+				want = append(want, f)
+			}
+		}
+		for _, f := range files() {
+			if !strings.HasSuffix(f, "kept-by-hand.tar") && !strings.HasSuffix(f, "notes.txt") && stampOf(f) == own[1] && !slices.Contains(want, f) {
+				want = append(want, f)
+			}
+		}
+		slices.Sort(want)
+		if got := files(); !slices.Equal(got, want) {
+			t.Errorf("after a successful deploy:\n%s\nwant the newest 4 other deploys' files, this deploy's and files not named for a deploy:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+		}
+		if !slices.Contains(files(), "backups/"+own[1]+".tar") {
+			t.Errorf("the backup just taken, %s, was deleted", own[1])
+		}
+		s.server(t, "cd "+srvDir+" && rm -f -- backups/2099* logs/2099* backups/kept-by-hand.tar logs/notes.txt")
+		s.wantServing(t, v4)
+	})
+
 	t.Run("deploy outlives its SSH connection and refuses a second one", func(t *testing.T) {
 		// docker pull waits on the paused registry, so the deploy is under way
 		// when its client dies.
@@ -993,4 +1054,14 @@ func docBlock(t *testing.T, after string) string {
 func restoreCommands(t *testing.T, backup string) string {
 	t.Helper()
 	return strings.NewReplacer("<backup>.tar", backup, "sudo ", "").Replace(docBlock(t, "## Restore"))
+}
+
+// isSubset reports whether every element of a is in b.
+func isSubset(a, b []string) bool {
+	for _, x := range a {
+		if !slices.Contains(b, x) {
+			return false
+		}
+	}
+	return true
 }
