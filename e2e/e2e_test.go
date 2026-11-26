@@ -140,7 +140,7 @@ func setup() error {
 	if err := bindStages(flow.PK, ident, pass, validate, login); err != nil {
 		return err
 	}
-	return setupLDAP(stage, ident, pass, login)
+	return setupLDAP(stage, flow.PK, ident, pass, login)
 }
 
 // newPhoneClient returns the fake phone's HTTPS client: it trusts only the
