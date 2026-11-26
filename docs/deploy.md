@@ -90,8 +90,8 @@ dir=$(mktemp -d)
 trap 'rm -rf "${dir:?}"' EXIT
 cd "$dir"
 curl -fsSLo install.sh -H 'Accept: application/vnd.github.raw+json' \
-  https://api.github.com/repos/frict-auth/frict-server/git/blobs/f05173e9a63c58e2278f7a7ea69523e3b7079c20
-echo '6325bfd4a8b7207c8a766c320b0d2d4de0f21425e158a7863fe5ff352fb30b87  install.sh' | sha256sum --check --strict
+  https://api.github.com/repos/frict-auth/frict-server/git/blobs/76831c4c5c87a477b1e7304d34f28efd6213c7d7
+echo '700cd036e15ffbe732180654a8fe8b8f4886731a275ec4abb721a67a9f65e98f  install.sh' | sha256sum --check --strict
 sudo bash install.sh "$key"
 )
 ```
@@ -198,6 +198,13 @@ The job's log ends with one of these:
 frict-server's own log is not in the job's log, which is public. On the
 deployment server, `sudo docker compose logs frict-server` in `/srv/frict`
 shows the live log; `/srv/frict/logs/` holds copies saved at deploy time.
+
+A successful deploy keeps the backups in `/srv/frict/backups/` and the logs
+in `/srv/frict/logs/` of the newest 5 deploys, its own always among them,
+and deletes older ones; a failed deploy deletes nothing. A backup restores
+the database as of its deploy, losing everything written since, so one more
+than a few deploys old is not worth restoring. Files whose names don't start
+with a deploy's stamp are left alone.
 
 frict-server refuses a database newer than it knows. If the failed version
 migrated it, going back can't work: the log says so, and the backup has to be

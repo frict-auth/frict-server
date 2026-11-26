@@ -483,7 +483,7 @@ func TestRetentionIsAtLeastADayAndTheNotMeWindow(t *testing.T) {
 
 // TestRunPrunesLoginRecordsAtStartup: a challenge that expired more than
 // the retention ago is gone once the server is up; a newer one stays.
-func TestRunPrunesLoginRecordsAtStartup(t *testing.T) {
+func TestRunPrunesAtStartup(t *testing.T) {
 	cfg := testConfig(t, "s3cret")
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
@@ -497,6 +497,17 @@ func TestRunPrunesLoginRecordsAtStartup(t *testing.T) {
 	}
 	if err := st.Enroll(ctx, "CODE", "DUAAAAAAAAAAAAAAAAAAAAAAAAAA", store.Device{DeviceKey: []byte{1}, ApprovalKey: []byte{2}, Attestation: []byte("{}"), EnrolledAt: now}); err != nil {
 		t.Fatal(err)
+	}
+	for _, u := range []struct {
+		id      string
+		expires time.Time
+	}{
+		{"DUBBBBBBBBBBBBBBBBBBBBBBBBBB", now.Add(-unclaimedGrace - time.Minute)},
+		{"DUCCCCCCCCCCCCCCCCCCCCCCCCCC", now.Add(-unclaimedGrace + time.Minute)},
+	} {
+		if err := st.CreateEnrollment(ctx, u.id, "unclaimed", u.id, u.expires.Add(-time.Minute), u.expires); err != nil {
+			t.Fatal(err)
+		}
 	}
 	old, recent := make([]byte, 16), make([]byte, 16)
 	recent[0] = 1
@@ -517,7 +528,7 @@ func TestRunPrunesLoginRecordsAtStartup(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- run(runCtx, cfg, ln, slog.New(slog.NewTextHandler(logs, nil))) }()
 	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(logs.String(), "pruned login records") {
+	for !strings.Contains(logs.String(), "pruned unclaimed enrollments") {
 		if time.Now().After(deadline) {
 			t.Fatalf("no prune at startup; logs:\n%s", logs)
 		}
@@ -527,8 +538,10 @@ func TestRunPrunesLoginRecordsAtStartup(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("run = %v", err)
 	}
-	if !strings.Contains(logs.String(), "deleted=1 ") {
-		t.Fatalf("startup prune did not delete exactly the old challenge; logs:\n%s", logs)
+	for _, line := range []string{"msg=\"pruned login records\" deleted=1 ", "msg=\"pruned unclaimed enrollments\" deleted=1 grace=24h0m0s"} {
+		if !strings.Contains(logs.String(), line) {
+			t.Fatalf("startup prune logged no %q; logs:\n%s", line, logs)
+		}
 	}
 	st, err = store.Open(cfg.DBPath)
 	if err != nil {
@@ -540,5 +553,8 @@ func TestRunPrunesLoginRecordsAtStartup(t *testing.T) {
 	}
 	if _, err := st.CloseChallenge(ctx, recent); err != nil {
 		t.Fatalf("recent challenge after startup: %v, want kept", err)
+	}
+	if _, err := st.DeviceOf(ctx, "DUAAAAAAAAAAAAAAAAAAAAAAAAAA"); err != nil {
+		t.Fatalf("enrolled user after startup: %v, want kept", err)
 	}
 }

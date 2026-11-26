@@ -786,3 +786,39 @@ func TestAppVersion(t *testing.T) {
 		t.Fatalf("push with no minimum: %q, want unlocked", lock)
 	}
 }
+
+// TestDeleteUnclaimedEnrollmentsBefore deletes users whose code expired
+// before the cutoff with no device, and keeps enrolled users whatever their
+// code's expiry, and unclaimed codes expiring at or after the cutoff.
+func TestDeleteUnclaimedEnrollmentsBefore(t *testing.T) {
+	s := enrolling(t) // alice and bob, codes expiring at t0+10m
+	ctx := context.Background()
+	if err := s.Enroll(ctx, aliceCode, aliceID, device(aliceID, t0)); err != nil {
+		t.Fatal(err)
+	}
+	pushTo(t, s, challengeID(1), aliceID, t0)
+	const carolID = "DUCCCCCCCCCCCCCCCCCCCCCCCCCC"
+	if err := s.CreateEnrollment(ctx, carolID, "carol", "CAROLCODE", t0, t0.Add(20*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+
+	cutoff := t0.Add(20 * time.Minute)
+	n, err := s.DeleteUnclaimedEnrollmentsBefore(ctx, cutoff)
+	if err != nil || n != 1 {
+		t.Fatalf("DeleteUnclaimedEnrollmentsBefore = %d %v, want 1", n, err)
+	}
+	for id, want := range map[string]int{aliceID: 1, bobID: 0, carolID: 1} {
+		if got := rowsOf(t, s, "users", id); got != want {
+			t.Errorf("users rows for %s = %d, want %d", id, got, want)
+		}
+	}
+	if n := rowsOf(t, s, "challenges", aliceID); n != 1 {
+		t.Errorf("alice's challenges = %d, want kept", n)
+	}
+	if got, err := s.EnrollmentStatusOf(ctx, bobID, bobCode, t0); err != nil || got != EnrollmentInvalid {
+		t.Errorf("bob's code after the prune: %q %v, want invalid", got, err)
+	}
+	if err := s.Enroll(ctx, bobCode, bobID, device(bobID, t0)); !errors.Is(err, ErrActivationInvalid) {
+		t.Errorf("enroll with bob's pruned code: %v, want ErrActivationInvalid", err)
+	}
+}
