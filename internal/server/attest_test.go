@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -77,7 +80,16 @@ func TestDeviceEnrollRejectsBadAttestation(t *testing.T) {
 			phone := newPhone(t)
 			c.change(&phone.Attestation)
 			skip := lineCount(logs)
-			f.rejectEnroll(must[*http.Request](t)(phone.EnrollRequest(a, f.now())), a)
+			r := must[*http.Request](t)(phone.EnrollRequest(a, f.now()))
+			body := must[[]byte](t)(io.ReadAll(r.Body))
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			var sent struct {
+				Attestation map[string][]string `json:"attestation"`
+			}
+			if err := json.Unmarshal(body, &sent); err != nil {
+				t.Fatal(err)
+			}
+			f.rejectEnroll(r, a)
 			if got := f.status(a); got != "waiting" {
 				t.Fatalf("after a rejected attestation: %q, want waiting", got)
 			}
@@ -91,8 +103,16 @@ func TestDeviceEnrollRejectsBadAttestation(t *testing.T) {
 					t.Errorf("security line %v: %s = %v, want %v", lines[0], k, lines[0][k], v)
 				}
 			}
-			if out := logs.String(); strings.Contains(out, "MII") || strings.Contains(out, "Android Keystore Key") {
-				t.Errorf("logs hold a certificate:\n%s", out)
+			out := logs.String()
+			for _, chain := range sent.Attestation {
+				for _, cert := range chain {
+					if strings.Contains(out, cert[:40]) {
+						t.Errorf("logs hold a certificate the phone sent:\n%s", out)
+					}
+				}
+			}
+			if strings.Contains(out, "Android Keystore Key") {
+				t.Errorf("logs hold a certificate's subject:\n%s", out)
 			}
 		})
 	}
