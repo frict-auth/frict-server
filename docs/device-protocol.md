@@ -300,7 +300,8 @@ user has been disabled due to authentication failures" with result `deny`
 ### `challenge` (signed with `device_key`)
 
 Request `{"challenge_id": "<22 chars>"}`. The ID is 16 random bytes,
-base64url without padding. The push carries only this ID (see Push).
+base64url without padding. The push carries this ID and the user ID (see
+Push).
 
 Response:
 
@@ -372,10 +373,12 @@ tries to deliver at once, waking a device in Doze. FCM may deprioritize
 high-priority messages that don't lead to a user-visible notification, so
 the app shows one for each (firebase.google.com/docs/cloud-messaging/android-message-priority).
 One `data` payload, sent when `/auth/v2/auth` creates a challenge for the
-user: `{"challenge_id": "<22 chars>"}`, 16 random bytes, base64url without
-padding, the same ID `pending` lists. The app fetches everything else with
-a signed `challenge` request, so Google never sees who is signing in to
-what.
+user: `{"challenge_id": "<22 chars>", "user_id": "DU…"}`. `challenge_id` is
+16 random bytes, base64url without padding, the same ID `pending` lists.
+`user_id` is the user ID issued at enrollment; one phone has one FID for all
+its accounts, so the app asks only the server of the account with that ID.
+The app fetches everything else with a signed `challenge` request, so
+Google sees two random IDs and never who is signing in to what.
 
 Push is best effort. `/auth` doesn't wait on it, and a failed push changes
 nothing about the challenge; the app finds it by polling `pending` at
