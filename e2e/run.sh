@@ -6,14 +6,14 @@
 #   EVIDENCE_DIR            where logs go (default: e2e/logs)
 #   FRICT_E2E_ANSWER_DELAY  how long the fake phone takes to answer in the
 #                           slow-human tests (default: 60s)
-#   FRICT_CHALLENGE_TTL     frict-server's push expiry (default: 90s)
+#   FRICT_CHALLENGE_TTL     frict-server's push expiry (default: 85s)
 #   E2E_RUN                 go test -run filter (default: all)
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 evidence="${EVIDENCE_DIR:-$here/logs}"
 export FRICT_E2E_ANSWER_DELAY="${FRICT_E2E_ANSWER_DELAY:-60s}"
-export FRICT_CHALLENGE_TTL="${FRICT_CHALLENGE_TTL:-90s}"
+export FRICT_CHALLENGE_TTL="${FRICT_CHALLENGE_TTL:-85s}"
 mkdir -p "$evidence"
 compose() { docker compose -f "$here/compose.yaml" "$@"; }
 

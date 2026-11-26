@@ -35,42 +35,78 @@ var ldapUsers = []string{
 	"ldap-mallory", // denied: LDAP bind and PAM via tuned SSSD
 }
 
+// ldapNoDevice may log in over LDAP but has no Frict device.
+const ldapNoDevice = "ldap-dave"
+
+// ldapSvcPass is the service account's password, read by setupLDAP.
+var ldapSvcPass string
+
 // ldapDevices holds each LDAP user's phone, enrolled on frict-server by
 // setupLDAP.
 var ldapDevices = map[string]device{}
 
 func userDN(username string) string { return "cn=" + username + ",ou=users," + ldapBaseDN }
 
-// setupLDAP adds an LDAP provider whose bind flow is
-// identification -> password -> Duo validation -> login, an outpost for it,
-// the service account SSSD searches with, and users whose phones are
-// enrolled on frict-server; then starts the outpost and both SSSD clients and
-// waits for them.
-func setupLDAP(stage func(string, map[string]any) (string, error), ident, pass, login string) error {
+// setupLDAP builds the M5 design (docs/ldap.md): one LDAP provider whose bind
+// flow is identification -> password -> Frict validation -> login, where the
+// validation stage denies users without a device and a negated user binding
+// lets only the service account skip it. browserFlow gets a deny stage for
+// the service account. It then starts the outpost and both SSSD clients.
+func setupLDAP(stage func(string, map[string]any) (string, error), browserFlow, ident, pass, login string) error {
+	var err error
+	if ldapSvcPass, err = readSecret("ldap-svc-password"); err != nil {
+		return err
+	}
+	svcPK, err := newUser(map[string]any{"username": ldapSvcUser, "name": ldapSvcUser, "type": "service_account"}, ldapSvcPass)
+	if err != nil {
+		return err
+	}
+
+	denySvc, err := stage("deny", map[string]any{"name": "deny-ldap-svc"})
+	if err != nil {
+		return err
+	}
+	denyBinding, err := bindReevaluated(browserFlow, denySvc, 15)
+	if err != nil {
+		return err
+	}
+	if err := bindUser(denyBinding, svcPK, false); err != nil {
+		return err
+	}
+
 	validate, err := stage("authenticator/validate", map[string]any{
-		"name": "frict-m0-ldap-validate", "device_classes": []string{"duo"},
-		// The service account has no device and must bind without MFA.
-		"not_configured_action": "skip",
+		"name": "ldap-frict-validate", "device_classes": []string{"duo"}, "not_configured_action": "deny",
 	})
 	if err != nil {
 		return err
 	}
 	var flow struct{ PK string }
 	if err := admin("POST", "/api/v3/flows/instances/", map[string]any{
-		"name": "frict-m0-ldap", "slug": "frict-m0-ldap", "title": "Frict M0 LDAP", "designation": "authentication",
+		"name": "ldap-bind", "slug": "ldap-bind", "title": "LDAP bind", "designation": "authentication",
 	}, &flow); err != nil {
 		return err
 	}
-	if err := bindStages(flow.PK, ident, pass, validate, login); err != nil {
+	if err := bindStages(flow.PK, ident, pass); err != nil {
 		return err
 	}
-	logout, err := stage("user_logout", map[string]any{"name": "frict-m0-ldap-logout"})
+	validateBinding, err := bindReevaluated(flow.PK, validate, 30)
+	if err != nil {
+		return err
+	}
+	if err := bindUser(validateBinding, svcPK, true); err != nil {
+		return err
+	}
+	if err := admin("POST", "/api/v3/flows/bindings/", map[string]any{"target": flow.PK, "stage": login, "order": 40}, nil); err != nil {
+		return err
+	}
+
+	logout, err := stage("user_logout", map[string]any{"name": "ldap-logout"})
 	if err != nil {
 		return err
 	}
 	var unbind struct{ PK string }
 	if err := admin("POST", "/api/v3/flows/instances/", map[string]any{
-		"name": "frict-m0-ldap-unbind", "slug": "frict-m0-ldap-unbind", "title": "Frict M0 LDAP unbind", "designation": "invalidation",
+		"name": "ldap-unbind", "slug": "ldap-unbind", "title": "LDAP unbind", "designation": "invalidation",
 	}, &unbind); err != nil {
 		return err
 	}
@@ -88,37 +124,27 @@ func setupLDAP(stage func(string, map[string]any) (string, error), ident, pass, 
 	}
 	var kp struct{ PK string }
 	if err := admin("POST", "/api/v3/crypto/certificatekeypairs/", map[string]any{
-		"name": "frict-m0-ldap", "certificate_data": certPEM, "key_data": keyPEM,
+		"name": "ldap.frict.test", "certificate_data": certPEM, "key_data": keyPEM,
 	}, &kp); err != nil {
 		return err
 	}
 	var provider struct{ PK int }
 	if err := admin("POST", "/api/v3/providers/ldap/", map[string]any{
-		"name": "frict-m0-ldap", "authorization_flow": flow.PK, "invalidation_flow": unbind.PK,
+		"name": "ldap", "authorization_flow": flow.PK, "invalidation_flow": unbind.PK,
 		"base_dn": ldapBaseDN, "certificate": kp.PK, "tls_server_name": "ldap.frict.test",
-		"bind_mode": "direct", "search_mode": "direct", "mfa_support": true,
+		"bind_mode": "direct", "search_mode": "direct", "mfa_support": false,
 	}, &provider); err != nil {
 		return err
 	}
+	var app struct{ PK string }
 	if err := admin("POST", "/api/v3/core/applications/", map[string]any{
-		"name": "frict-m0-ldap", "slug": "frict-m0-ldap", "provider": provider.PK,
-	}, nil); err != nil {
-		return err
-	}
-	var outpost struct{ PK string }
-	if err := admin("POST", "/api/v3/outposts/instances/", map[string]any{
-		"name": "frict-m0-ldap", "type": "ldap", "providers": []int{provider.PK},
-		"config": map[string]any{"authentik_host": "http://server:9000"},
-	}, &outpost); err != nil {
-		return err
-	}
-	var token struct{ Key string }
-	if err := admin("GET", "/api/v3/core/tokens/ak-outpost-"+outpost.PK+"-api/view_key/", nil, &token); err != nil {
+		"name": "ldap", "slug": "ldap", "provider": provider.PK,
+	}, &app); err != nil {
 		return err
 	}
 
 	var role struct{ PK string }
-	if err := admin("POST", "/api/v3/rbac/roles/", map[string]any{"name": "frict-m0-ldap-search"}, &role); err != nil {
+	if err := admin("POST", "/api/v3/rbac/roles/", map[string]any{"name": "ldap-search"}, &role); err != nil {
 		return err
 	}
 	if err := admin("POST", "/api/v3/rbac/permissions/assigned_by_roles/"+role.PK+"/assign/", map[string]any{
@@ -127,16 +153,19 @@ func setupLDAP(stage func(string, map[string]any) (string, error), ident, pass, 
 	}, nil); err != nil {
 		return err
 	}
-	svcPass, err := readSecret("ldap-svc-password")
-	if err != nil {
+	if err := admin("PATCH", fmt.Sprintf("/api/v3/core/users/%d/", svcPK), map[string]any{"roles": []string{role.PK}}, nil); err != nil {
 		return err
 	}
-	if _, err := newUser(map[string]any{"username": ldapSvcUser, "name": ldapSvcUser, "roles": []string{role.PK}}, svcPass); err != nil {
-		return err
-	}
-	for _, username := range ldapUsers {
-		if _, err := newUser(map[string]any{"username": username, "name": username}, env.userPass); err != nil {
+
+	var members []int
+	for _, username := range append([]string{ldapNoDevice}, ldapUsers...) {
+		pk, err := newUser(map[string]any{"username": username, "name": username}, env.userPass)
+		if err != nil {
 			return err
+		}
+		members = append(members, pk)
+		if username == ldapNoDevice {
+			continue
 		}
 		d, err := enrollViaDuoAPI(username)
 		if err != nil {
@@ -148,6 +177,28 @@ func setupLDAP(stage func(string, map[string]any) (string, error), ident, pass, 
 		}
 		ldapDevices[username] = d
 	}
+	var group struct{ PK string }
+	if err := admin("POST", "/api/v3/core/groups/", map[string]any{"name": "ldap-login", "users": members}, &group); err != nil {
+		return err
+	}
+	for i, who := range []map[string]any{{"group": group.PK}, {"user": svcPK}} {
+		who["target"], who["order"] = app.PK, i
+		if err := admin("POST", "/api/v3/policies/bindings/", who, nil); err != nil {
+			return err
+		}
+	}
+
+	var outpost struct{ PK string }
+	if err := admin("POST", "/api/v3/outposts/instances/", map[string]any{
+		"name": "ldap", "type": "ldap", "providers": []int{provider.PK},
+		"config": map[string]any{"authentik_host": "http://server:9000"},
+	}, &outpost); err != nil {
+		return err
+	}
+	var token struct{ Key string }
+	if err := admin("GET", "/api/v3/core/tokens/ak-outpost-"+outpost.PK+"-api/view_key/", nil, &token); err != nil {
+		return err
+	}
 
 	up := composeCmd("up", "--detach", "--no-deps", "--wait", "--wait-timeout", "120", "ldap")
 	up.Env = append(os.Environ(), "FRICT_LDAP_OUTPOST_TOKEN="+token.Key)
@@ -157,26 +208,49 @@ func setupLDAP(stage func(string, map[string]any) (string, error), ident, pass, 
 	if out, err := composeCmd("up", "--detach", "--no-deps", sssdDefault, sssdTuned).CombinedOutput(); err != nil {
 		return fmt.Errorf("starting sssd clients: %v\n%s", err, out)
 	}
+	// A wrong password answered with invalidCredentials means the outpost
+	// serves LDAPS and runs the bind flow. Whether the right one binds is
+	// for the tests to say.
+	return retry(2*time.Minute, func() error {
+		if r := ldapSearch(sssdTuned, ldapSvcUser, ldapSvcPass+"-wrong", ldapBaseDN); r.exit != 49 {
+			return fmt.Errorf("outpost readiness: wrong service account password: exit %d, want 49: %s", r.exit, r.out)
+		}
+		return nil
+	})
+}
+
+// bindReevaluated binds stage into flow at order, with its policies
+// evaluated against the pending user when the flow reaches it, and returns
+// the binding's policy target.
+func bindReevaluated(flow, stage string, order int) (string, error) {
+	var b struct {
+		PBM string `json:"policybindingmodel_ptr_id"`
+	}
+	err := admin("POST", "/api/v3/flows/bindings/", map[string]any{
+		"target": flow, "stage": stage, "order": order, "evaluate_on_plan": false, "re_evaluate_policies": true,
+	}, &b)
+	return b.PBM, err
+}
+
+// bindUser binds the user userPK to target as a policy, negated or not.
+func bindUser(target string, userPK int, negate bool) error {
+	return admin("POST", "/api/v3/policies/bindings/", map[string]any{
+		"target": target, "user": userPK, "negate": negate, "order": 0,
+	}, nil)
+}
+
+// requireNSS waits for svc's SSSD to resolve username, which needs the
+// service account's search.
+func requireNSS(t *testing.T, svc, username string) {
+	t.Helper()
 	if err := retry(2*time.Minute, func() error {
-		r := ldapSearch(sssdTuned, ldapSvcUser, svcPass, userDN("ldap-alice"))
-		if r.exit != 0 {
-			return fmt.Errorf("service account search: exit %d: %s", r.exit, r.out)
+		if r := inContainer(svc, "", "id", username); r.exit != 0 {
+			return fmt.Errorf("%s: id %s: exit %d: %s", svc, username, r.exit, r.out)
 		}
 		return nil
 	}); err != nil {
-		return err
+		t.Fatal(err)
 	}
-	for _, svc := range []string{sssdDefault, sssdTuned} {
-		if err := retry(2*time.Minute, func() error {
-			if r := inContainer(svc, "", "id", "ldap-alice"); r.exit != 0 {
-				return fmt.Errorf("%s: id ldap-alice: exit %d: %s", svc, r.exit, r.out)
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func retry(limit time.Duration, f func() error) error {
@@ -226,8 +300,11 @@ func ldapSearch(svc, username, password, base string) result {
 		"ldapsearch", "-x", "-LLL", "-H", ldapURI, "-D", userDN(username), "-w", password, "-b", base, "-s", "base", "cn")
 }
 
-// pamAuth runs one PAM authentication for username through pam_sss in svc.
-func pamAuth(svc, username string) result {
+// pamAuth runs one PAM authentication for username through pam_sss in svc,
+// as sshd does for a password login, once svc's SSSD resolves username.
+func pamAuth(t *testing.T, svc, username string) result {
+	t.Helper()
+	requireNSS(t, svc, username)
 	return inContainer(svc, env.userPass+"\n", "pamtester", "-v", "frict-test", username, "authenticate")
 }
 
@@ -350,7 +427,7 @@ func TestSSSDDefaultTimeoutsLosePush(t *testing.T) {
 		}
 	})
 	start := time.Now()
-	r := pamAuth(sssdDefault, user)
+	r := pamAuth(t, sssdDefault, user)
 	n := pushesSince(t, user, start)
 	t.Logf("pam auth (%s) as %s: exit %d after %s, %d pushes (answer delay %s)\n%s", sssdDefault, user, r.exit, r.elapsed.Round(time.Millisecond), n, env.answerDelay, r.out)
 	if r.exit == 0 {
@@ -368,7 +445,7 @@ func TestSSSDTunedSurvivesPush(t *testing.T) {
 	requireDelayAbove(t, sssdDefaultOptTimeout)
 	answerPushes(t, user, "approve", "")
 	start := time.Now()
-	r := pamAuth(sssdTuned, user)
+	r := pamAuth(t, sssdTuned, user)
 	n := pushesSince(t, user, start)
 	t.Logf("pam auth (%s) as %s: exit %d after %s, %d pushes (answer delay %s)\n%s", sssdTuned, user, r.exit, r.elapsed.Round(time.Millisecond), n, env.answerDelay, r.out)
 	if r.exit != 0 || !strings.Contains(r.out, "successfully authenticated") {
@@ -389,7 +466,7 @@ func TestSSSDTunedFailsWhenPushDenied(t *testing.T) {
 	requireDelayAbove(t, sssdDefaultOptTimeout)
 	answerPushes(t, user, "deny", "cancel")
 	start := time.Now()
-	r := pamAuth(sssdTuned, user)
+	r := pamAuth(t, sssdTuned, user)
 	n := pushesSince(t, user, start)
 	t.Logf("pam auth (%s) as %s: exit %d after %s, %d pushes (answer delay %s)\n%s", sssdTuned, user, r.exit, r.elapsed.Round(time.Millisecond), n, env.answerDelay, r.out)
 	if r.exit == 0 || !strings.Contains(r.out, "Authentication failure") {
@@ -400,5 +477,84 @@ func TestSSSDTunedFailsWhenPushDenied(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("frict-server created %d challenges for %s, want 1", n, user)
+	}
+}
+
+// allPushesSince counts every challenge frict-server created since t.
+func allPushesSince(t *testing.T, since time.Time) int {
+	t.Helper()
+	out, err := composeCmd("logs", "--no-color", "--since", since.UTC().Format(time.RFC3339Nano), "frict-server").CombinedOutput()
+	if err != nil {
+		t.Fatalf("frict-server logs: %v\n%s", err, out)
+	}
+	return strings.Count(string(out), `msg="challenge created"`)
+}
+
+// TestLDAPSvcBindsWithPasswordOnly: the service account SSSD searches with
+// binds with its password alone; the negated binding skips Frict for it.
+func TestLDAPSvcBindsWithPasswordOnly(t *testing.T) {
+	start := time.Now()
+	r := ldapSearch(sssdTuned, ldapSvcUser, ldapSvcPass, userDN("ldap-alice"))
+	t.Logf("bind+search as %s: exit %d after %s\n%s", ldapSvcUser, r.exit, r.elapsed.Round(time.Millisecond), r.out)
+	if r.exit != 0 || !strings.Contains(r.out, "cn: ldap-alice") {
+		t.Fatalf("service account bind+search failed: exit %d\n%s", r.exit, r.out)
+	}
+	if n := allPushesSince(t, start); n != 0 {
+		t.Fatalf("frict-server created %d challenges during the service account bind, want 0", n)
+	}
+	if r := ldapSearch(sssdTuned, ldapSvcUser, ldapSvcPass+"x", userDN("ldap-alice")); r.exit != 49 {
+		t.Fatalf("service account bind with a wrong password: exit %d, want 49\n%s", r.exit, r.out)
+	}
+}
+
+// TestLDAPUserWithoutDeviceCannotBind: a user allowed to log in over LDAP
+// but without a Frict device is refused, right password or not, and nothing
+// is pushed.
+func TestLDAPUserWithoutDeviceCannotBind(t *testing.T) {
+	start := time.Now()
+	r := ldapSearch(sssdTuned, ldapNoDevice, env.userPass, userDN(ldapNoDevice))
+	t.Logf("bind+search as %s (right password, no device): exit %d after %s\n%s", ldapNoDevice, r.exit, r.elapsed.Round(time.Millisecond), r.out)
+	if r.exit != 49 {
+		t.Fatalf("bind without a device: exit %d, want 49 (invalidCredentials)\n%s", r.exit, r.out)
+	}
+	if n := allPushesSince(t, start); n != 0 {
+		t.Fatalf("frict-server created %d challenges, want 0", n)
+	}
+}
+
+// TestLDAPCredentialsDontMix: the skip names the service account's user
+// object, resolved from the bind DN, and the password stage checks that
+// user's own password, so neither half of the service account's credentials
+// helps anyone else.
+func TestLDAPCredentialsDontMix(t *testing.T) {
+	start := time.Now()
+	for _, c := range []struct{ what, user, password string }{
+		{"service account DN, a user's password", ldapSvcUser, env.userPass},
+		{"enrolled user's DN, the service account's password", "ldap-alice", ldapSvcPass},
+	} {
+		r := ldapSearch(sssdTuned, c.user, c.password, userDN(c.user))
+		t.Logf("%s: exit %d after %s\n%s", c.what, r.exit, r.elapsed.Round(time.Millisecond), r.out)
+		if r.exit != 49 {
+			t.Errorf("%s: exit %d, want 49 (invalidCredentials)", c.what, r.exit)
+		}
+	}
+	if n := allPushesSince(t, start); n != 0 {
+		t.Fatalf("frict-server created %d challenges, want 0", n)
+	}
+}
+
+// TestLDAPSvcDeniedOnBrowserFlow: the service account's password sits on
+// every SSSD client, so the browser login flow refuses that account before
+// its password, and it never reaches Duo enrollment.
+func TestLDAPSvcDeniedOnBrowserFlow(t *testing.T) {
+	b := newBrowser(t)
+	b.expect(b.do("GET", nil), "ak-stage-identification")
+	c := b.do("POST", map[string]any{"component": "ak-stage-identification", "uid_field": ldapSvcUser})
+	if c.Component == "ak-stage-password" {
+		c = b.do("POST", map[string]any{"component": "ak-stage-password", "password": ldapSvcPass})
+	}
+	b.expect(c, "ak-stage-access-denied")
+	if status, who := b.whoami(); status == 200 {
+		t.Fatalf("browser flow produced a session for %q", who)
 	}
 }

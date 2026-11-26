@@ -6,7 +6,7 @@ Greek chain of fire-beacon towers that relayed signals across the land.
 GitHub org `frict-auth`: `frict-server`, `frict-android`, later `frict-ios`.
 Domain `frict.app`; Android application ID `app.frict.android`.
 
-Plan v1 — 2026-10-30. Status: M0–M3 done.
+Plan v1 — 2026-10-30. Status: M0–M3 done; M5 in progress.
 
 ---
 
@@ -441,16 +441,27 @@ push to a device whose last request was below it
 control. Raise the minimum only once the new app is on Play: until a phone
 updates, its user can't sign in with Frict.
 
-**M5 — LDAP / Linux login.** Only if M0 said yes.
+**M5 — LDAP / Linux login.** SSH and console logins through SSSD against
+Authentik's LDAP outpost, with a Frict push in the bind flow
+(`docs/ldap.md`).
+
+Status: **in progress.** The design is proven in e2e (`e2e/ldap_test.go`):
+one provider and one bind flow whose validation stage denies users without
+a device, a negated user binding that lets only the `ldap-svc` service
+account bind with its password alone, the outpost on `http://server:9000`,
+LDAPS, and `ldap-svc` denied on the browser flow. An enrolled user's bind
+and a PAM login through the tuned SSSD wait for one push; approve logs in,
+deny fails. Left: the deployment server side (outpost service, `tailscale
+cert`, hetzner-setup), the Authentik admin steps, and a real login from the
+first client.
 
 **M6 — iOS.** Deferred. Needs Apple Developer Program, APNs key, and macOS CI
 (free on public repos).
 
-**V1.0.** The Android app holds several enrollments (sign-in keys) at once,
-e.g. a personal account and a separate Authentik admin account. The server is
-unchanged: each enrollment is a separate Duo device in Authentik. The app
-shows which account each request is for. Also before V1.0: the block vs mute
-review (Open).
+**V1.0.** M4 and M5 done. The Android app holds several enrollments
+(sign-in keys) at once, e.g. a personal account and a separate Authentik
+admin account. The server is unchanged: each enrollment is a separate Duo
+device in Authentik. The app shows which account each request is for.
 
 **Later.** UnifiedPush + ntfy for de-Googled phones. Forked stage if number
 matching is ever needed.
@@ -519,7 +530,7 @@ issue → PR.
 - ~~Upgrade prod Authentik to 2026.8.5~~ (done).
 
 **Before M5**
-- Prod Authentik: LDAP authentication flow with the Frict validation stage.
+- Prod Authentik: the objects in `docs/ldap.md`, in its order.
 
 **Before M6**
 - Apple Developer Program ($99/yr), APNs `.p8` key uploaded to Firebase.
@@ -584,11 +595,9 @@ host.
 
 All clicks by the Authentik administrator; agents don't change prod Authentik. Based on notes from
 2026-04-06 — re-check the current flows before starting:
-LDAP provider (pk 5, `mfa_support: true`) had no authentication flow of its
-own and fell through to `default-authentication-flow` (Identification →
-Password → Login, no MFA); `default-authentication-mfa-validation` existed but
-was unbound; an old experiment `default-emailauthentication-flowtest` was
-waiting to be cleaned up.
+the LDAP provider then had no authentication flow of its own (no MFA) and has
+since been deleted; M5 creates a fresh one. An old experiment
+`default-emailauthentication-flowtest` was waiting to be cleaned up.
 
 **M3 — browser login.**
 1. **Duo Authenticator Setup stage** `frict-setup`:
@@ -601,13 +610,13 @@ waiting to be cleaned up.
    stage, on the operator's own account.
 3. Alerting and configuration-error emails: `docs/authentik.md`.
 
-**M5 — LDAP.** Only if M0 proved push over LDAP binds.
-1. Flow `ldap-authentication`: Identification → Password → a validation
-   stage offering Duo → Login.
-2. Set the LDAP provider's authentication flow to it.
-3. Reconfigure SSSD LDAP login on the laptop from the config M0 proved in the
-   container (timeouts included), then confirm a real login with a push
-   approval.
+**M5 — LDAP.**
+1. Deployment server: the outpost service and LDAPS certificate
+   (hetzner-setup).
+2. Authentik admin steps in `docs/ldap.md`, then confirm
+   `FRICT_CHALLENGE_TTL` ≤ 85 s.
+3. First client from the `docs/ldap.md` SSSD section; confirm a real login
+   with a push approval and a denial.
 4. Clean up `default-emailauthentication-flowtest` while there.
 
 ---
@@ -632,7 +641,16 @@ upload. Keep the name in one constant per codebase.
 
 ## Settled decisions
 
-- Number matching: out of scope; non-compliance documented.
+- Number matching: out of scope; non-compliance documented. Approve-only
+  push is what NIST SP 800-63B-4 §3.1.3 calls "no longer considered
+  acceptable"; the gap is accepted for household use.
+- A pause **blocks** (`locked_out` at once), it doesn't mute. Duo's
+  default "Muted Push" silences notifications for 20 minutes after a fraud
+  report but still lets the user approve by opening the app
+  (duo.com/docs/administration-settings). With Authentik re-sending after
+  every failure (goauthentik#11368), a mute would keep an attacker's
+  challenge pending beside the user's own, which only number matching
+  could tell apart.
 - Repos public.
 - Human not a merge blocker; auto-merge gated by CI + cross-review status.
 - Production deploys of frict-server wait for the approver.
@@ -655,8 +673,6 @@ number (`docs/m0-findings.md` (d) and "Number matching").
   PERMISSION_DENIED (actions run 44539165608 attempt 2; negative control
   run 44542161659).
 - Whether Authentik will accept a per-stage `disable_ca_pinning` option.
-- Review block vs mute during a pause before V1. Frict blocks: a paused
-  `/auth` is answered `locked_out` at once.
 
 ---
 
