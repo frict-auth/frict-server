@@ -495,7 +495,7 @@ func TestRunPrunesAtStartup(t *testing.T) {
 	if err := st.CreateEnrollment(ctx, "DUAAAAAAAAAAAAAAAAAAAAAAAAAA", "alice", "CODE", now, now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Enroll(ctx, "CODE", "DUAAAAAAAAAAAAAAAAAAAAAAAAAA", store.Device{DeviceKey: []byte{1}, ApprovalKey: []byte{2}, Attestation: []byte("{}"), EnrolledAt: now}); err != nil {
+	if _, err := st.Enroll(ctx, "CODE", "DUAAAAAAAAAAAAAAAAAAAAAAAAAA", store.Device{DeviceKey: []byte{1}, ApprovalKey: []byte{2}, Attestation: []byte("{}"), EnrolledAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	for _, u := range []struct {
