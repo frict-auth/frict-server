@@ -153,9 +153,10 @@ already in its config. Set clients up only from this file.
 LDAPS is reachable only on the tailnet, and `cache_credentials = false` means
 SSSD never logs anyone in without reaching the outpost. So:
 
-- Every client is on the tailnet. Tag unattended machines (servers, home
-  desktops) so their node keys never expire; for personal devices, disable
-  key expiry in the admin console.
+- Every client is on the tailnet with key expiry disabled: admin console →
+  Machines → the machine's menu → Disable key expiry. A device tagged when it
+  authenticates starts with expiry disabled; check the Machines page anyway.
+  Tags are for unattended machines such as servers, not ones people use.
 - A laptop with no network, or with Tailscale down, cannot log in an LDAP
   user. Its user logs in with the local break-glass account until it is back
   online.
