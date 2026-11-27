@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"strings"
@@ -48,11 +49,12 @@ var ldapDevices = map[string]device{}
 func userDN(username string) string { return "cn=" + username + ",ou=users," + ldapBaseDN }
 
 // setupLDAP builds the M5 design (docs/ldap.md): one LDAP provider whose bind
-// flow is identification -> password -> Frict validation -> login, where the
-// validation stage denies users without a device and a negated user binding
-// lets only the service account skip it. browserFlow gets a deny stage for
-// the service account. It then starts the outpost and both SSSD clients.
-func setupLDAP(stage func(string, map[string]any) (string, error), browserFlow, ident, pass, login string) error {
+// flow, run only by the outpost, is identification -> password -> Frict
+// validation -> login, where the validation stage denies users without a
+// device and a negated user binding lets only the service account skip it.
+// browserFlow gets a deny stage for the service account. It then starts the
+// outpost and both SSSD clients.
+func setupLDAP(stage func(string, map[string]any) (string, error), browserFlow, login string) error {
 	var err error
 	if ldapSvcPass, err = readSecret("ldap-svc-password"); err != nil {
 		return err
@@ -74,6 +76,14 @@ func setupLDAP(stage func(string, map[string]any) (string, error), browserFlow, 
 		return err
 	}
 
+	ident, err := stage("identification", map[string]any{"name": "ldap-identification", "user_fields": []string{"username"}})
+	if err != nil {
+		return err
+	}
+	pass, err := stage("password", map[string]any{"name": "ldap-password", "backends": []string{"authentik.core.auth.InbuiltBackend"}})
+	if err != nil {
+		return err
+	}
 	validate, err := stage("authenticator/validate", map[string]any{
 		"name": "ldap-frict-validate", "device_classes": []string{"duo"}, "not_configured_action": "deny",
 	})
@@ -83,6 +93,7 @@ func setupLDAP(stage func(string, map[string]any) (string, error), browserFlow, 
 	var flow struct{ PK string }
 	if err := admin("POST", "/api/v3/flows/instances/", map[string]any{
 		"name": "ldap-bind", "slug": "ldap-bind", "title": "LDAP bind", "designation": "authentication",
+		"authentication": "require_outpost",
 	}, &flow); err != nil {
 		return err
 	}
@@ -522,15 +533,39 @@ func TestLDAPUserWithoutDeviceCannotBind(t *testing.T) {
 	}
 }
 
+// appPassword mints an app password token for username, as any user can for
+// themselves, and returns its key.
+func appPassword(t *testing.T, username string) string {
+	t.Helper()
+	var users struct{ Results []struct{ PK int } }
+	if err := admin("GET", "/api/v3/core/users/?username="+url.QueryEscape(username), nil, &users); err != nil || len(users.Results) != 1 {
+		t.Fatalf("looking up %s: %v %+v", username, err, users)
+	}
+	id := "app-password-" + username
+	if err := admin("POST", "/api/v3/core/tokens/", map[string]any{
+		"identifier": id, "intent": "app_password", "user": users.Results[0].PK,
+	}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var token struct{ Key string }
+	if err := admin("GET", "/api/v3/core/tokens/"+id+"/view_key/", nil, &token); err != nil {
+		t.Fatal(err)
+	}
+	return token.Key
+}
+
 // TestLDAPCredentialsDontMix: the skip names the service account's user
 // object, resolved from the bind DN, and the password stage checks that
-// user's own password, so neither half of the service account's credentials
-// helps anyone else.
+// user's own password and nothing else, so neither half of the service
+// account's credentials helps anyone else and app passwords don't bind.
 func TestLDAPCredentialsDontMix(t *testing.T) {
+	svcAppPass, aliceAppPass := appPassword(t, ldapSvcUser), appPassword(t, "ldap-alice")
 	start := time.Now()
 	for _, c := range []struct{ what, user, password string }{
 		{"service account DN, a user's password", ldapSvcUser, env.userPass},
 		{"enrolled user's DN, the service account's password", "ldap-alice", ldapSvcPass},
+		{"service account DN, its own app password", ldapSvcUser, svcAppPass},
+		{"enrolled user's DN, their own app password", "ldap-alice", aliceAppPass},
 	} {
 		r := ldapSearch(sssdTuned, c.user, c.password, userDN(c.user))
 		t.Logf("%s: exit %d after %s\n%s", c.what, r.exit, r.elapsed.Round(time.Millisecond), r.out)
@@ -557,4 +592,23 @@ func TestLDAPSvcDeniedOnBrowserFlow(t *testing.T) {
 	if status, who := b.whoami(); status == 200 {
 		t.Fatalf("browser flow produced a session for %q", who)
 	}
+}
+
+// TestLDAPBindFlowRefusesBrowser: a browser running ldap-bind as the
+// service account, which skips Frict there, gets no session; only the
+// outpost, authenticated by its token, may run that flow.
+func TestLDAPBindFlowRefusesBrowser(t *testing.T) {
+	b := newBrowserOn(t, "ldap-bind")
+	c := b.do("GET", nil)
+	if c.Component == "ak-stage-identification" {
+		c = b.do("POST", map[string]any{"component": "ak-stage-identification", "uid_field": ldapSvcUser})
+	}
+	if c.Component == "ak-stage-password" {
+		c = b.do("POST", map[string]any{"component": "ak-stage-password", "password": ldapSvcPass})
+	}
+	t.Logf("ldap-bind without the outpost token ends at %s", c.raw)
+	if status, who := b.whoami(); status == 200 {
+		t.Errorf("ldap-bind produced a browser session for %q", who)
+	}
+	b.expect(c, "ak-stage-access-denied")
 }
