@@ -144,8 +144,22 @@ already in its config. Set clients up only from this file.
 - After the password, PAM waits silently for the push; there is no "check
   your phone" prompt. Approve within the push expiry.
 - `sudo` through `pam_sss` pushes on every run its timestamp doesn't cover.
-- Keep a local admin account with an SSH key as break-glass for when
-  Authentik, Frict or the phone is unavailable.
+- Keep a local break-glass account on every client for when Authentik, Frict,
+  the phone or the tailnet is unavailable: an SSH key on servers, a local
+  password for the console on desktops and laptops.
+
+### Network and offline use
+
+LDAPS is reachable only on the tailnet, and `cache_credentials = false` means
+SSSD never logs anyone in without reaching the outpost. So:
+
+- Every client is on the tailnet with key expiry disabled: admin console →
+  Machines → the machine's menu → Disable key expiry. A device tagged when it
+  authenticates starts with expiry disabled; check the Machines page anyway.
+  Tags are for unattended machines such as servers, not ones people use.
+- A laptop with no network, or with Tailscale down, cannot log in an LDAP
+  user. Its user logs in with the local break-glass account until it is back
+  online.
 
 ### Check a new client
 
