@@ -140,7 +140,7 @@ func setup() error {
 	if err := bindStages(flow.PK, ident, pass, validate, login); err != nil {
 		return err
 	}
-	return setupLDAP(stage, flow.PK, ident, pass, login)
+	return setupLDAP(stage, flow.PK, login)
 }
 
 // newPhoneClient returns the fake phone's HTTPS client: it trusts only the
@@ -276,7 +276,11 @@ type browser struct {
 	url    string
 }
 
-func newBrowser(t *testing.T) *browser {
+func newBrowser(t *testing.T) *browser { return newBrowserOn(t, env.flowSlug) }
+
+// newBrowserOn is a browser that runs the flow slug through the executor
+// API, without an outpost token.
+func newBrowserOn(t *testing.T, slug string) *browser {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		t.Fatal(err)
@@ -284,7 +288,7 @@ func newBrowser(t *testing.T) *browser {
 	return &browser{
 		t:      t,
 		client: &http.Client{Jar: jar, Timeout: 10 * time.Minute},
-		url:    env.baseURL + "/api/v3/flows/executor/" + env.flowSlug + "/?query=" + url.QueryEscape("next=/"),
+		url:    env.baseURL + "/api/v3/flows/executor/" + slug + "/?query=" + url.QueryEscape("next=/"),
 	}
 }
 

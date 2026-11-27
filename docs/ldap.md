@@ -9,7 +9,9 @@ setup; the test names are given with each rule below.
 
 | Object | Setting |
 |---|---|
-| Flow `ldap-bind` | identification → password → `ldap-frict-validate` → user login |
+| Flow `ldap-bind` | `ldap-identification` → `ldap-password` → `ldap-frict-validate` → user login; authentication **Require Outpost** |
+| Stage `ldap-identification` | Identification, user fields **Username** only |
+| Stage `ldap-password` | Password, backends **User database + standard password** only |
 | Stage `ldap-frict-validate` | Authenticator Validation, device classes **Duo** only, not configured: **deny** |
 | Its binding in `ldap-bind` | evaluate when planned **off**, evaluate when run **on**, one policy binding: user `ldap-svc`, **negate** |
 | User `ldap-svc` | type service account, password, no device, role `ldap-search` |
@@ -31,7 +33,13 @@ setup; the test names are given with each rule below.
   provider for `ldap-svc` would send every user bind through its flow.
 - The service account's password sits on every client. `deny-ldap-svc` keeps
   it out of the browser flow, where it could otherwise enroll a phone
-  (`TestLDAPSvcDeniedOnBrowserFlow`).
+  (`TestLDAPSvcDeniedOnBrowserFlow`). Require Outpost keeps browsers out of
+  `ldap-bind`, where `ldap-svc` skips Frict: only a request carrying an
+  outpost's token may run it (`TestLDAPBindFlowRefusesBrowser`).
+- `ldap-bind` has its own stages. The default password stage also accepts
+  app passwords and Kerberos or LDAP source passwords, and the default
+  identification stage also matches email. In `ldap-password`, an app
+  password binds no one (`TestLDAPCredentialsDontMix`).
 - No OTP over LDAP: code-based MFA support stays off and Frict is the only
   second factor.
 
@@ -53,9 +61,12 @@ table.
    `ldap-frict-validate`: device classes Duo only, not configured action
    *Deny*. Leave the browser flow's validation stage alone.
 4. **Group** `ldap-login` with the users who may log in over LDAP.
-5. **Flow** `ldap-bind`, designation Authentication. Bind, in order: an
-   identification stage that matches usernames, a password stage with the
-   built-in backend, `ldap-frict-validate`, a user login stage. On the
+5. **Flow** `ldap-bind`, designation Authentication, Behavior settings →
+   Authentication **Require Outpost**. Create Identification Stage
+   `ldap-identification` (user fields: Username only) and Password Stage
+   `ldap-password` (backends: User database + standard password only); don't
+   reuse the default stages. Bind, in order: `ldap-identification`,
+   `ldap-password`, `ldap-frict-validate`, a user login stage. On the
    `ldap-frict-validate` binding: planned off, run on, then bind User
    `ldap-svc` with **Negate** on.
 6. **Certificate.** System → Certificates lists a keypair named after the
